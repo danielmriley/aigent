@@ -1,3 +1,4 @@
+// ── Domain types (always available) ──────────────────────────────────────────
 pub mod commands;
 
 use chrono::{DateTime, Utc};

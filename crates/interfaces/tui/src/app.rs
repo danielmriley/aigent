@@ -17,7 +17,7 @@ use tracing::debug;
 use tui_textarea::{Input, Key, TextArea};
 
 use aigent_config::AppConfig;
-use aigent_daemon::BackendEvent;
+use aigent_runtime::BackendEvent;
 
 use crate::{
     events::AppEvent,
@@ -141,6 +141,7 @@ impl App {
                     "/doctor",
                     "/status",
                     "/context",
+                    "/tools",
                     "/model show",
                     "/model list",
                     "/exit",
@@ -471,6 +472,14 @@ impl App {
                 } else {
                     "tool failed".to_string()
                 };
+            }
+            BackendEvent::ExternalTurn { source, content } => {
+                self.state.messages.push(Message {
+                    role: source,
+                    content,
+                });
+                self.pending_stream.clear();
+                self.auto_follow = true;
             }
         }
     }

@@ -1,7 +1,8 @@
 [agent]
 name = "Zenith"
-workspace_path = "."
-thinking_level = "deep"
+user_name = "Daniel"
+workspace_path = "/home/daniel/Projects/aigent/./workspace"
+thinking_level = "balanced"
 
 [llm]
 provider = "ollama"
@@ -31,3 +32,6 @@ completed = true
 
 [integrations]
 telegram_enabled = true
+
+[daemon]
+socket_path = "/tmp/aigent.sock"

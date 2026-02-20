@@ -11,17 +11,18 @@ clap.workspace = true
 crossterm.workspace = true
 dotenvy.workspace = true
 ratatui.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-aigent-config = { path = "../aigent-config" }
-aigent-core = { path = "../aigent-core" }
-aigent-daemon = { path = "../aigent-daemon" }
-aigent-llm = { path = "../aigent-llm" }
-aigent-memory = { path = "../aigent-memory" }
-aigent-telegram = { path = "../aigent-telegram" }
-aigent-ui = { path = "../aigent-ui" }
+aigent-config = { path = "../../config" }
+aigent-core = { path = "../../core" }
+aigent-runtime = { path = "../../runtime" }
+aigent-llm = { path = "../../llm" }
+aigent-memory = { path = "../../memory" }
+aigent-telegram = { path = "../telegram" }
+aigent-ui = { path = "../tui" }
 tui-textarea = "0.7.0"
 pulldown-cmark = "0.13.0"
 syntect = "5.2.0"

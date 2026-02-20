@@ -11,6 +11,6 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-aigent-core = { path = "../aigent-core" }
+aigent-core = { path = "../core" }
 tokio.workspace = true
 

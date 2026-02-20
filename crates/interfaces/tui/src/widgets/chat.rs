@@ -111,6 +111,18 @@ fn build_chat_lines_with_starts(
                 Span::styled(format!("{}> ", assistant_label), prefix_style),
                 Span::styled(streaming.to_string(), body_style),
             ]));
+        } else if message.role != "assistant" {
+            // External source (e.g. telegram) — show role as prefix
+            let mut ext_prefix = Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD);
+            if is_selected {
+                ext_prefix = ext_prefix.bg(theme.muted);
+            }
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}> ", message.role), ext_prefix),
+                Span::styled(message.content.clone(), body_style),
+            ]));
         } else {
             let rendered = render_markdown_lines(&message.content);
             if let Some(first) = rendered.first() {

@@ -1,6 +1,45 @@
 package aigent:host;
 
+/// Parameters passed to a tool invocation.
+record tool-param {
+  name: string,
+  value: string,
+}
+
+/// Result returned by a tool execution.
+record tool-result {
+  success: bool,
+  output: string,
+}
+
+/// Metadata describing a tool.
+record tool-spec {
+  name: string,
+  description: string,
+}
+
 world host {
-  export log: func(message: string)
-  export get-time-unix-ms: func() -> u64
+  // ── logging & time ──────────────────────────────────────────
+  export log: func(message: string);
+  export get-time-unix-ms: func() -> u64;
+
+  // ── filesystem (workspace-bounded) ──────────────────────────
+  export read-file: func(path: string, max-bytes: u32) -> result<string, string>;
+  export write-file: func(path: string, content: string) -> result<_, string>;
+  export list-dir: func(path: string) -> result<list<string>, string>;
+
+  // ── shell execution ─────────────────────────────────────────
+  export run-shell: func(command: string, timeout-ms: u32) -> tool-result;
+
+  // ── key-value store (persistent across invocations) ─────────
+  export kv-get: func(key: string) -> option<string>;
+  export kv-set: func(key: string, value: string);
+
+  // ── HTTP client ─────────────────────────────────────────────
+  export http-get: func(url: string) -> result<string, string>;
+  export http-post: func(url: string, body: string, content-type: string) -> result<string, string>;
+
+  // ── Guest must implement ────────────────────────────────────
+  import spec: func() -> tool-spec;
+  import run: func(params: list<tool-param>) -> tool-result;
 }

@@ -9,4 +9,4 @@ anyhow.workspace = true
 serde.workspace = true
 toml.workspace = true
 
-aigent-core = { path = "../aigent-core" }
+aigent-core = { path = "../core" }

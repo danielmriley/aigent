@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::consistency::{ConsistencyDecision, evaluate_core_update};
@@ -31,11 +32,13 @@ pub struct MemoryManager {
 
 impl MemoryManager {
     pub fn with_event_log(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        info!(path = %path.display(), "loading memory from event log");
         let mut manager = Self {
             identity: IdentityKernel::default(),
             store: MemoryStore::default(),
-            event_log: Some(MemoryEventLog::new(path.as_ref().to_path_buf())),
-            vault_path: derive_default_vault_path(path.as_ref()),
+            event_log: Some(MemoryEventLog::new(path.to_path_buf())),
+            vault_path: derive_default_vault_path(path),
         };
 
         let events = manager
@@ -44,10 +47,20 @@ impl MemoryManager {
             .expect("event log is always present in with_event_log")
             .load()?;
 
+        let event_count = events.len();
         for event in events {
             manager.apply_replayed_entry(event.entry)?;
         }
 
+        let stats = manager.stats();
+        info!(
+            events = event_count,
+            core = stats.core,
+            episodic = stats.episodic,
+            semantic = stats.semantic,
+            procedural = stats.procedural,
+            "memory loaded"
+        );
         Ok(manager)
     }
 
@@ -91,7 +104,13 @@ impl MemoryManager {
             .all()
             .iter()
             .filter(|entry| {
-                entry.tier != MemoryTier::Core && !entry.source.starts_with("assistant-turn")
+                entry.tier != MemoryTier::Core
+                    // Skip assistant-turn metadata (old format)
+                    && !entry.source.starts_with("assistant-turn")
+                    // Skip sleep cycle bookkeeping entries — their content
+                    // contains structured text ("promoted 79 items: • [Core]…")
+                    // that the LLM misreads as factual memory counts.
+                    && entry.source != "sleep:cycle"
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -200,6 +219,7 @@ impl MemoryManager {
             ConsistencyDecision::Accept => {
                 let inserted = self.store.insert(entry.clone());
                 if inserted {
+                    debug!(tier = ?entry.tier, source = %entry.source, id = %entry.id, content_len = entry.content.len(), "memory entry recorded");
                     if let Some(event_log) = &self.event_log {
                         let event = MemoryRecordEvent {
                             event_id: Uuid::new_v4(),
@@ -207,10 +227,14 @@ impl MemoryManager {
                             entry: entry.clone(),
                         };
                         event_log.append(&event)?;
+                    } else {
+                        warn!(tier = ?entry.tier, source = %entry.source, "no event log configured — entry is ephemeral");
                     }
                     if sync_vault {
                         self.sync_vault_projection()?;
                     }
+                } else {
+                    debug!(id = %entry.id, "duplicate entry skipped (already in store)");
                 }
                 Ok(entry)
             }
@@ -218,13 +242,34 @@ impl MemoryManager {
         }
     }
 
+    #[instrument(skip(self))]
     pub fn run_sleep_cycle(&mut self) -> Result<SleepSummary> {
         let snapshot = self.store.all().to_vec();
+        info!(entries = snapshot.len(), "sleep cycle starting");
         let mut summary = distill(&snapshot);
+
+        // Build a human-readable summary of what was promoted.
+        let promotion_lines = summary
+            .promotions
+            .iter()
+            .map(|p| format!("  • [{:?}] {}", p.to_tier, &p.content[..p.content.len().min(120)]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let distilled_content = if promotion_lines.is_empty() {
+            format!("Sleep cycle reviewed {} memories; no new promotions this cycle. distilled", snapshot.len())
+        } else {
+            format!(
+                "Sleep cycle reviewed {} memories and promoted {} items:\n{} distilled",
+                snapshot.len(),
+                summary.promotions.len(),
+                promotion_lines
+            )
+        };
+        summary.distilled = distilled_content.clone();
 
         let marker = self.record_inner(
             MemoryTier::Semantic,
-            format!("sleep cycle summary: {}", summary.distilled),
+            distilled_content,
             "sleep:cycle".to_string(),
             false,
         )?;
@@ -241,12 +286,43 @@ impl MemoryManager {
         }
 
         self.sync_vault_projection()?;
-
+        info!(promoted = summary.promoted_ids.len(), "sleep cycle complete");
         Ok(summary)
     }
 
     pub fn flush_all(&mut self) -> Result<()> {
         self.sync_vault_projection()
+    }
+
+    #[instrument(skip(self))]
+    pub fn seed_core_identity(&mut self, user_name: &str, bot_name: &str) -> Result<()> {
+        let user_name = user_name.trim();
+        let bot_name = bot_name.trim();
+        if user_name.is_empty() || bot_name.is_empty() {
+            bail!("user name and bot name are required for identity seeding");
+        }
+
+        let statement = format!(
+            "You are {bot_name}, a helpful and truthful AI companion. \
+             The user's name is {user_name}. \
+             You have persistent multi-tier memory (Core, Semantic, Episodic, Procedural) \
+             and can learn and remember information over time across conversations."
+        );
+
+        let already_present = self
+            .entries_by_tier(MemoryTier::Core)
+            .into_iter()
+            .any(|entry| entry.source == "onboarding:identity");
+
+        if already_present {
+            debug!(bot_name, user_name, "core identity already seeded — skipping");
+        } else {
+            info!(bot_name, user_name, "seeding core identity");
+            let entry = self.record(MemoryTier::Core, statement, "onboarding:identity")?;
+            info!(id = %entry.id, "core identity entry created");
+        }
+
+        Ok(())
     }
 
     fn sync_vault_projection(&self) -> Result<()> {

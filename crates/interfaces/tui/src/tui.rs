@@ -150,8 +150,8 @@ where
 }
 
 pub fn create_backend_channel() -> (
-    mpsc::UnboundedSender<aigent_daemon::BackendEvent>,
-    mpsc::UnboundedReceiver<aigent_daemon::BackendEvent>,
+    mpsc::UnboundedSender<aigent_runtime::BackendEvent>,
+    mpsc::UnboundedReceiver<aigent_runtime::BackendEvent>,
 ) {
     mpsc::unbounded_channel()
 }

@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use aigent_daemon::{BackendEvent, DaemonClient};
+use aigent_runtime::{BackendEvent, DaemonClient};
 use aigent_llm::{list_ollama_models, list_openrouter_models};
 use tokio::sync::mpsc;
 
@@ -25,7 +25,22 @@ pub async fn start_bot(client_ipc: DaemonClient) -> Result<()> {
     println!("listening for updates...");
 
     loop {
-        let updates = fetch_updates(&client, &base_url, offset).await?;
+        let updates = match fetch_updates(&client, &base_url, offset).await {
+            Ok(u) => u,
+            Err(err) => {
+                let err_str = err.to_string();
+                if err_str.contains("409") {
+                    // Another instance is polling — back off and let it win.
+                    eprintln!("[telegram] 409 Conflict: another bot instance is running; waiting 15s before retrying");
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                } else {
+                    eprintln!("[telegram] getUpdates error: {err} — retrying in 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                continue;
+            }
+        };
+
         for update in updates {
             offset = update.update_id + 1;
 
@@ -37,11 +52,25 @@ pub async fn start_bot(client_ipc: DaemonClient) -> Result<()> {
             };
 
             let chat_id = message.chat.id;
-            let response =
-                handle_telegram_input(&client_ipc, chat_id, text.trim(), &mut recent_turns).await?;
+            let response = match handle_telegram_input(
+                &client_ipc,
+                chat_id,
+                text.trim(),
+                &mut recent_turns,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(err) => {
+                    eprintln!("[telegram] handler error for chat {chat_id}: {err}");
+                    format!("⚠️ error: {err}")
+                }
+            };
 
             for chunk in chunk_message(&response, 3500) {
-                send_message(&client, &base_url, chat_id, &chunk).await?;
+                if let Err(err) = send_message(&client, &base_url, chat_id, &chunk).await {
+                    eprintln!("[telegram] sendMessage error for chat {chat_id}: {err}");
+                }
             }
         }
 
@@ -143,15 +172,31 @@ async fn handle_telegram_input(
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    daemon.stream_submit(line.to_string(), tx).await?;
+    // stream_submit reads the socket until Done/Error, then returns.
+    // We drive both concurrently: collecting tokens while the streaming task runs.
+    let submit_task = tokio::spawn({
+        let daemon = daemon.clone();
+        let line = line.to_string();
+        async move { daemon.stream_submit(line, "telegram", tx).await }
+    });
+
     let mut out = String::new();
-    while let Ok(event) = rx.try_recv() {
+    while let Some(event) = rx.recv().await {
         match event {
             BackendEvent::Token(chunk) => out.push_str(&chunk),
-            BackendEvent::Error(err) => return Ok(format!("error: {err}")),
+            BackendEvent::Error(err) => {
+                let _ = submit_task.await;
+                return Ok(format!("error: {err}"));
+            }
             BackendEvent::Done => break,
             _ => {}
         }
+    }
+    // Propagate IPC-level errors from stream_submit.
+    match submit_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Ok(format!("error: {err}")),
+        Err(err) => return Ok(format!("error: task panicked: {err}")),
     }
 
     if out.trim().is_empty() {

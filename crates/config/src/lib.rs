@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct AgentConfig {
     pub name: String,
+    pub user_name: String,
     pub workspace_path: String,
     pub thinking_level: String,
 }
@@ -17,6 +18,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             name: "Aigent".to_string(),
+            user_name: String::new(),
             workspace_path: ".".to_string(),
             thinking_level: "balanced".to_string(),
         }

@@ -14,9 +14,12 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph, Wrap};
 
 use aigent_config::AppConfig;
+use aigent_runtime::AgentRuntime;
+
+use crate::theme::Theme;
 
 pub fn center(area: Rect, horizontal: Constraint, vertical: Constraint) -> Rect {
     let [area] = Layout::horizontal([horizontal])
@@ -58,89 +61,77 @@ enum SetupMode {
     Configuration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSection {
+    Identity,
+    Llm,
+    Telegram,
+    DataMemory,
+    Safety,
+    FullWizard,
+}
+
+impl ConfigSection {
+    fn label(self) -> &'static str {
+        match self {
+            ConfigSection::Identity => "Identity",
+            ConfigSection::Llm => "LLM settings",
+            ConfigSection::Telegram => "Telegram settings",
+            ConfigSection::DataMemory => "Data directory & memory",
+            ConfigSection::Safety => "Safety profile",
+            ConfigSection::FullWizard => "Run full setup",
+        }
+    }
+
+    fn all() -> [ConfigSection; 6] {
+        [
+            ConfigSection::Identity,
+            ConfigSection::Llm,
+            ConfigSection::Telegram,
+            ConfigSection::DataMemory,
+            ConfigSection::Safety,
+            ConfigSection::FullWizard,
+        ]
+    }
+}
+
 fn run_onboarding_prompt(
     config: &mut AppConfig,
     mode: SetupMode,
     _models: AvailableModels,
 ) -> Result<()> {
-    if mode == SetupMode::Onboarding {
-        println!("onboarding");
-    } else {
-        println!("configuration wizard");
-    }
+    if mode == SetupMode::Configuration {
+        println!("Configuration Wizard");
+        loop {
+            let section = prompt_config_section()?;
+            match section {
+                ConfigSection::Identity => prompt_identity_settings(config, false)?,
+                ConfigSection::Llm => prompt_llm_settings(config)?,
+                ConfigSection::Telegram => prompt_telegram_settings(config)?,
+                ConfigSection::DataMemory => prompt_data_memory_settings(config)?,
+                ConfigSection::Safety => prompt_safety_settings(config)?,
+                ConfigSection::FullWizard => {
+                    prompt_identity_settings(config, false)?;
+                    prompt_llm_settings(config)?;
+                    prompt_data_memory_settings(config)?;
+                    prompt_safety_settings(config)?;
+                    prompt_telegram_settings(config)?;
+                }
+            }
 
-    let bot_name = prompt(
-        "Choose a name for your bot",
-        if config.agent.name.trim().is_empty() {
-            "Aigent"
-        } else {
-            &config.agent.name
-        },
-    )?;
-    config.agent.name = bot_name;
-
-    let provider = prompt(
-        "LLM provider (ollama/openrouter)",
-        if config.llm.provider.trim().is_empty() {
-            "ollama"
-        } else {
-            &config.llm.provider
-        },
-    )?;
-    let provider = normalize_provider(&provider)?;
-    if provider == "openrouter" {
-        config.llm.provider = "openrouter".to_string();
-        let model = prompt("OpenRouter model", &config.llm.openrouter_model)?;
-        config.llm.openrouter_model = model;
-
-        let key = prompt_optional("OpenRouter API key (leave blank to keep existing)")?;
-        if let Some(key) = key {
-            upsert_env_value(Path::new(".env"), "OPENROUTER_API_KEY", &key)?;
+            if !prompt_bool("Configure another section? (yes/no)", false)? {
+                break;
+            }
         }
     } else {
-        config.llm.provider = "ollama".to_string();
-        let model = prompt("Ollama model", &config.llm.ollama_model)?;
-        config.llm.ollama_model = model;
+        println!("Onboarding Wizard");
+        prompt_identity_settings(config, true)?;
+        prompt_llm_settings(config)?;
+        prompt_data_memory_settings(config)?;
+        prompt_safety_settings(config)?;
+        prompt_telegram_settings(config)?;
     }
 
-    let thinking_level = prompt(
-        "Thinking level (low/balanced/deep)",
-        &config.agent.thinking_level,
-    )?;
-    config.agent.thinking_level = normalize_thinking_level(&thinking_level)?;
-
-    let workspace = prompt("Workspace path", &config.agent.workspace_path)?;
-    config.agent.workspace_path = workspace;
-
-    let sleep_start = prompt(
-        "Night sleep start hour (0-23)",
-        &config.memory.night_sleep_start_hour.to_string(),
-    )?;
-    config.memory.night_sleep_start_hour = parse_hour(&sleep_start)?;
-    let sleep_end = prompt(
-        "Night sleep end hour (0-23)",
-        &config.memory.night_sleep_end_hour.to_string(),
-    )?;
-    config.memory.night_sleep_end_hour = parse_hour(&sleep_end)?;
-
-    let safety_profile = prompt("Safety profile (strict/power-user)", "strict")?;
-    let safety_profile = normalize_safety_profile(&safety_profile)?;
-    apply_safety_profile(config, &safety_profile);
-
-    let telegram_enabled = prompt_bool(
-        "Enable Telegram integration (yes/no)",
-        config.integrations.telegram_enabled,
-    )?;
-    config.integrations.telegram_enabled = telegram_enabled;
-    if telegram_enabled {
-        let token = prompt_optional("Telegram bot token (leave blank to keep existing)")?;
-        if let Some(token) = token {
-            upsert_env_value(Path::new(".env"), "TELEGRAM_BOT_TOKEN", &token)?;
-        }
-    }
-
-    let workspace = resolve_workspace_path(&config.agent.workspace_path)?;
-    apply_memory_contract(config, &workspace)?;
     config.onboarding.completed = true;
 
     Ok(())
@@ -160,7 +151,11 @@ fn run_onboarding_tui(
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut step = WizardStep::Welcome;
+    let mut step = if mode == SetupMode::Configuration {
+        WizardStep::ConfigMenu
+    } else {
+        WizardStep::Welcome
+    };
     let mut input = draft.value_for_step(step);
     let mut error_message: Option<String> = None;
 
@@ -187,11 +182,33 @@ fn run_onboarding_tui(
             }
 
             match key.code {
-                KeyCode::Esc => bail!("onboarding cancelled"),
+                KeyCode::Esc => {
+                    draft.apply_partial(config)?;
+                    if draft.provider == "openrouter" && !draft.openrouter_key.trim().is_empty() {
+                        upsert_env_value(
+                            Path::new(".env"),
+                            "OPENROUTER_API_KEY",
+                            draft.openrouter_key.trim(),
+                        )?;
+                    }
+                    if draft.telegram_enabled && !draft.telegram_token.trim().is_empty() {
+                        upsert_env_value(
+                            Path::new(".env"),
+                            "TELEGRAM_BOT_TOKEN",
+                            draft.telegram_token.trim(),
+                        )?;
+                    }
+                    return Ok(());
+                }
                 KeyCode::Backspace => {
                     if step.is_text_step() {
                         input.pop();
                     }
+                }
+                KeyCode::Left => {
+                    step = prev_step(step, &draft, mode);
+                    input = draft.value_for_step(step);
+                    error_message = None;
                 }
                 KeyCode::Up => {
                     draft.choice_prev(step);
@@ -200,6 +217,31 @@ fn run_onboarding_tui(
                 KeyCode::Down => {
                     draft.choice_next(step);
                     input = draft.value_for_step(step);
+                }
+                KeyCode::Char('b') if !step.is_text_step() => {
+                    step = prev_step(step, &draft, mode);
+                    input = draft.value_for_step(step);
+                    error_message = None;
+                }
+                KeyCode::Char('t') if !step.is_text_step() => {
+                    let tested = match step {
+                        WizardStep::Model | WizardStep::OpenRouterKey => {
+                            Some(test_llm_connection_for_draft(&draft).map(|ok| {
+                                format!("Connected ✓ {ok}")
+                            }))
+                        }
+                        WizardStep::TelegramToken => Some(test_telegram_connection(&draft.telegram_token).map(|_| {
+                            "Connected ✓ Telegram token looks valid".to_string()
+                        })),
+                        _ => None,
+                    };
+
+                    if let Some(result) = tested {
+                        error_message = Some(match result {
+                            Ok(msg) => msg,
+                            Err(err) => format!("Connection failed: {err}"),
+                        });
+                    }
                 }
                 KeyCode::Char(ch) => {
                     if step.is_text_step() {
@@ -230,8 +272,8 @@ fn run_onboarding_tui(
                         break;
                     }
 
-                    if step == WizardStep::Welcome {
-                        step = next_step(step, &draft);
+                    if step == WizardStep::Welcome || step == WizardStep::ConfigMenu {
+                        step = next_step(step, &draft, mode);
                         input = draft.value_for_step(step);
                         error_message = None;
                         continue;
@@ -241,7 +283,10 @@ fn run_onboarding_tui(
                         error_message = Some(err.to_string());
                         continue;
                     }
-                    step = next_step(step, &draft);
+                    step = next_step(step, &draft, mode);
+                    if step == WizardStep::ConfigMenu && mode == SetupMode::Configuration {
+                        let _ = draft.apply_partial(config);
+                    }
                     input = draft.value_for_step(step);
                     error_message = None;
                 }
@@ -265,9 +310,11 @@ fn run_onboarding_tui(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WizardStep {
+    ConfigMenu,
     Welcome,
+    UserName,
     BotName,
-    Workspace,
+    DataDirectory,
     Provider,
     Model,
     OpenRouterKey,
@@ -285,7 +332,8 @@ impl WizardStep {
         matches!(
             self,
             WizardStep::BotName
-                | WizardStep::Workspace
+                | WizardStep::UserName
+                | WizardStep::DataDirectory
                 | WizardStep::OpenRouterKey
                 | WizardStep::NightSleepStart
                 | WizardStep::NightSleepEnd
@@ -296,6 +344,8 @@ impl WizardStep {
 
 #[derive(Debug, Clone)]
 struct OnboardingDraft {
+    config_section: ConfigSection,
+    user_name: String,
     bot_name: String,
     workspace_path: String,
     provider: String,
@@ -314,6 +364,8 @@ struct OnboardingDraft {
 impl OnboardingDraft {
     fn from_config(config: &AppConfig, models: AvailableModels) -> Self {
         Self {
+            config_section: ConfigSection::Identity,
+            user_name: config.agent.user_name.clone(),
             bot_name: config.agent.name.clone(),
             workspace_path: config.agent.workspace_path.clone(),
             provider: config.llm.provider.clone(),
@@ -336,9 +388,11 @@ impl OnboardingDraft {
 
     fn value_for_step(&self, step: WizardStep) -> String {
         match step {
+            WizardStep::ConfigMenu => self.config_section.label().to_string(),
             WizardStep::Welcome => String::new(),
+            WizardStep::UserName => self.user_name.clone(),
             WizardStep::BotName => self.bot_name.clone(),
-            WizardStep::Workspace => self.workspace_path.clone(),
+            WizardStep::DataDirectory => self.workspace_path.clone(),
             WizardStep::Provider => self.provider.clone(),
             WizardStep::Model => {
                 if self.provider.eq_ignore_ascii_case("openrouter") {
@@ -367,17 +421,33 @@ impl OnboardingDraft {
     fn commit_step(&mut self, step: WizardStep, input: &str) -> Result<()> {
         let value = input.trim();
         match step {
+            WizardStep::ConfigMenu => {
+                if let Some((index, _)) = ConfigSection::all()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, section)| section.label().eq_ignore_ascii_case(value))
+                {
+                    self.config_section = ConfigSection::all()[index];
+                }
+            }
+            WizardStep::UserName => {
+                if value.is_empty() {
+                    bail!("user name cannot be empty");
+                }
+                self.user_name = value.to_string();
+            }
             WizardStep::BotName => {
                 if value.is_empty() {
                     bail!("bot name cannot be empty");
                 }
                 self.bot_name = value.to_string();
             }
-            WizardStep::Workspace => {
+            WizardStep::DataDirectory => {
                 if value.is_empty() {
-                    bail!("workspace path cannot be empty");
+                    bail!("data directory cannot be empty");
                 }
-                self.workspace_path = value.to_string();
+                let path = resolve_data_directory(value, ResolveDataDirMode::CreateIfMissing)?;
+                self.workspace_path = path.display().to_string();
             }
             WizardStep::Model => {
                 if value.is_empty() {
@@ -409,6 +479,14 @@ impl OnboardingDraft {
 
     fn choice_next(&mut self, step: WizardStep) {
         match step {
+            WizardStep::ConfigMenu => {
+                let all = ConfigSection::all();
+                let idx = all
+                    .iter()
+                    .position(|section| *section == self.config_section)
+                    .unwrap_or(0);
+                self.config_section = all[(idx + 1) % all.len()];
+            }
             WizardStep::Provider => {
                 self.provider = if self.provider.eq_ignore_ascii_case("openrouter") {
                     "ollama".to_string()
@@ -467,6 +545,15 @@ impl OnboardingDraft {
 
     fn choice_prev(&mut self, step: WizardStep) {
         match step {
+            WizardStep::ConfigMenu => {
+                let all = ConfigSection::all();
+                let idx = all
+                    .iter()
+                    .position(|section| *section == self.config_section)
+                    .unwrap_or(0);
+                let prev = if idx == 0 { all.len() - 1 } else { idx - 1 };
+                self.config_section = all[prev];
+            }
             WizardStep::Model => {
                 let is_openrouter = self.provider.eq_ignore_ascii_case("openrouter");
                 let models = if is_openrouter {
@@ -507,6 +594,7 @@ impl OnboardingDraft {
     }
 
     fn apply(&self, config: &mut AppConfig) -> Result<()> {
+        config.agent.user_name = self.user_name.clone();
         config.agent.name = self.bot_name.clone();
         config.agent.workspace_path = self.workspace_path.clone();
         config.llm.provider = normalize_provider(&self.provider)?;
@@ -519,19 +607,88 @@ impl OnboardingDraft {
         apply_safety_profile(config, &safety_profile);
         config.integrations.telegram_enabled = self.telegram_enabled;
 
-        let workspace = resolve_workspace_path(&config.agent.workspace_path)?;
+        let workspace = resolve_data_directory(
+            &config.agent.workspace_path,
+            ResolveDataDirMode::CreateIfMissing,
+        )?;
         apply_memory_contract(config, &workspace)?;
         config.onboarding.completed = true;
 
         Ok(())
     }
+
+    fn apply_partial(&self, config: &mut AppConfig) -> Result<()> {
+        if !self.user_name.trim().is_empty() {
+            config.agent.user_name = self.user_name.clone();
+        }
+        if !self.bot_name.trim().is_empty() {
+            config.agent.name = self.bot_name.clone();
+        }
+        if !self.workspace_path.trim().is_empty() {
+            config.agent.workspace_path = self.workspace_path.clone();
+        }
+        config.llm.provider = normalize_provider(&self.provider)?;
+        config.llm.ollama_model = self.ollama_model.clone();
+        config.llm.openrouter_model = self.openrouter_model.clone();
+        if let Ok(level) = normalize_thinking_level(&self.thinking_level) {
+            config.agent.thinking_level = level;
+        }
+        config.memory.night_sleep_start_hour = self.night_sleep_start_hour;
+        config.memory.night_sleep_end_hour = self.night_sleep_end_hour;
+        if let Ok(profile) = normalize_safety_profile(&self.safety_profile) {
+            apply_safety_profile(config, &profile);
+        }
+        config.integrations.telegram_enabled = self.telegram_enabled;
+        Ok(())
+    }
 }
 
-fn next_step(current: WizardStep, draft: &OnboardingDraft) -> WizardStep {
+fn next_step(current: WizardStep, draft: &OnboardingDraft, mode: SetupMode) -> WizardStep {
+    if mode == SetupMode::Configuration && draft.config_section != ConfigSection::FullWizard {
+        return match (draft.config_section, current) {
+            (ConfigSection::Identity, WizardStep::ConfigMenu) => WizardStep::UserName,
+            (ConfigSection::Identity, WizardStep::UserName) => WizardStep::BotName,
+            (ConfigSection::Identity, WizardStep::BotName) => WizardStep::ConfigMenu,
+
+            (ConfigSection::Llm, WizardStep::ConfigMenu) => WizardStep::Provider,
+            (ConfigSection::Llm, WizardStep::Provider) => WizardStep::Model,
+            (ConfigSection::Llm, WizardStep::Model) => {
+                if draft.provider.eq_ignore_ascii_case("openrouter") {
+                    WizardStep::OpenRouterKey
+                } else {
+                    WizardStep::ConfigMenu
+                }
+            }
+            (ConfigSection::Llm, WizardStep::OpenRouterKey) => WizardStep::ConfigMenu,
+
+            (ConfigSection::Telegram, WizardStep::ConfigMenu) => WizardStep::Messaging,
+            (ConfigSection::Telegram, WizardStep::Messaging) => {
+                if draft.telegram_enabled {
+                    WizardStep::TelegramToken
+                } else {
+                    WizardStep::ConfigMenu
+                }
+            }
+            (ConfigSection::Telegram, WizardStep::TelegramToken) => WizardStep::ConfigMenu,
+
+            (ConfigSection::DataMemory, WizardStep::ConfigMenu) => WizardStep::DataDirectory,
+            (ConfigSection::DataMemory, WizardStep::DataDirectory) => WizardStep::NightSleepStart,
+            (ConfigSection::DataMemory, WizardStep::NightSleepStart) => WizardStep::NightSleepEnd,
+            (ConfigSection::DataMemory, WizardStep::NightSleepEnd) => WizardStep::ConfigMenu,
+
+            (ConfigSection::Safety, WizardStep::ConfigMenu) => WizardStep::Safety,
+            (ConfigSection::Safety, WizardStep::Safety) => WizardStep::ConfigMenu,
+
+            _ => WizardStep::ConfigMenu,
+        };
+    }
+
     match current {
-        WizardStep::Welcome => WizardStep::BotName,
-        WizardStep::BotName => WizardStep::Workspace,
-        WizardStep::Workspace => WizardStep::Provider,
+        WizardStep::ConfigMenu => WizardStep::Welcome,
+        WizardStep::Welcome => WizardStep::UserName,
+        WizardStep::UserName => WizardStep::BotName,
+        WizardStep::BotName => WizardStep::DataDirectory,
+        WizardStep::DataDirectory => WizardStep::Provider,
         WizardStep::Provider => WizardStep::Model,
         WizardStep::Model => {
             if draft.provider.eq_ignore_ascii_case("openrouter") {
@@ -557,22 +714,131 @@ fn next_step(current: WizardStep, draft: &OnboardingDraft) -> WizardStep {
     }
 }
 
-fn step_number(step: WizardStep) -> usize {
-    match step {
-        WizardStep::Welcome => 1,
-        WizardStep::BotName => 2,
-        WizardStep::Workspace => 3,
-        WizardStep::Provider => 4,
-        WizardStep::Model => 5,
-        WizardStep::OpenRouterKey => 6,
-        WizardStep::Thinking => 7,
-        WizardStep::NightSleepStart => 8,
-        WizardStep::NightSleepEnd => 9,
-        WizardStep::Safety => 10,
-        WizardStep::Messaging => 11,
-        WizardStep::TelegramToken => 12,
-        WizardStep::Summary => 13,
+fn prev_step(current: WizardStep, draft: &OnboardingDraft, mode: SetupMode) -> WizardStep {
+    if mode == SetupMode::Configuration && draft.config_section != ConfigSection::FullWizard {
+        return match (draft.config_section, current) {
+            (_, WizardStep::ConfigMenu) => WizardStep::ConfigMenu,
+            (ConfigSection::Identity, WizardStep::UserName) => WizardStep::ConfigMenu,
+            (ConfigSection::Identity, WizardStep::BotName) => WizardStep::UserName,
+
+            (ConfigSection::Llm, WizardStep::Provider) => WizardStep::ConfigMenu,
+            (ConfigSection::Llm, WizardStep::Model) => WizardStep::Provider,
+            (ConfigSection::Llm, WizardStep::OpenRouterKey) => WizardStep::Model,
+
+            (ConfigSection::Telegram, WizardStep::Messaging) => WizardStep::ConfigMenu,
+            (ConfigSection::Telegram, WizardStep::TelegramToken) => WizardStep::Messaging,
+
+            (ConfigSection::DataMemory, WizardStep::DataDirectory) => WizardStep::ConfigMenu,
+            (ConfigSection::DataMemory, WizardStep::NightSleepStart) => WizardStep::DataDirectory,
+            (ConfigSection::DataMemory, WizardStep::NightSleepEnd) => {
+                WizardStep::NightSleepStart
+            }
+
+            (ConfigSection::Safety, WizardStep::Safety) => WizardStep::ConfigMenu,
+            _ => WizardStep::ConfigMenu,
+        };
     }
+
+    match current {
+        WizardStep::ConfigMenu => WizardStep::ConfigMenu,
+        WizardStep::Welcome => WizardStep::Welcome,
+        WizardStep::UserName => WizardStep::Welcome,
+        WizardStep::BotName => WizardStep::UserName,
+        WizardStep::DataDirectory => WizardStep::BotName,
+        WizardStep::Provider => WizardStep::DataDirectory,
+        WizardStep::Model => WizardStep::Provider,
+        WizardStep::OpenRouterKey => WizardStep::Model,
+        WizardStep::Thinking => {
+            if draft.provider.eq_ignore_ascii_case("openrouter") {
+                WizardStep::OpenRouterKey
+            } else {
+                WizardStep::Model
+            }
+        }
+        WizardStep::NightSleepStart => WizardStep::Thinking,
+        WizardStep::NightSleepEnd => WizardStep::NightSleepStart,
+        WizardStep::Safety => WizardStep::NightSleepEnd,
+        WizardStep::Messaging => WizardStep::Safety,
+        WizardStep::TelegramToken => WizardStep::Messaging,
+        WizardStep::Summary => {
+            if draft.telegram_enabled {
+                WizardStep::TelegramToken
+            } else {
+                WizardStep::Messaging
+            }
+        }
+    }
+}
+
+fn active_steps(mode: SetupMode, draft: &OnboardingDraft) -> Vec<WizardStep> {
+    if mode == SetupMode::Configuration {
+        return match draft.config_section {
+            ConfigSection::Identity => {
+                vec![WizardStep::ConfigMenu, WizardStep::UserName, WizardStep::BotName]
+            }
+            ConfigSection::Llm => {
+                let mut steps = vec![WizardStep::ConfigMenu, WizardStep::Provider, WizardStep::Model];
+                if draft.provider.eq_ignore_ascii_case("openrouter") {
+                    steps.push(WizardStep::OpenRouterKey);
+                }
+                steps
+            }
+            ConfigSection::Telegram => {
+                let mut steps = vec![WizardStep::ConfigMenu, WizardStep::Messaging];
+                if draft.telegram_enabled {
+                    steps.push(WizardStep::TelegramToken);
+                }
+                steps
+            }
+            ConfigSection::DataMemory => vec![
+                WizardStep::ConfigMenu,
+                WizardStep::DataDirectory,
+                WizardStep::NightSleepStart,
+                WizardStep::NightSleepEnd,
+            ],
+            ConfigSection::Safety => vec![WizardStep::ConfigMenu, WizardStep::Safety],
+            ConfigSection::FullWizard => {
+                let mut steps = vec![WizardStep::ConfigMenu];
+                steps.extend(active_steps(SetupMode::Onboarding, draft));
+                steps
+            }
+        };
+    }
+
+    let mut steps = vec![
+        WizardStep::Welcome,
+        WizardStep::UserName,
+        WizardStep::BotName,
+        WizardStep::DataDirectory,
+        WizardStep::Provider,
+        WizardStep::Model,
+    ];
+    if draft.provider.eq_ignore_ascii_case("openrouter") {
+        steps.push(WizardStep::OpenRouterKey);
+    }
+    steps.extend([
+        WizardStep::Thinking,
+        WizardStep::NightSleepStart,
+        WizardStep::NightSleepEnd,
+        WizardStep::Safety,
+        WizardStep::Messaging,
+    ]);
+    if draft.telegram_enabled {
+        steps.push(WizardStep::TelegramToken);
+    }
+    steps.push(WizardStep::Summary);
+    steps
+}
+
+fn step_progress(step: WizardStep, mode: SetupMode, draft: &OnboardingDraft) -> (usize, usize) {
+    let steps = active_steps(mode, draft);
+    let total = steps.len();
+    let index = steps
+        .iter()
+        .position(|candidate| *candidate == step)
+        .unwrap_or(0)
+        + 1;
+    (index, total)
 }
 
 fn draw_onboarding(
@@ -584,12 +850,18 @@ fn draw_onboarding(
     mode: SetupMode,
 ) -> Result<()> {
     let (title, description, input_display) = step_content(step, draft, input);
+    let theme = Theme::default();
+    let (step_index, step_total) = step_progress(step, mode, draft);
+    let progress = if step_total == 0 {
+        0.0
+    } else {
+        step_index as f64 / step_total as f64
+    };
 
     terminal.draw(|frame| {
         let area = frame.area();
 
-        // Center the wizard box
-        let wizard_area = center(area, Constraint::Length(70), Constraint::Length(24));
+        let wizard_area = center(area, Constraint::Length(92), Constraint::Length(26));
 
         let header_title = if mode == SetupMode::Onboarding {
             " Aigent Onboarding "
@@ -606,14 +878,14 @@ fn draw_onboarding(
                 ratatui::text::Line::from(Span::styled(
                     header_title,
                     Style::default()
-                        .fg(Color::LightBlue)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ))
                 .centered(),
             )
             .title_bottom(
                 ratatui::text::Line::from(Span::styled(
-                    format!(" Step {}/13 ", step_number(step)),
+                    format!(" Step {step_index}/{step_total} "),
                     Style::default().fg(Color::DarkGray),
                 ))
                 .right_aligned(),
@@ -621,22 +893,81 @@ fn draw_onboarding(
 
         frame.render_widget(block.clone(), wizard_area);
 
-        // Inner area
         let inner_area = wizard_area.inner(ratatui::layout::Margin {
             vertical: 1,
             horizontal: 2,
         });
 
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(24), Constraint::Min(40)])
+            .split(inner_area);
+
+        let sidebar_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.muted))
+            .title(" Steps ");
+        let sidebar_inner = sidebar_block.inner(columns[0]);
+        frame.render_widget(sidebar_block, columns[0]);
+
+        let labels = active_steps(mode, draft)
+            .into_iter()
+            .map(|candidate| {
+                let label = match candidate {
+                    WizardStep::ConfigMenu => "Configuration Menu",
+                    WizardStep::Welcome => "Welcome",
+                    WizardStep::UserName => "User Name",
+                    WizardStep::BotName => "Bot Name",
+                    WizardStep::DataDirectory => "Data Directory",
+                    WizardStep::Provider => "Provider",
+                    WizardStep::Model => "Model",
+                    WizardStep::OpenRouterKey => "OpenRouter Key",
+                    WizardStep::Thinking => "Thinking",
+                    WizardStep::NightSleepStart => "Sleep Start",
+                    WizardStep::NightSleepEnd => "Sleep End",
+                    WizardStep::Safety => "Safety",
+                    WizardStep::Messaging => "Messaging",
+                    WizardStep::TelegramToken => "Telegram Token",
+                    WizardStep::Summary => "Summary",
+                };
+
+                if candidate == step {
+                    Line::from(Span::styled(
+                        format!("> {label}"),
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        format!("  {label}"),
+                        Style::default().fg(theme.foreground),
+                    ))
+                }
+            })
+            .collect::<Vec<_>>();
+        frame.render_widget(Paragraph::new(labels), sidebar_inner);
+
+        let content_area = columns[1];
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1), // progress
                 Constraint::Length(2), // Title
                 Constraint::Min(3),    // Description
                 Constraint::Length(5), // Input box
                 Constraint::Length(1), // Spacer
                 Constraint::Length(2), // Footer/Error
             ])
-            .split(inner_area);
+            .split(content_area);
+
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(theme.accent).bg(theme.background))
+            .ratio(progress)
+            .label(format!("Step {step_index} of {step_total}"));
+        frame.render_widget(gauge, chunks[0]);
 
         // Title
         let title_widget = Paragraph::new(title)
@@ -646,21 +977,21 @@ fn draw_onboarding(
                     .add_modifier(Modifier::BOLD),
             )
             .alignment(ratatui::layout::Alignment::Center);
-        frame.render_widget(title_widget, chunks[0]);
+        frame.render_widget(title_widget, chunks[1]);
 
         // Description
         let desc_widget = Paragraph::new(description)
             .style(Style::default().fg(Color::Gray))
             .wrap(Wrap { trim: true })
             .alignment(ratatui::layout::Alignment::Center);
-        frame.render_widget(desc_widget, chunks[1]);
+        frame.render_widget(desc_widget, chunks[2]);
 
         // Input box
         if step != WizardStep::Welcome && step != WizardStep::Summary {
             let input_block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan));
+                .border_style(Style::default().fg(theme.accent));
             let input_widget = Paragraph::new(input_display)
                 .block(input_block)
                 .style(Style::default().fg(Color::White))
@@ -668,7 +999,7 @@ fn draw_onboarding(
                 .alignment(ratatui::layout::Alignment::Center);
 
             // Center the input box horizontally
-            let input_area = center(chunks[2], Constraint::Percentage(80), Constraint::Length(5));
+            let input_area = center(chunks[3], Constraint::Percentage(80), Constraint::Length(5));
             frame.render_widget(input_widget, input_area);
         } else if step == WizardStep::Summary {
             // For summary, we use the input box area for more description
@@ -677,29 +1008,37 @@ fn draw_onboarding(
                 .wrap(Wrap { trim: true })
                 .alignment(ratatui::layout::Alignment::Left);
 
-            let summary_area = chunks[1].union(chunks[2]).union(chunks[3]);
+            let summary_area = chunks[2].union(chunks[3]).union(chunks[4]);
             frame.render_widget(summary_widget, summary_area);
         }
 
         // Footer
         let footer_text = if let Some(message) = error_message {
-            Line::from(vec![
-                Span::styled(
-                    "Error: ",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(message, Style::default().fg(Color::LightRed)),
-            ])
+            let is_success = message.starts_with("Connected ✓");
+            if is_success {
+                Line::from(Span::styled(
+                    message,
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        "Error: ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(message, Style::default().fg(Color::LightRed)),
+                ])
+            }
         } else {
             Line::from(Span::styled(
-                "Enter=continue • Up/Down/Tab=cycle • Esc=cancel",
+                "Enter=next • Left/b=back • t=test connection • Esc=save draft & exit",
                 Style::default().fg(Color::DarkGray),
             ))
         };
 
         let footer_widget =
             Paragraph::new(footer_text).alignment(ratatui::layout::Alignment::Center);
-        frame.render_widget(footer_widget, chunks[4]);
+        frame.render_widget(footer_widget, chunks[5]);
     })?;
 
     Ok(())
@@ -815,6 +1154,17 @@ fn step_content<'a>(
     input: &'a str,
 ) -> (&'static str, String, ratatui::text::Text<'a>) {
     match step {
+        WizardStep::ConfigMenu => {
+            let options = ConfigSection::all()
+                .into_iter()
+                .map(ConfigSection::label)
+                .collect::<Vec<_>>();
+            (
+                "Configuration Menu",
+                "Select a settings area, then press Enter.".to_string(),
+                format_choice_list(&options, draft.config_section.label()),
+            )
+        }
         WizardStep::Welcome => (
             "Welcome to Aigent",
             "This wizard configures identity, memory policy, and safety.\n\nPress Enter to begin.".to_string(),
@@ -825,9 +1175,14 @@ fn step_content<'a>(
             "Choose a name for your bot. This is how it will identify itself.".to_string(),
             ratatui::text::Text::from(format!("\n{}\n", input)),
         ),
-        WizardStep::Workspace => (
-            "Workspace Path",
-            "Set the workspace path for operations. This is where the bot will store its memory and configuration.".to_string(),
+        WizardStep::UserName => (
+            "User Identity",
+            "What is your name? (the agent stores this in Core memory).".to_string(),
+            ratatui::text::Text::from(format!("\n{}\n", input)),
+        ),
+        WizardStep::DataDirectory => (
+            "Data Directory",
+            "Where Aigent stores memory files, event logs, vault exports, and config (default: aigent-data).".to_string(),
             ratatui::text::Text::from(format!("\n{}\n", input)),
         ),
         WizardStep::Provider => (
@@ -857,7 +1212,7 @@ fn step_content<'a>(
         WizardStep::OpenRouterKey => (
             "OpenRouter API Key",
             "Optional OpenRouter API key (saved to .env if set). Leave blank to keep existing.".to_string(),
-            ratatui::text::Text::from(format!("\n{}\n", input)),
+            ratatui::text::Text::from(format!("\n{}\n", mask_secret(input))),
         ),
         WizardStep::Thinking => (
             "Thinking Level",
@@ -887,7 +1242,7 @@ fn step_content<'a>(
         WizardStep::TelegramToken => (
             "Telegram Token",
             "Optional Telegram bot token (saved to .env if set). Leave blank to keep existing.".to_string(),
-            ratatui::text::Text::from(format!("\n{}\n", input)),
+            ratatui::text::Text::from(format!("\n{}\n", mask_secret(input))),
         ),
         WizardStep::Summary => {
             let docker_ok = command_exists("docker");
@@ -895,10 +1250,11 @@ fn step_content<'a>(
                 .join(".aigent")
                 .join("memory");
             (
-                "Memory Contract & Summary",
+                "Setup Summary",
                 String::new(),
                 ratatui::text::Text::from(format!(
-                    "Bot: {}\nProvider: {}\nModel: {}\nThinking: {}\nWorkspace: {}\nSleep mode: nightly ({}:00-{}:00 local)\nSafety: {}\nTelegram: {}\nDocker available: {}\nMemory path: {}\n\nMemory contract:\n- Event-log memory is canonical\n- Nightly sleep distills and promotes important memories\n- Core memories shape personality over time\n\nPress Enter to finalize setup.",
+                    "User: {}\nBot: {}\nProvider: {}\nModel: {}\nThinking: {}\nData directory: {}\nSleep mode: nightly ({}:00-{}:00 local)\nSafety: {}\nTelegram: {}\nDocker available: {}\nMemory path: {}\n\nMemory contract:\n- Event-log memory is canonical\n- Nightly sleep distills and promotes important memories\n- Core memories shape personality over time\n\nPress Enter to finalize setup.",
+                    draft.user_name,
                     draft.bot_name,
                     draft.provider,
                     if draft.provider.eq_ignore_ascii_case("openrouter") {
@@ -929,6 +1285,51 @@ fn command_exists(command: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok()
+}
+
+fn mask_secret(value: &str) -> String {
+    if value.is_empty() {
+        String::new()
+    } else {
+        "•".repeat(value.chars().count())
+    }
+}
+
+fn test_llm_connection_for_draft(draft: &OnboardingDraft) -> Result<String> {
+    let mut config = AppConfig::default();
+    draft.apply_partial(&mut config)?;
+    let runtime = AgentRuntime::new(config);
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(runtime.test_model_connection())
+}
+
+fn test_telegram_connection(token: &str) -> Result<()> {
+    let token = token.trim();
+    if token.is_empty() {
+        bail!("telegram token is empty")
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let url = format!("https://api.telegram.org/bot{token}/getMe");
+        let response = reqwest::Client::new().get(url).send().await?;
+        let payload: serde_json::Value = response.json().await?;
+        if payload
+            .get("ok")
+            .and_then(|ok| ok.as_bool())
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            bail!(
+                "telegram token rejected: {}",
+                payload
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("unknown error")
+            )
+        }
+    })
 }
 
 fn parse_hour(raw: &str) -> Result<u8> {
@@ -986,27 +1387,84 @@ fn normalize_safety_profile(raw: &str) -> Result<String> {
     }
 }
 
-fn resolve_workspace_path(raw: &str) -> Result<PathBuf> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("workspace path cannot be empty");
+fn detect_project_root() -> Option<PathBuf> {
+    let mut cursor = std::env::current_dir().ok()?;
+    loop {
+        if cursor.join("Cargo.toml").exists() {
+            return Some(cursor);
+        }
+        if !cursor.pop() {
+            return None;
+        }
     }
+}
 
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let path = if trimmed == "~" {
-        home.ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?
-    } else if let Some(rest) = trimmed.strip_prefix("~/") {
-        home.ok_or_else(|| anyhow::anyhow!("failed to resolve home directory"))?
-            .join(rest)
-    } else {
-        PathBuf::from(trimmed)
+fn is_forbidden_data_dir(path: &Path) -> bool {
+    let Some(root) = detect_project_root() else {
+        return false;
     };
 
-    if !path.exists() {
-        bail!("workspace path does not exist: {}", path.display());
+    let path = path.to_path_buf();
+    if path == root {
+        return true;
     }
+
+    let forbidden = [
+        "crates",
+        "src",
+        "target",
+        ".git",
+        "config",
+        "docs",
+        "skills-src",
+        "wit",
+        ".aigent",
+    ];
+
+    forbidden
+        .iter()
+        .map(|segment| root.join(segment))
+        .any(|blocked| path.starts_with(blocked))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolveDataDirMode {
+    AskToCreate,
+    CreateIfMissing,
+}
+
+fn resolve_data_directory(raw: &str, mode: ResolveDataDirMode) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    let chosen = if trimmed.is_empty() {
+        "aigent-data"
+    } else {
+        trimmed
+    };
+
+    let mut path = PathBuf::from(chosen);
+    if !path.is_absolute() {
+        path = std::env::current_dir()?.join(path);
+    }
+
+    if is_forbidden_data_dir(&path) {
+        bail!("forbidden data directory; choose a path outside project source folders")
+    }
+
+    if !path.exists() {
+        match mode {
+            ResolveDataDirMode::AskToCreate => {
+                let create = prompt_bool("Directory does not exist. Create it? (Y/n)", true)?;
+                if !create {
+                    bail!("data directory does not exist")
+                }
+            }
+            ResolveDataDirMode::CreateIfMissing => {}
+        }
+        fs::create_dir_all(&path)?;
+    }
+
     if !path.is_dir() {
-        bail!("workspace path must be a directory: {}", path.display());
+        bail!("data directory must be a directory: {}", path.display());
     }
 
     Ok(path)
@@ -1019,6 +1477,131 @@ fn apply_memory_contract(config: &mut AppConfig, workspace: &Path) -> Result<()>
 
     let memory_dir = workspace.join(".aigent").join("memory");
     fs::create_dir_all(&memory_dir)?;
+    Ok(())
+}
+
+fn prompt_config_section() -> Result<ConfigSection> {
+    println!("\nChoose a section to configure:");
+    for (index, section) in ConfigSection::all().iter().enumerate() {
+        println!("  {}. {}", index + 1, section.label());
+    }
+
+    loop {
+        let raw = prompt("Section number", "6")?;
+        if let Ok(number) = raw.trim().parse::<usize>() {
+            if (1..=ConfigSection::all().len()).contains(&number) {
+                return Ok(ConfigSection::all()[number - 1]);
+            }
+        }
+        println!("Enter a valid number from 1 to 6.");
+    }
+}
+
+fn prompt_identity_settings(config: &mut AppConfig, require_user_name: bool) -> Result<()> {
+    let user_default = if config.agent.user_name.trim().is_empty() {
+        ""
+    } else {
+        &config.agent.user_name
+    };
+    let user_name = prompt("What is your name?", user_default)?;
+    if require_user_name && user_name.trim().is_empty() {
+        bail!("user name is required");
+    }
+    if !user_name.trim().is_empty() {
+        config.agent.user_name = user_name;
+    }
+
+    let bot_name = prompt(
+        "Choose a name for your bot",
+        if config.agent.name.trim().is_empty() {
+            "Aigent"
+        } else {
+            &config.agent.name
+        },
+    )?;
+    config.agent.name = bot_name;
+    Ok(())
+}
+
+fn prompt_llm_settings(config: &mut AppConfig) -> Result<()> {
+    let provider = prompt(
+        "LLM provider (ollama/openrouter)",
+        if config.llm.provider.trim().is_empty() {
+            "ollama"
+        } else {
+            &config.llm.provider
+        },
+    )?;
+    let provider = normalize_provider(&provider)?;
+    if provider == "openrouter" {
+        config.llm.provider = "openrouter".to_string();
+        let model = prompt("OpenRouter model", &config.llm.openrouter_model)?;
+        config.llm.openrouter_model = model;
+
+        let key = prompt_optional("OpenRouter API key (leave blank to keep existing)")?;
+        if let Some(key) = key {
+            upsert_env_value(Path::new(".env"), "OPENROUTER_API_KEY", &key)?;
+        }
+    } else {
+        config.llm.provider = "ollama".to_string();
+        let model = prompt("Ollama model", &config.llm.ollama_model)?;
+        config.llm.ollama_model = model;
+    }
+
+    let thinking_level = prompt(
+        "Thinking level (low/balanced/deep)",
+        &config.agent.thinking_level,
+    )?;
+    config.agent.thinking_level = normalize_thinking_level(&thinking_level)?;
+    Ok(())
+}
+
+fn prompt_data_memory_settings(config: &mut AppConfig) -> Result<()> {
+    let data_dir_default = if config.agent.workspace_path.trim().is_empty()
+        || config.agent.workspace_path.trim() == "."
+    {
+        "aigent-data"
+    } else {
+        &config.agent.workspace_path
+    };
+    let workspace = prompt("Data directory", data_dir_default)?;
+    let workspace = resolve_data_directory(&workspace, ResolveDataDirMode::AskToCreate)?;
+    config.agent.workspace_path = workspace.display().to_string();
+
+    let sleep_start = prompt(
+        "Night sleep start hour (0-23)",
+        &config.memory.night_sleep_start_hour.to_string(),
+    )?;
+    config.memory.night_sleep_start_hour = parse_hour(&sleep_start)?;
+    let sleep_end = prompt(
+        "Night sleep end hour (0-23)",
+        &config.memory.night_sleep_end_hour.to_string(),
+    )?;
+    config.memory.night_sleep_end_hour = parse_hour(&sleep_end)?;
+
+    apply_memory_contract(config, &workspace)?;
+    Ok(())
+}
+
+fn prompt_safety_settings(config: &mut AppConfig) -> Result<()> {
+    let safety_profile = prompt("Safety profile (strict/power-user)", "strict")?;
+    let safety_profile = normalize_safety_profile(&safety_profile)?;
+    apply_safety_profile(config, &safety_profile);
+    Ok(())
+}
+
+fn prompt_telegram_settings(config: &mut AppConfig) -> Result<()> {
+    let telegram_enabled = prompt_bool(
+        "Enable Telegram integration (yes/no)",
+        config.integrations.telegram_enabled,
+    )?;
+    config.integrations.telegram_enabled = telegram_enabled;
+    if telegram_enabled {
+        let token = prompt_optional("Telegram bot token (leave blank to keep existing)")?;
+        if let Some(token) = token {
+            upsert_env_value(Path::new(".env"), "TELEGRAM_BOT_TOKEN", &token)?;
+        }
+    }
     Ok(())
 }
 

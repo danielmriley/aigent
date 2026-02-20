@@ -268,6 +268,9 @@ impl OllamaClient {
                 }
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                     if let Some(content) = json.get("response").and_then(|v| v.as_str()) {
+                        if content.is_empty() {
+                            continue;
+                        }
                         full_response.push_str(content);
                         let _ = tx.send(content.to_string()).await;
                     }
@@ -386,6 +389,9 @@ impl OpenRouterClient {
                                     .and_then(|delta| delta.get("content"))
                                     .and_then(|content| content.as_str())
                                 {
+                                    if content.is_empty() {
+                                        continue;
+                                    }
                                     full_response.push_str(content);
                                     let _ = tx.send(content.to_string()).await;
                                 }

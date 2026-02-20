@@ -15,7 +15,7 @@ use fs2::FileExt;
 use tracing_subscriber::EnvFilter;
 
 use aigent_config::AppConfig;
-use aigent_runtime::{
+use aigent_daemon::{
     BackendEvent, DaemonClient, run_unified_daemon,
 };
 use aigent_llm::{list_ollama_models, list_openrouter_models};
@@ -162,7 +162,6 @@ async fn main() -> Result<()> {
                 let models = fetch_available_models().await;
                 run_onboarding(&mut config, models)?;
                 config.save_to("config/default.toml")?;
-                seed_identity_from_config(&config, &memory_log_path)?;
             }
 
             run_start_mode(config, &memory_log_path).await?;
@@ -172,7 +171,6 @@ async fn main() -> Result<()> {
                 let models = fetch_available_models().await;
                 run_onboarding(&mut config, models)?;
                 config.save_to("config/default.toml")?;
-                seed_identity_from_config(&config, &memory_log_path)?;
             }
 
             run_telegram_runtime(config, &memory_log_path).await?;
@@ -317,8 +315,6 @@ struct DaemonPaths {
     log_file: PathBuf,
     mode_file: PathBuf,
     lock_file: PathBuf,
-    telegram_pid_file: PathBuf,
-    telegram_lock_file: PathBuf,
 }
 
 fn daemon_paths() -> DaemonPaths {
@@ -328,8 +324,6 @@ fn daemon_paths() -> DaemonPaths {
         log_file: runtime_dir.join("daemon.log"),
         mode_file: runtime_dir.join("daemon.mode"),
         lock_file: runtime_dir.join("daemon.lock"),
-        telegram_pid_file: runtime_dir.join("telegram.pid"),
-        telegram_lock_file: runtime_dir.join("telegram.lock"),
         runtime_dir,
     }
 }
@@ -504,32 +498,14 @@ fn daemon_status() -> Result<()> {
             println!("- channel: {mode}");
             println!("- socket: {}", socket_path.display());
             println!("- log: {}", paths.log_file.display());
-        } else {
-            println!("daemon status: stopped");
-            println!("- channel: {mode}");
-            println!("- socket: {}", socket_path.display());
-            println!("- log: {}", paths.log_file.display());
+            return Ok(());
         }
-    } else {
-        println!("daemon status: stopped");
-        println!("- channel: {mode}");
-        println!("- socket: {}", socket_path.display());
-        println!("- log: {}", paths.log_file.display());
     }
 
-    // Telegram bot status
-    if let Some(tg_pid) = read_pid(&paths.telegram_pid_file)? {
-        if is_pid_running(tg_pid) {
-            println!("telegram status: running");
-            println!("- pid: {tg_pid}");
-        } else {
-            println!("telegram status: stopped (stale pid {tg_pid})");
-            let _ = fs::remove_file(&paths.telegram_pid_file);
-        }
-    } else {
-        println!("telegram status: stopped");
-    }
-
+    println!("daemon status: stopped");
+    println!("- channel: {mode}");
+    println!("- socket: {}", socket_path.display());
+    println!("- log: {}", paths.log_file.display());
     Ok(())
 }
 
@@ -636,18 +612,6 @@ async fn run_start_mode(config: AppConfig, memory_log_path: &Path) -> Result<()>
     ensure_daemon_running(&config)?;
 
     if interactive_terminal {
-        // If Telegram is enabled, run the bot in the background alongside the TUI.
-        // Skip silently if another process already holds the lock (e.g. `aigent telegram`).
-        if config.integrations.telegram_enabled {
-            let tg_config = config.clone();
-            let tg_memory_log = memory_log_path.to_path_buf();
-            tokio::spawn(async move {
-                if let Err(err) = run_telegram_runtime_guarded(tg_config, &tg_memory_log, true).await {
-                    eprintln!("[telegram] bot exited: {err}");
-                }
-            });
-        }
-
         println!("{}", aigent_ui::tui::banner());
         let client = DaemonClient::new(&config.daemon.socket_path);
         return run_interactive_session(&config, client).await;
@@ -663,16 +627,6 @@ async fn run_start_mode(config: AppConfig, memory_log_path: &Path) -> Result<()>
 }
 
 async fn run_telegram_runtime(config: AppConfig, memory_log_path: &Path) -> Result<()> {
-    run_telegram_runtime_guarded(config, memory_log_path, false).await
-}
-
-/// `silent_if_locked`: when true (background mode), skip without error if another instance
-/// already holds the lock. When false (explicit `aigent telegram`), error immediately.
-async fn run_telegram_runtime_guarded(
-    config: AppConfig,
-    memory_log_path: &Path,
-    silent_if_locked: bool,
-) -> Result<()> {
     if config.needs_onboarding() {
         bail!("onboarding not complete; run `aigent onboard` first");
     }
@@ -685,34 +639,8 @@ async fn run_telegram_runtime_guarded(
 
     let _ = memory_log_path;
     ensure_daemon_running(&config)?;
-
-    // Acquire an exclusive lock to prevent duplicate polling instances.
-    let paths = daemon_paths();
-    fs::create_dir_all(&paths.runtime_dir)?;
-    let lock_file = File::create(&paths.telegram_lock_file)?;
-    match lock_file.try_lock_exclusive() {
-        Ok(()) => {}
-        Err(_) => {
-            if silent_if_locked {
-                return Ok(());
-            }
-            bail!(
-                "another Telegram bot instance is already running (lock held at {})",
-                paths.telegram_lock_file.display()
-            );
-        }
-    }
-
-    fs::write(&paths.telegram_pid_file, std::process::id().to_string())?;
-
     let client = DaemonClient::new(&config.daemon.socket_path);
-    let result = start_bot(client).await;
-
-    // Cleanup regardless of success/failure.
-    let _ = fs::remove_file(&paths.telegram_pid_file);
-    // lock_file drop releases the OS lock automatically.
-
-    result
+    start_bot(client).await
 }
 
 fn ensure_daemon_running(config: &AppConfig) -> Result<()> {
@@ -767,7 +695,7 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                 aigent_ui::UiCommand::Submit(line) => {
                     if line == "/help" {
                         let _ = backend_tx.send(BackendEvent::Token(
-                            "Commands: /help, /status, /memory, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
+                            "Commands: /help, /status, /memory, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
                         ));
                         let _ = backend_tx.send(BackendEvent::Done);
                         return Ok(());
@@ -776,15 +704,12 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                         match daemon.get_status().await {
                             Ok(status) => {
                                 let text = format!(
-                                    "bot: {}\nprovider: {}\nmodel: {}\nthinking: {}\nmemory: {} total (core={}, semantic={}, episodic={})\nuptime: {}s",
+                                    "bot: {}\nprovider: {}\nmodel: {}\nthinking: {}\nmemories: {}\nuptime: {}s",
                                     status.bot_name,
                                     status.provider,
                                     status.model,
                                     status.thinking_level,
                                     status.memory_total,
-                                    status.memory_core,
-                                    status.memory_semantic,
-                                    status.memory_episodic,
                                     status.uptime_secs
                                 );
                                 let _ = backend_tx.send(BackendEvent::Token(text));
@@ -866,57 +791,6 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                         return Ok(());
                     }
 
-                    if line == "/tools" {
-                        match daemon.list_tools().await {
-                            Ok(specs) => {
-                                if specs.is_empty() {
-                                    let _ = backend_tx.send(BackendEvent::Token("(no tools registered)".to_string()));
-                                } else {
-                                    let mut text = String::from("**Available tools:**\n");
-                                    for spec in &specs {
-                                        text.push_str(&format!("- **{}** — {}\n", spec.name, spec.description));
-                                        for p in &spec.params {
-                                            let req = if p.required { " (required)" } else { "" };
-                                            text.push_str(&format!("  - `{}`{}: {}\n", p.name, req, p.description));
-                                        }
-                                    }
-                                    let _ = backend_tx.send(BackendEvent::Token(text));
-                                }
-                                let _ = backend_tx.send(BackendEvent::Done);
-                            }
-                            Err(err) => {
-                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
-                            }
-                        }
-                        return Ok(());
-                    }
-
-                    if line.starts_with("/tools run ") {
-                        let rest = line.strip_prefix("/tools run ").unwrap().trim();
-                        let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-                        let tool_name = parts[0].to_string();
-                        let raw_args = parts.get(1).unwrap_or(&"{}");
-                        let args: std::collections::HashMap<String, String> = match serde_json::from_str(raw_args) {
-                            Ok(a) => a,
-                            Err(err) => {
-                                let _ = backend_tx.send(BackendEvent::Error(format!("invalid args JSON: {err}")));
-                                return Ok(());
-                            }
-                        };
-                        match daemon.execute_tool(&tool_name, args).await {
-                            Ok((success, output)) => {
-                                let status = if success { "success" } else { "failed" };
-                                let text = format!("**Tool {status}:**\n```\n{output}\n```");
-                                let _ = backend_tx.send(BackendEvent::Token(text));
-                                let _ = backend_tx.send(BackendEvent::Done);
-                            }
-                            Err(err) => {
-                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
-                            }
-                        }
-                        return Ok(());
-                    }
-
                     tokio::spawn(async move {
                         let _ = daemon.stream_submit(line, "tui", backend_tx.clone()).await;
                     });
@@ -972,8 +846,7 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
             println!("provider: {}", status.provider);
             println!("model: {}", status.model);
             println!("thinking: {}", status.thinking_level);
-            println!("memory: {} total (core={}, semantic={}, episodic={})",
-                status.memory_total, status.memory_core, status.memory_semantic, status.memory_episodic);
+            println!("memories: {}", status.memory_total);
             println!("uptime: {}s", status.uptime_secs);
             continue;
         }

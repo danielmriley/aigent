@@ -1,16 +1,16 @@
 [workspace]
 members = [
-  "crates/aigent-app",
-  "crates/aigent-core",
-  "crates/aigent-config",
-  "crates/aigent-memory",
-  "crates/aigent-llm",
-  "crates/aigent-exec",
-  "crates/aigent-tools",
-  "crates/aigent-ui",
-  "crates/aigent-telegram",
-  "crates/aigent-daemon",
-  "crates/aigent-audit",
+  "crates/interfaces/cli",
+  "crates/core",
+  "crates/config",
+  "crates/memory",
+  "crates/llm",
+  "crates/exec",
+  "crates/tools",
+  "crates/interfaces/tui",
+  "crates/interfaces/telegram",
+  "crates/runtime",
+  "crates/audit",
 ]
 resolver = "2"
 
