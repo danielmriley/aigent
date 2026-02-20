@@ -456,10 +456,10 @@ async fn run_start_mode(config: AppConfig, memory_log_path: &Path) -> Result<()>
         let mut memory = MemoryManager::with_event_log(memory_log_path)?;
         seed_identity_memory(&mut memory, &config.agent.name)?;
 
-        let mut runtime = AgentRuntime::new(config);
+        let runtime = AgentRuntime::new(config);
         runtime.run().await?;
         println!("{}", aigent_ui::tui::banner());
-        let session_result = run_interactive_session(&mut runtime, &mut memory).await;
+        let session_result = run_interactive_session(runtime, memory).await;
 
         if let Some(child) = service_worker.as_mut() {
             let _ = child.kill();
@@ -560,25 +560,19 @@ fn seed_identity_memory(memory: &mut MemoryManager, bot_name: &str) -> Result<()
 }
 
 async fn run_interactive_session(
-    runtime: &mut AgentRuntime,
-    memory: &mut MemoryManager,
+    mut runtime: AgentRuntime,
+    mut memory: MemoryManager,
 ) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return run_interactive_line_session(runtime, memory).await;
+        return run_interactive_line_session(&mut runtime, &mut memory).await;
     }
-
-    let transcript: Vec<String> = aigent_ui::tui::banner()
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(ToString::to_string)
-        .collect();
 
     let (backend_tx, backend_rx) = aigent_ui::tui::create_backend_channel();
     let mut app = aigent_ui::App::new(backend_rx, &runtime.config);
-    for line in transcript {
-        app.push_assistant_message(line);
-    }
-    app.push_assistant_message("Type /help for commands. Press Tab for autocomplete.".to_string());
+    app.push_assistant_message(format!(
+        "{} is online. Type /help for commands.",
+        runtime.config.agent.name
+    ));
 
     let turn_count: usize = 0;
     let recent_turns: VecDeque<ConversationTurn> = VecDeque::new();
@@ -598,40 +592,45 @@ async fn run_interactive_session(
             match command {
                 aigent_ui::UiCommand::Quit => {}
                 aigent_ui::UiCommand::Submit(line) => {
-                    let (tx_chunk, mut rx_chunk) = tokio::sync::mpsc::channel(100);
-                    let tx_backend_chunks = backend_tx.clone();
                     tokio::spawn(async move {
-                        while let Some(chunk) = rx_chunk.recv().await {
-                            let _ = tx_backend_chunks.send(BackendEvent::Token(chunk));
-                        }
-                    });
+                        let _ = backend_tx.send(BackendEvent::Thinking);
 
-                    let mut runtime = runtime.lock().await;
-                    let mut memory = memory.lock().await;
-                    let mut turn_count = turn_count.lock().await;
-                    let mut recent_turns = recent_turns.lock().await;
+                        let (tx_chunk, mut rx_chunk) = tokio::sync::mpsc::channel(100);
+                        let tx_backend_chunks = backend_tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(chunk) = rx_chunk.recv().await {
+                                let _ = tx_backend_chunks.send(BackendEvent::Token(chunk));
+                            }
+                        });
 
-                    let outcome = handle_interactive_input(
-                        &mut **runtime,
-                        &mut **memory,
-                        &line,
-                        &mut *turn_count,
-                        &mut *recent_turns,
-                        Some(tx_chunk),
-                    )
-                    .await;
+                        let mut runtime = runtime.lock().await;
+                        let mut memory = memory.lock().await;
+                        let mut turn_count = turn_count.lock().await;
+                        let mut recent_turns = recent_turns.lock().await;
 
-                    match outcome {
-                        Ok(outcome) => {
-                            for msg in outcome.messages {
-                                let _ = backend_tx.send(BackendEvent::Token(msg));
+                        let outcome = handle_interactive_input(
+                            &mut *runtime,
+                            &mut *memory,
+                            &line,
+                            &mut *turn_count,
+                            &mut *recent_turns,
+                            Some(tx_chunk),
+                        )
+                        .await;
+
+                        match outcome {
+                            Ok(outcome) => {
                                 let _ = backend_tx.send(BackendEvent::Done);
+                                for msg in outcome.messages {
+                                    let _ = backend_tx.send(BackendEvent::Token(msg));
+                                    let _ = backend_tx.send(BackendEvent::Done);
+                                }
+                            }
+                            Err(err) => {
+                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
                             }
                         }
-                        Err(err) => {
-                            let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
-                        }
-                    }
+                    });
                 }
             }
             Ok(())
@@ -858,6 +857,7 @@ async fn handle_interactive_input(
 
     let mut messages = Vec::new();
     let recent_context = recent_turns.iter().cloned().collect::<Vec<_>>();
+    let is_streaming = tx.is_some();
     let reply = if let Some(tx) = tx {
         runtime
             .respond_and_remember_stream(memory, line, &recent_context, tx)
@@ -867,7 +867,9 @@ async fn handle_interactive_input(
             .respond_and_remember(memory, line, &recent_context)
             .await?
     };
-    messages.push(format!("aigent> {reply}"));
+    if !is_streaming {
+        messages.push(format!("aigent> {reply}"));
+    }
 
     recent_turns.push_back(ConversationTurn {
         user: line.to_string(),

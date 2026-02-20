@@ -1,6 +1,6 @@
 use arboard::Clipboard;
 use chrono::Local;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use ignore::WalkBuilder;
@@ -22,7 +22,11 @@ use aigent_daemon::BackendEvent;
 use crate::{
     events::AppEvent,
     theme::Theme,
-    widgets::{chat::draw_chat, input::draw_input, sidebar::draw_sidebar},
+    widgets::{
+        chat::{chat_visual_line_count, draw_chat, message_visual_line_start},
+        input::draw_input,
+        sidebar::draw_sidebar,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -46,6 +50,7 @@ pub struct Message {
 
 #[derive(Debug, Clone)]
 pub struct AppState {
+    pub bot_name: String,
     pub sessions: Vec<String>,
     pub current_session: usize,
     pub messages: Vec<Message>,
@@ -77,9 +82,12 @@ pub struct App {
     pub focus: Focus,
     pub theme: Theme,
     pub scroll: usize,
+    pub max_scroll: usize,
+    pub auto_follow: bool,
     pub show_sidebar: bool,
     pub spinner_tick: usize,
     pub pending_stream: String,
+    pub input_wrap_width: usize,
     pub workspace_files: Vec<String>,
     pub file_popup: FilePopup,
     pub command_palette: CommandPalette,
@@ -92,6 +100,7 @@ impl App {
 
         Self {
             state: AppState {
+                bot_name: config.agent.name.clone(),
                 sessions: vec!["default".to_string()],
                 current_session: 0,
                 messages: Vec::new(),
@@ -109,9 +118,12 @@ impl App {
             focus: Focus::Input,
             theme: Theme::default(),
             scroll: 0,
+            max_scroll: 0,
+            auto_follow: true,
             show_sidebar: true,
             spinner_tick: 0,
             pending_stream: String::new(),
+            input_wrap_width: 60,
             workspace_files: collect_workspace_files(Path::new(".")),
             file_popup: FilePopup {
                 visible: false,
@@ -170,6 +182,20 @@ impl App {
                 self.refresh_file_popup();
                 None
             }
+            AppEvent::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.auto_follow = false;
+                        self.scroll = self.scroll.saturating_sub(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scroll = self.scroll.saturating_add(3).min(self.max_scroll);
+                        self.auto_follow = self.scroll >= self.max_scroll;
+                    }
+                    _ => {}
+                }
+                None
+            }
             AppEvent::Resize(_, _) => None,
             AppEvent::Backend(be) => {
                 self.apply_backend(be);
@@ -188,6 +214,25 @@ impl App {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
                     self.command_palette.visible = !self.command_palette.visible;
                     return None;
+                }
+
+                match key.code {
+                    KeyCode::PageUp => {
+                        self.auto_follow = false;
+                        self.scroll = self.scroll.saturating_sub(5);
+                        return None;
+                    }
+                    KeyCode::PageDown => {
+                        self.scroll = self.scroll.saturating_add(5).min(self.max_scroll);
+                        self.auto_follow = self.scroll >= self.max_scroll;
+                        return None;
+                    }
+                    KeyCode::End => {
+                        self.auto_follow = true;
+                        self.scroll = self.max_scroll;
+                        return None;
+                    }
+                    _ => {}
                 }
 
                 if self.command_palette.visible {
@@ -252,6 +297,7 @@ impl App {
                         KeyCode::Esc => {
                             self.state.history_mode = false;
                             self.state.selected_message = None;
+                            self.auto_follow = true;
                         }
                         KeyCode::Up => {
                             let current = self
@@ -259,12 +305,14 @@ impl App {
                                 .selected_message
                                 .unwrap_or_else(|| self.state.messages.len().saturating_sub(1));
                             self.state.selected_message = Some(current.saturating_sub(1));
+                            self.auto_follow = false;
                         }
                         KeyCode::Down => {
                             let current = self.state.selected_message.unwrap_or(0);
                             self.state.selected_message = Some(
                                 (current + 1).min(self.state.messages.len().saturating_sub(1)),
                             );
+                            self.auto_follow = false;
                         }
                         KeyCode::Char('c') => {
                             if let Some(code) = self.selected_code_block() {
@@ -309,10 +357,11 @@ impl App {
                         self.state.history_mode = true;
                         self.state.selected_message =
                             Some(self.state.messages.len().saturating_sub(1));
+                        self.auto_follow = false;
                         None
                     }
                     KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
-                        let text = self.input_text().trim().to_string();
+                        let text = normalize_for_submit(&self.input_text());
                         if text.is_empty() {
                             return None;
                         }
@@ -322,6 +371,7 @@ impl App {
                             return Some(UiCommand::Quit);
                         }
                         self.push_user_message(text.clone());
+                        self.auto_follow = true;
                         self.clear_input();
                         self.state.status = "thinking...".to_string();
                         Some(UiCommand::Submit(text))
@@ -348,11 +398,21 @@ impl App {
                             alt: key.modifiers.contains(KeyModifiers::ALT),
                             shift: key.modifiers.contains(KeyModifiers::SHIFT),
                         });
+                        self.apply_input_soft_wrap();
                         self.refresh_file_popup();
                         None
                     }
                 }
             }
+        }
+    }
+
+    fn apply_input_soft_wrap(&mut self) {
+        let raw = self.input_text();
+        let wrapped = soft_wrap_text(&raw, self.input_wrap_width);
+        if wrapped != raw {
+            self.textarea = TextArea::default();
+            self.textarea.insert_str(&wrapped);
         }
     }
 
@@ -416,19 +476,24 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
+        self.input_wrap_width = usize::from(frame.area().width.saturating_sub(4)).max(8);
+        self.apply_input_soft_wrap();
+        let input_line_count = self.textarea.lines().len().max(1);
+        let input_height = (input_line_count as u16 + 2).clamp(3, 8);
+
         let outer = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(5),
-                Constraint::Length(10),
+                Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
             .split(frame.area());
 
         let header = Paragraph::new(Line::from(format!(
-            "Aigent • {} • Ctrl+S sidebar • Esc history",
-            self.state.status
+            "{} • {} • Ctrl+S sidebar • Esc history",
+            self.state.bot_name, self.state.status
         )));
         frame.render_widget(header, outer[0]);
 
@@ -444,16 +509,47 @@ impl App {
                 .split(outer[1])
         };
 
+        let selected = if self.state.history_mode {
+            self.state.selected_message
+        } else {
+            None
+        };
+        let chat_content_width = middle[0].width.saturating_sub(2);
+        let line_count = chat_visual_line_count(
+            &self.state.messages,
+            &self.theme,
+            selected,
+            &self.state.bot_name,
+            chat_content_width,
+        );
+        let chat_body_height = middle[0].height.saturating_sub(2) as usize;
+        self.max_scroll = line_count.saturating_sub(chat_body_height);
+        if self.state.history_mode {
+            if let Some(selected_message) = self.state.selected_message {
+                let selected_start = message_visual_line_start(
+                    &self.state.messages,
+                    &self.theme,
+                    &self.state.bot_name,
+                    selected_message,
+                    chat_content_width,
+                );
+                self.scroll = selected_start.min(self.max_scroll);
+            }
+        }
+        if self.auto_follow {
+            self.scroll = self.max_scroll;
+        } else {
+            self.scroll = self.scroll.min(self.max_scroll);
+        }
+
         draw_chat(
             frame,
             middle[0],
             &self.state.messages,
             &self.theme,
-            if self.state.history_mode {
-                self.state.selected_message
-            } else {
-                None
-            },
+            selected,
+            &self.state.bot_name,
+            self.scroll,
         );
 
         if self.show_sidebar {
@@ -526,7 +622,7 @@ impl App {
         }
 
         let footer = Paragraph::new(Line::from(
-            "Enter send • Alt+Enter newline • Ctrl+K commands • @ file picker • history: Esc/Up/Down",
+            "Enter send • Alt+Enter newline • Ctrl+K commands • Alt+S select/copy • @ file picker • history: Esc/Up/Down",
         ));
         frame.render_widget(footer, outer[3]);
     }
@@ -563,6 +659,97 @@ impl App {
         self.file_popup.candidates = scored.into_iter().take(8).map(|(_, p)| p).collect();
         self.file_popup.selected = 0;
     }
+}
+
+fn soft_wrap_text(input: &str, width: usize) -> String {
+    let width = width.max(8);
+    input
+        .lines()
+        .map(|line| soft_wrap_line(line, width))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn soft_wrap_line(line: &str, width: usize) -> String {
+    if line.chars().count() <= width {
+        return line.to_string();
+    }
+
+    let mut out = String::new();
+    let mut current = String::new();
+
+    for word in line.split_whitespace() {
+        let current_len = current.chars().count();
+        let word_len = word.chars().count();
+        if current_len == 0 {
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                for chunk in split_hard(word, width) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&chunk);
+                }
+            }
+            continue;
+        }
+
+        if current_len + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&current);
+            current.clear();
+
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                for chunk in split_hard(word, width) {
+                    if !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&chunk);
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&current);
+    }
+
+    if out.is_empty() {
+        line.to_string()
+    } else {
+        out
+    }
+}
+
+fn split_hard(input: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        current.push(ch);
+        if current.chars().count() >= width {
+            chunks.push(current);
+            current = String::new();
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn normalize_for_submit(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn collect_workspace_files(root: &Path) -> Vec<String> {

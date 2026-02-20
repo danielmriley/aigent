@@ -22,10 +22,25 @@ pub fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &AppState, _theme:
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("Memory Peek"));
-    for item in state.memory_peek.iter().take(3) {
-        lines.push(Line::from(format!("- {item}")));
-    }
+    lines.push(Line::from("Conversation"));
+    lines.push(Line::from(format!("- messages: {}", state.messages.len())));
+    lines.push(Line::from(format!(
+        "- history mode: {}",
+        if state.history_mode { "on" } else { "off" }
+    )));
+    lines.push(Line::from(format!(
+        "- selected: {}",
+        state
+            .selected_message
+            .map(|idx| idx + 1)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from("Keys"));
+    lines.push(Line::from("- Ctrl+K: commands"));
+    lines.push(Line::from("- Esc: history"));
+    lines.push(Line::from("- PgUp/PgDn: chat scroll"));
 
     let widget = Paragraph::new(lines)
         .block(
@@ -34,7 +49,7 @@ pub fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &AppState, _theme:
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: true });
 
     frame.render_widget(widget, area);
 }

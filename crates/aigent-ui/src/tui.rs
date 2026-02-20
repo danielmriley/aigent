@@ -3,7 +3,9 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event as CrosstermEvent};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -41,14 +43,18 @@ where
 {
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
+    let mut selection_mode = false;
+    let mut previous_status: Option<String> = None;
 
     let result = async {
         loop {
-            terminal.draw(|f| app.draw(f))?;
+            if !selection_mode {
+                terminal.draw(|f| app.draw(f))?;
+            }
 
             tokio::select! {
                 backend = app.backend_rx.recv() => {
@@ -67,12 +73,58 @@ where
                     }
                 } => {
                     if let Some(CrosstermEvent::Key(key)) = key_event {
+                        let force_quit = key.code == crossterm::event::KeyCode::Char('c')
+                            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                            && key.kind == KeyEventKind::Press;
+
+                        if force_quit {
+                            if selection_mode {
+                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                                if let Some(status) = previous_status.take() {
+                                    app.set_status(status);
+                                }
+                                selection_mode = false;
+                            }
+                            break;
+                        }
+
+                        let select_shortcut = key.code == crossterm::event::KeyCode::Char('s')
+                            && (key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
+                                || (key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                                    && key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)))
+                            && key.kind == KeyEventKind::Press;
+
+                        if selection_mode {
+                            if select_shortcut || matches!(key.code, crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Enter) {
+                                execute!(terminal.backend_mut(), EnableMouseCapture)?;
+                                if let Some(status) = previous_status.take() {
+                                    app.set_status(status);
+                                }
+                                selection_mode = false;
+                            }
+                            continue;
+                        }
+
+                        if select_shortcut
+                        {
+                            previous_status = Some(app.state.status.clone());
+                            app.set_status("selection mode: drag to highlight, copy with terminal shortcut, Alt+S/Esc/Enter to return");
+                            execute!(terminal.backend_mut(), DisableMouseCapture)?;
+                            selection_mode = true;
+                            continue;
+                        }
+
+                        if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
                         if let Some(command) = app.update(AppEvent::Key(key)) {
                             if matches!(command, UiCommand::Quit) {
                                 break;
                             }
                             on_command(command).await?;
                         }
+                    } else if let Some(CrosstermEvent::Mouse(mouse)) = key_event {
+                        let _ = app.update(AppEvent::Mouse(mouse));
                     } else if let Some(CrosstermEvent::Resize(w, h)) = key_event {
                         let _ = app.update(AppEvent::Resize(w, h));
                     }
@@ -84,8 +136,15 @@ where
     .await;
 
     debug!("restoring terminal state");
+    if selection_mode {
+        execute!(terminal.backend_mut(), EnableMouseCapture)?;
+    }
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
     result
 }
