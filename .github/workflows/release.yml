@@ -1,0 +1,45 @@
+name: release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+      - name: Build
+        run: cargo build --release --locked -p aigent-app
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/release/aigent-app dist/aigent
+          sha256sum dist/aigent > dist/aigent.sha256
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/aigent-app.exe dist/aigent.exe
+          $hash = (Get-FileHash -Algorithm SHA256 dist/aigent.exe).Hash.ToLower()
+          "$hash  aigent.exe" | Out-File -Encoding ascii dist/aigent.sha256
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aigent-${{ matrix.os }}
+          path: |
+            dist/*

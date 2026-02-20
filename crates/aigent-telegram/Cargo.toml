@@ -1,0 +1,19 @@
+[package]
+name = "aigent-telegram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+aigent-core = { path = "../aigent-core" }
+aigent-daemon = { path = "../aigent-daemon" }
+aigent-llm = { path = "../aigent-llm" }
+aigent-memory = { path = "../aigent-memory" }
+

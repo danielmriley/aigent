@@ -1,0 +1,25 @@
+[package]
+name = "aigent-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+dotenvy.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+aigent-config = { path = "../aigent-config" }
+aigent-core = { path = "../aigent-core" }
+aigent-daemon = { path = "../aigent-daemon" }
+aigent-llm = { path = "../aigent-llm" }
+aigent-memory = { path = "../aigent-memory" }
+aigent-telegram = { path = "../aigent-telegram" }
+aigent-ui = { path = "../aigent-ui" }
+tui-textarea = "0.7.0"

@@ -1,0 +1,33 @@
+[agent]
+name = "Zenith"
+workspace_path = "."
+thinking_level = "deep"
+
+[llm]
+provider = "ollama"
+ollama_model = "gemma3:12b"
+openrouter_model = "openai/gpt-4o-mini"
+ollama_local_first = true
+
+[memory]
+backend = "eventlog"
+auto_sleep_minutes = 120
+auto_sleep_turn_interval = 6
+auto_sleep_mode = "nightly"
+night_sleep_start_hour = 23
+night_sleep_end_hour = 4
+core_rewrite_requires_approval = true
+
+[safety]
+approval_required = true
+allow_shell = true
+allow_wasm = true
+
+[telemetry]
+log_level = "info"
+
+[onboarding]
+completed = true
+
+[integrations]
+telegram_enabled = true

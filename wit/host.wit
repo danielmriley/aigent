@@ -1,0 +1,6 @@
+package aigent:host;
+
+world host {
+  export log: func(message: string)
+  export get-time-unix-ms: func() -> u64
+}
