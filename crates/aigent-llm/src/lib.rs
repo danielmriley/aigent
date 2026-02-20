@@ -234,7 +234,12 @@ impl OllamaClient {
         }
     }
 
-    async fn chat_model_stream(&self, model: &str, prompt: &str, tx: mpsc::Sender<String>) -> Result<String> {
+    async fn chat_model_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        tx: mpsc::Sender<String>,
+    ) -> Result<String> {
         let base_url = std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
         let endpoint = format!("{}/api/generate", base_url.trim_end_matches('/'));
@@ -280,7 +285,8 @@ impl LlmClient for OpenRouterClient {
         self.chat_model("openai/gpt-4o-mini", prompt).await
     }
     async fn chat_stream(&self, prompt: &str, tx: mpsc::Sender<String>) -> Result<String> {
-        self.chat_model_stream("openai/gpt-4o-mini", prompt, tx).await
+        self.chat_model_stream("openai/gpt-4o-mini", prompt, tx)
+            .await
     }
 }
 
@@ -330,7 +336,12 @@ impl OpenRouterClient {
         )
     }
 
-    async fn chat_model_stream(&self, model: &str, prompt: &str, tx: mpsc::Sender<String>) -> Result<String> {
+    async fn chat_model_stream(
+        &self,
+        model: &str,
+        prompt: &str,
+        tx: mpsc::Sender<String>,
+    ) -> Result<String> {
         let api_key = std::env::var("OPENROUTER_API_KEY").ok();
         if let Some(api_key) = api_key {
             if !api_key.trim().is_empty() {

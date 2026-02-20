@@ -60,7 +60,8 @@ impl AgentRuntime {
         recent_turns: &[ConversationTurn],
     ) -> Result<String> {
         let (tx, _rx) = mpsc::channel(100);
-        self.respond_and_remember_stream(memory, user_message, recent_turns, tx).await
+        self.respond_and_remember_stream(memory, user_message, recent_turns, tx)
+            .await
     }
 
     pub async fn respond_and_remember_stream(

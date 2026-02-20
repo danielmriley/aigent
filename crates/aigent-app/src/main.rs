@@ -1,5 +1,6 @@
 mod tui;
 
+use arboard::Clipboard;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
@@ -21,6 +22,7 @@ use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_ra
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tracing_subscriber::EnvFilter;
+use ignore::WalkBuilder;
 
 use aigent_config::AppConfig;
 use aigent_daemon::{AgentRuntime, ConversationTurn};
@@ -638,7 +640,8 @@ async fn run_interactive_session(runtime: &mut AgentRuntime, memory: &mut Memory
         .collect();
     transcript.push("Type /help for commands. Press Tab for autocomplete.".to_string());
     
-    let mut app = tui::App::new(transcript);
+    let workspace_files = collect_workspace_files(Path::new("."))?;
+    let mut app = tui::App::new(transcript, workspace_files);
     let mut turn_count: usize = 0;
     let mut recent_turns: VecDeque<ConversationTurn> = VecDeque::new();
     let event_log = MemoryEventLog::new(Path::new(".aigent").join("memory").join("events.jsonl"));
@@ -674,12 +677,13 @@ async fn run_interactive_session(runtime: &mut AgentRuntime, memory: &mut Memory
             pull_telegram_events_into_transcript(
                 &event_log,
                 &mut external_feed,
-                &mut app.transcript,
-                app.auto_follow,
-                &mut app.viewport_start_line,
+                &mut app.chat_panel.transcript,
+                app.chat_panel.auto_follow,
+                &mut app.chat_panel.viewport_start_line,
             )?;
 
-            let suggestions = command_suggestions(&app.textarea.lines().join("\n"));
+            app.refresh_file_popup();
+            let suggestions = command_suggestions(&app.input_box.text());
             let viewport = app.draw(&mut terminal, &suggestions, &runtime.config)?;
 
             if let Some(event) = rx.recv().await {
@@ -688,61 +692,125 @@ async fn run_interactive_session(runtime: &mut AgentRuntime, memory: &mut Memory
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
+
+                        if app.handle_file_popup_key(key) {
+                            continue;
+                        }
+
+                        if app.chat_panel.history_mode {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.chat_panel.exit_history_mode();
+                                }
+                                KeyCode::Up => {
+                                    app.chat_panel.select_prev_message();
+                                }
+                                KeyCode::Down => {
+                                    app.chat_panel.select_next_message();
+                                }
+                                KeyCode::Char('c') => {
+                                    if let Some(selected) = app.chat_panel.selected_transcript_entry() {
+                                        if let Some(assistant) = selected.strip_prefix("aigent> ") {
+                                            if let Some(code) = tui::extract_first_code_block(assistant) {
+                                                match Clipboard::new().and_then(|mut cb| cb.set_text(code.clone())) {
+                                                    Ok(_) => {
+                                                        app.chat_panel
+                                                            .transcript
+                                                            .push("aigent> copied code block to clipboard".to_string());
+                                                    }
+                                                    Err(err) => {
+                                                        app.chat_panel
+                                                            .transcript
+                                                            .push(format!("aigent> clipboard error: {err}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('a') => {
+                                    if let Some(selected) = app.chat_panel.selected_transcript_entry() {
+                                        if let Some(assistant) = selected.strip_prefix("aigent> ") {
+                                            if let Some(code) = tui::extract_first_code_block(assistant) {
+                                                let dir = Path::new(".aigent").join("snippets");
+                                                fs::create_dir_all(&dir)?;
+                                                let file_name = format!(
+                                                    "applied_{}.txt",
+                                                    Local::now().format("%Y%m%d_%H%M%S")
+                                                );
+                                                let path = dir.join(file_name);
+                                                fs::write(&path, code)?;
+                                                app.chat_panel.transcript.push(format!(
+                                                    "aigent> applied code block to {}",
+                                                    path.display()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+
                         match key.code {
+                            KeyCode::Esc => {
+                                app.chat_panel.enter_history_mode();
+                            }
                             KeyCode::PageUp => {
                                 let page_step = usize::from(terminal.size()?.height.saturating_sub(6)).max(1);
-                                let from_line = if app.auto_follow { viewport.max_scroll } else { viewport.start };
-                                app.viewport_start_line = from_line.saturating_sub(page_step);
-                                app.auto_follow = false;
+                                let from_line = if app.chat_panel.auto_follow { viewport.max_scroll } else { viewport.start };
+                                app.chat_panel.viewport_start_line = from_line.saturating_sub(page_step);
+                                app.chat_panel.auto_follow = false;
                             }
                             KeyCode::PageDown => {
                                 let page_step = usize::from(terminal.size()?.height.saturating_sub(6)).max(1);
-                                let from_line = if app.auto_follow { viewport.max_scroll } else { viewport.start };
-                                app.viewport_start_line = from_line.saturating_add(page_step).min(viewport.max_scroll);
-                                if app.viewport_start_line >= viewport.max_scroll {
-                                    app.auto_follow = true;
+                                let from_line = if app.chat_panel.auto_follow { viewport.max_scroll } else { viewport.start };
+                                app.chat_panel.viewport_start_line = from_line.saturating_add(page_step).min(viewport.max_scroll);
+                                if app.chat_panel.viewport_start_line >= viewport.max_scroll {
+                                    app.chat_panel.auto_follow = true;
                                 }
                             }
                             KeyCode::End => {
-                                app.viewport_start_line = viewport.max_scroll;
-                                app.auto_follow = true;
+                                app.chat_panel.viewport_start_line = viewport.max_scroll;
+                                app.chat_panel.auto_follow = true;
                             }
                             KeyCode::Tab => {
-                                let input = app.textarea.lines().join("\n");
+                                let input = app.input_box.text();
                                 if let Some(suggestion) = command_suggestions(&input).first() {
-                                    app.textarea = tui_textarea::TextArea::default();
-                                    app.textarea.insert_str(*suggestion);
+                                    app.input_box.textarea = tui_textarea::TextArea::default();
+                                    app.input_box.textarea.insert_str(*suggestion);
                                 }
                             }
                             KeyCode::Enter => {
                                 if key.modifiers.contains(KeyModifiers::ALT) {
-                                    app.textarea.insert_newline();
+                                    app.input_box.textarea.insert_newline();
                                     continue;
                                 }
 
-                                let line = app.textarea.lines().join("\n").trim().to_string();
-                                app.textarea = tui_textarea::TextArea::default();
+                                let line = app.input_box.textarea.lines().join("\n").trim().to_string();
+                                app.input_box.textarea = tui_textarea::TextArea::default();
                                 if line.is_empty() {
                                     continue;
                                 }
 
-                                app.transcript.push(format!("you> {line}"));
+                                app.chat_panel.transcript.push(format!("you> {line}"));
                                 let is_chat_turn = !line.starts_with('/');
                                 if is_chat_turn {
-                                    app.is_thinking = true;
-                                    app.thinking_spinner_tick = 0;
+                                    app.chat_panel.is_thinking = true;
+                                    app.chat_panel.thinking_spinner_tick = 0;
                                 }
-                                if app.auto_follow {
-                                    app.viewport_start_line = viewport.max_scroll;
+                                if app.chat_panel.auto_follow {
+                                    app.chat_panel.viewport_start_line = viewport.max_scroll;
                                 }
 
                                 // Spawn LLM task
                                 let tx_llm = tx.clone();
-                                // We need to clone runtime config and memory for the background task, 
+                                // We need to clone runtime config and memory for the background task,
                                 // but we can't easily do that since they are mutable references.
                                 // For now, we'll block the main loop on the LLM call, but we'll use tokio::select!
                                 // to keep processing Tick events for the spinner.
-                                
+
                                 let config_clone = runtime.config.clone();
                                 let (tx_chunk, mut rx_chunk) = tokio::sync::mpsc::channel(100);
                                 let tx_llm_chunk = tx.clone();
@@ -768,7 +836,8 @@ async fn run_interactive_session(runtime: &mut AgentRuntime, memory: &mut Memory
                                         }
                                         Some(inner_event) = rx.recv() => {
                                             app.handle_event(inner_event);
-                                            let suggestions = command_suggestions(&app.textarea.lines().join("\n"));
+                                            app.refresh_file_popup();
+                                            let suggestions = command_suggestions(&app.input_box.text());
                                             app.draw(&mut terminal, &suggestions, &config_clone)?;
                                         }
                                     }
@@ -1069,6 +1138,24 @@ fn command_suggestions(input: &str) -> Vec<&'static str> {
         .filter(|candidate| candidate.starts_with(input))
         .take(4)
         .collect()
+}
+
+fn collect_workspace_files(root: &Path) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    for entry in WalkBuilder::new(root).hidden(false).git_ignore(true).build() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(root) else {
+            continue;
+        };
+        files.push(rel.display().to_string());
+    }
+    files.sort();
+    Ok(files)
 }
 
 fn parse_model_provider_from_command(line: &str) -> CliModelProvider {
