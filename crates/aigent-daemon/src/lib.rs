@@ -6,6 +6,9 @@ use aigent_llm::{LlmRouter, Provider};
 use aigent_memory::{MemoryManager, MemoryTier};
 use tokio::sync::mpsc;
 
+mod events;
+pub use events::{BackendEvent, ToolCallInfo, ToolResult};
+
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {
     pub user: String,
@@ -150,6 +153,43 @@ impl AgentRuntime {
         )?;
 
         Ok(reply)
+    }
+
+    pub async fn stream_turn(
+        &self,
+        turn: ConversationTurn,
+        tx: tokio::sync::mpsc::UnboundedSender<BackendEvent>,
+    ) -> Result<()> {
+        let _ = tx.send(BackendEvent::Thinking);
+        let mut memory = MemoryManager::default();
+
+        let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(128);
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            while let Some(chunk) = chunk_rx.recv().await {
+                let _ = tx_clone.send(BackendEvent::Token(chunk));
+            }
+        });
+
+        let recent = vec![ConversationTurn {
+            user: turn.user.clone(),
+            assistant: turn.assistant.clone(),
+        }];
+
+        match self
+            .respond_and_remember_stream(&mut memory, &turn.user, &recent, chunk_tx)
+            .await
+        {
+            Ok(_) => {
+                let _ = tx.send(BackendEvent::MemoryUpdated);
+                let _ = tx.send(BackendEvent::Done);
+                Ok(())
+            }
+            Err(err) => {
+                let _ = tx.send(BackendEvent::Error(err.to_string()));
+                Err(err)
+            }
+        }
     }
 
     pub fn environment_snapshot(&self, memory: &MemoryManager, recent_turn_count: usize) -> String {

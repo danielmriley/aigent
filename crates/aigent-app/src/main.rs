@@ -1,7 +1,4 @@
-mod tui;
-
-use arboard::Clipboard;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
@@ -9,31 +6,27 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use chrono::{Local, Timelike};
 use clap::{Parser, Subcommand, ValueEnum};
-use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use tracing_subscriber::EnvFilter;
-use ignore::WalkBuilder;
 
 use aigent_config::AppConfig;
-use aigent_daemon::{AgentRuntime, ConversationTurn};
+use aigent_daemon::{AgentRuntime, BackendEvent, ConversationTurn};
 use aigent_llm::{list_ollama_models, list_openrouter_models};
-use aigent_memory::event_log::{MemoryEventLog, MemoryRecordEvent};
+use aigent_memory::event_log::MemoryEventLog;
 use aigent_memory::{MemoryManager, MemoryTier};
 use aigent_telegram::start_bot;
 use aigent_ui::onboard::{run_configuration, run_onboarding};
 
 #[derive(Debug, Parser)]
-#[command(name = "aigent", version, about = "A persistent memory-centric AI agent")]
+#[command(
+    name = "aigent",
+    version,
+    about = "A persistent memory-centric AI agent"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -122,7 +115,9 @@ enum MemoryCommands {
 async fn fetch_available_models() -> aigent_ui::onboard::AvailableModels {
     println!("Fetching available models...");
     let ollama = aigent_llm::list_ollama_models().await.unwrap_or_default();
-    let openrouter = aigent_llm::list_openrouter_models().await.unwrap_or_default();
+    let openrouter = aigent_llm::list_openrouter_models()
+        .await
+        .unwrap_or_default();
     aigent_ui::onboard::AvailableModels { ollama, openrouter }
 }
 
@@ -310,9 +305,7 @@ fn daemon_start(force: bool) -> Result<()> {
     }
 
     if !telegram_token_configured() {
-        bail!(
-            "TELEGRAM_BOT_TOKEN is missing; add it via `aigent configuration` or set it in .env"
-        );
+        bail!("TELEGRAM_BOT_TOKEN is missing; add it via `aigent configuration` or set it in .env");
     }
 
     let paths = daemon_paths();
@@ -338,7 +331,10 @@ fn daemon_start(force: bool) -> Result<()> {
     let err = out.try_clone()?;
 
     let child = Command::new(exe)
-        .env("AIGENT_DAEMON_WORKER", daemon_channel_label(CliDaemonChannel::Telegram))
+        .env(
+            "AIGENT_DAEMON_WORKER",
+            daemon_channel_label(CliDaemonChannel::Telegram),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
@@ -509,7 +505,10 @@ fn spawn_connected_service_worker(config: &AppConfig) -> Result<Option<Child>> {
         .stderr(Stdio::from(err))
         .spawn()?;
 
-    println!("connected services: telegram worker started (pid {})", child.id());
+    println!(
+        "connected services: telegram worker started (pid {})",
+        child.id()
+    );
     Ok(Some(child))
 }
 
@@ -545,67 +544,6 @@ fn telegram_token_configured() -> bool {
         .unwrap_or(false)
 }
 
-struct ExternalFeedState {
-    known_event_ids: HashSet<String>,
-    last_scan: Instant,
-}
-
-impl ExternalFeedState {
-    fn from_log(event_log: &MemoryEventLog) -> Result<Self> {
-        let known_event_ids = event_log
-            .load()?
-            .into_iter()
-            .map(|event| event.event_id.to_string())
-            .collect::<HashSet<_>>();
-
-        Ok(Self {
-            known_event_ids,
-            last_scan: Instant::now(),
-        })
-    }
-}
-
-fn pull_telegram_events_into_transcript(
-    event_log: &MemoryEventLog,
-    state: &mut ExternalFeedState,
-    transcript: &mut Vec<String>,
-    auto_follow: bool,
-    viewport_start_line: &mut usize,
-) -> Result<()> {
-    if state.last_scan.elapsed() < Duration::from_millis(300) {
-        return Ok(());
-    }
-    state.last_scan = Instant::now();
-
-    let mut new_lines = event_log
-        .load()?
-        .into_iter()
-        .filter(|event| state.known_event_ids.insert(event.event_id.to_string()))
-        .filter_map(telegram_transcript_line)
-        .collect::<Vec<_>>();
-
-    if new_lines.is_empty() {
-        return Ok(());
-    }
-
-    transcript.append(&mut new_lines);
-    if auto_follow {
-        *viewport_start_line = usize::MAX;
-    }
-    Ok(())
-}
-
-fn telegram_transcript_line(event: MemoryRecordEvent) -> Option<String> {
-    let source = event.entry.source;
-    if source.starts_with("telegram:user:") {
-        return Some(format!("you> [telegram] {}", event.entry.content));
-    }
-    if source.starts_with("telegram:assistant:") {
-        return Some(format!("aigent> [telegram] {}", event.entry.content));
-    }
-    None
-}
-
 fn seed_identity_memory(memory: &mut MemoryManager, bot_name: &str) -> Result<()> {
     let marker = format!("my name is {bot_name}").to_lowercase();
     let already_seeded = memory
@@ -621,266 +559,91 @@ fn seed_identity_memory(memory: &mut MemoryManager, bot_name: &str) -> Result<()
     Ok(())
 }
 
-async fn run_interactive_session(runtime: &mut AgentRuntime, memory: &mut MemoryManager) -> Result<()> {
+async fn run_interactive_session(
+    runtime: &mut AgentRuntime,
+    memory: &mut MemoryManager,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return run_interactive_line_session(runtime, memory).await;
     }
 
-    let mut stdout = io::stdout();
-    enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
-
-    let mut transcript: Vec<String> = aigent_ui::tui::banner()
+    let transcript: Vec<String> = aigent_ui::tui::banner()
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(ToString::to_string)
         .collect();
-    transcript.push("Type /help for commands. Press Tab for autocomplete.".to_string());
-    
-    let workspace_files = collect_workspace_files(Path::new("."))?;
-    let mut app = tui::App::new(transcript, workspace_files);
-    let mut turn_count: usize = 0;
-    let mut recent_turns: VecDeque<ConversationTurn> = VecDeque::new();
-    let event_log = MemoryEventLog::new(Path::new(".aigent").join("memory").join("events.jsonl"));
-    let mut external_feed = ExternalFeedState::from_log(&event_log)?;
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    let tick_rate = Duration::from_millis(120);
-
-    // Event listener task
-    let tx_clone = tx.clone();
-    tokio::spawn(async move {
-        loop {
-            if event::poll(tick_rate).unwrap_or(false) {
-                if let Ok(event) = event::read() {
-                    match event {
-                        Event::Key(key) => {
-                            let _ = tx_clone.send(tui::Event::Key(key)).await;
-                        }
-                        Event::Paste(text) => {
-                            let _ = tx_clone.send(tui::Event::Paste(text)).await;
-                        }
-                        _ => {}
-                    }
-                }
-            } else {
-                let _ = tx_clone.send(tui::Event::Tick).await;
-            }
-        }
-    });
-
-    let result = async {
-        loop {
-            pull_telegram_events_into_transcript(
-                &event_log,
-                &mut external_feed,
-                &mut app.chat_panel.transcript,
-                app.chat_panel.auto_follow,
-                &mut app.chat_panel.viewport_start_line,
-            )?;
-
-            app.refresh_file_popup();
-            let suggestions = command_suggestions(&app.input_box.text());
-            let viewport = app.draw(&mut terminal, &suggestions, &runtime.config)?;
-
-            if let Some(event) = rx.recv().await {
-                match event {
-                    tui::Event::Key(key) => {
-                        if key.kind != KeyEventKind::Press {
-                            continue;
-                        }
-
-                        if app.handle_file_popup_key(key) {
-                            continue;
-                        }
-
-                        if app.chat_panel.history_mode {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    app.chat_panel.exit_history_mode();
-                                }
-                                KeyCode::Up => {
-                                    app.chat_panel.select_prev_message();
-                                }
-                                KeyCode::Down => {
-                                    app.chat_panel.select_next_message();
-                                }
-                                KeyCode::Char('c') => {
-                                    if let Some(selected) = app.chat_panel.selected_transcript_entry() {
-                                        if let Some(assistant) = selected.strip_prefix("aigent> ") {
-                                            if let Some(code) = tui::extract_first_code_block(assistant) {
-                                                match Clipboard::new().and_then(|mut cb| cb.set_text(code.clone())) {
-                                                    Ok(_) => {
-                                                        app.chat_panel
-                                                            .transcript
-                                                            .push("aigent> copied code block to clipboard".to_string());
-                                                    }
-                                                    Err(err) => {
-                                                        app.chat_panel
-                                                            .transcript
-                                                            .push(format!("aigent> clipboard error: {err}"));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                KeyCode::Char('a') => {
-                                    if let Some(selected) = app.chat_panel.selected_transcript_entry() {
-                                        if let Some(assistant) = selected.strip_prefix("aigent> ") {
-                                            if let Some(code) = tui::extract_first_code_block(assistant) {
-                                                let dir = Path::new(".aigent").join("snippets");
-                                                fs::create_dir_all(&dir)?;
-                                                let file_name = format!(
-                                                    "applied_{}.txt",
-                                                    Local::now().format("%Y%m%d_%H%M%S")
-                                                );
-                                                let path = dir.join(file_name);
-                                                fs::write(&path, code)?;
-                                                app.chat_panel.transcript.push(format!(
-                                                    "aigent> applied code block to {}",
-                                                    path.display()
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        match key.code {
-                            KeyCode::Esc => {
-                                app.chat_panel.enter_history_mode();
-                            }
-                            KeyCode::PageUp => {
-                                let page_step = usize::from(terminal.size()?.height.saturating_sub(6)).max(1);
-                                let from_line = if app.chat_panel.auto_follow { viewport.max_scroll } else { viewport.start };
-                                app.chat_panel.viewport_start_line = from_line.saturating_sub(page_step);
-                                app.chat_panel.auto_follow = false;
-                            }
-                            KeyCode::PageDown => {
-                                let page_step = usize::from(terminal.size()?.height.saturating_sub(6)).max(1);
-                                let from_line = if app.chat_panel.auto_follow { viewport.max_scroll } else { viewport.start };
-                                app.chat_panel.viewport_start_line = from_line.saturating_add(page_step).min(viewport.max_scroll);
-                                if app.chat_panel.viewport_start_line >= viewport.max_scroll {
-                                    app.chat_panel.auto_follow = true;
-                                }
-                            }
-                            KeyCode::End => {
-                                app.chat_panel.viewport_start_line = viewport.max_scroll;
-                                app.chat_panel.auto_follow = true;
-                            }
-                            KeyCode::Tab => {
-                                let input = app.input_box.text();
-                                if let Some(suggestion) = command_suggestions(&input).first() {
-                                    app.input_box.textarea = tui_textarea::TextArea::default();
-                                    app.input_box.textarea.insert_str(*suggestion);
-                                }
-                            }
-                            KeyCode::Enter => {
-                                if key.modifiers.contains(KeyModifiers::ALT) {
-                                    app.input_box.textarea.insert_newline();
-                                    continue;
-                                }
-
-                                let line = app.input_box.textarea.lines().join("\n").trim().to_string();
-                                app.input_box.textarea = tui_textarea::TextArea::default();
-                                if line.is_empty() {
-                                    continue;
-                                }
-
-                                app.chat_panel.transcript.push(format!("you> {line}"));
-                                let is_chat_turn = !line.starts_with('/');
-                                if is_chat_turn {
-                                    app.chat_panel.is_thinking = true;
-                                    app.chat_panel.thinking_spinner_tick = 0;
-                                }
-                                if app.chat_panel.auto_follow {
-                                    app.chat_panel.viewport_start_line = viewport.max_scroll;
-                                }
-
-                                // Spawn LLM task
-                                let tx_llm = tx.clone();
-                                // We need to clone runtime config and memory for the background task,
-                                // but we can't easily do that since they are mutable references.
-                                // For now, we'll block the main loop on the LLM call, but we'll use tokio::select!
-                                // to keep processing Tick events for the spinner.
-
-                                let config_clone = runtime.config.clone();
-                                let (tx_chunk, mut rx_chunk) = tokio::sync::mpsc::channel(100);
-                                let tx_llm_chunk = tx.clone();
-                                tokio::spawn(async move {
-                                    while let Some(chunk) = rx_chunk.recv().await {
-                                        let _ = tx_llm_chunk.send(tui::Event::LlmChunk(chunk)).await;
-                                    }
-                                });
-
-                                let mut outcome_future = Box::pin(handle_interactive_input(
-                                    runtime,
-                                    memory,
-                                    &line,
-                                    &mut turn_count,
-                                    &mut recent_turns,
-                                    Some(tx_chunk),
-                                ));
-
-                                let outcome = loop {
-                                    tokio::select! {
-                                        res = &mut outcome_future => {
-                                            break res;
-                                        }
-                                        Some(inner_event) = rx.recv() => {
-                                            app.handle_event(inner_event);
-                                            app.refresh_file_popup();
-                                            let suggestions = command_suggestions(&app.input_box.text());
-                                            app.draw(&mut terminal, &suggestions, &config_clone)?;
-                                        }
-                                    }
-                                };
-
-                                match outcome {
-                                    Ok(outcome) => {
-                                        let _ = tx_llm.try_send(tui::Event::LlmDone(outcome.messages));
-                                        if outcome.exit_requested {
-                                            app.should_quit = true;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx_llm.try_send(tui::Event::Error(e.to_string()));
-                                    }
-                                }
-                            }
-                            _ => {
-                                app.handle_event(tui::Event::Key(key));
-                            }
-                        }
-                    }
-                    _ => {
-                        app.handle_event(event);
-                    }
-                }
-            }
-
-            if app.should_quit {
-                break;
-            }
-        }
-        Ok(()) as Result<()>
+    let (backend_tx, backend_rx) = aigent_ui::tui::create_backend_channel();
+    let mut app = aigent_ui::App::new(backend_rx, &runtime.config);
+    for line in transcript {
+        app.push_assistant_message(line);
     }
-    .await;
+    app.push_assistant_message("Type /help for commands. Press Tab for autocomplete.".to_string());
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    result
+    let turn_count: usize = 0;
+    let recent_turns: VecDeque<ConversationTurn> = VecDeque::new();
+    let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
+    let memory = Arc::new(tokio::sync::Mutex::new(memory));
+    let turn_count = Arc::new(tokio::sync::Mutex::new(turn_count));
+    let recent_turns = Arc::new(tokio::sync::Mutex::new(recent_turns));
+
+    aigent_ui::tui::run_app_with(&mut app, |command| {
+        let backend_tx = backend_tx.clone();
+        let runtime = runtime.clone();
+        let memory = memory.clone();
+        let turn_count = turn_count.clone();
+        let recent_turns = recent_turns.clone();
+
+        async move {
+            match command {
+                aigent_ui::UiCommand::Quit => {}
+                aigent_ui::UiCommand::Submit(line) => {
+                    let (tx_chunk, mut rx_chunk) = tokio::sync::mpsc::channel(100);
+                    let tx_backend_chunks = backend_tx.clone();
+                    tokio::spawn(async move {
+                        while let Some(chunk) = rx_chunk.recv().await {
+                            let _ = tx_backend_chunks.send(BackendEvent::Token(chunk));
+                        }
+                    });
+
+                    let mut runtime = runtime.lock().await;
+                    let mut memory = memory.lock().await;
+                    let mut turn_count = turn_count.lock().await;
+                    let mut recent_turns = recent_turns.lock().await;
+
+                    let outcome = handle_interactive_input(
+                        &mut **runtime,
+                        &mut **memory,
+                        &line,
+                        &mut *turn_count,
+                        &mut *recent_turns,
+                        Some(tx_chunk),
+                    )
+                    .await;
+
+                    match outcome {
+                        Ok(outcome) => {
+                            for msg in outcome.messages {
+                                let _ = backend_tx.send(BackendEvent::Token(msg));
+                                let _ = backend_tx.send(BackendEvent::Done);
+                            }
+                        }
+                        Err(err) => {
+                            let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    })
+    .await
 }
 
-async fn run_interactive_line_session(runtime: &mut AgentRuntime, memory: &mut MemoryManager) -> Result<()> {
+async fn run_interactive_line_session(
+    runtime: &mut AgentRuntime,
+    memory: &mut MemoryManager,
+) -> Result<()> {
     println!("interactive mode");
     println!("commands: /model show|provider <ollama|openrouter>|set <model>|key <api-key>|test");
     println!("          /think <low|balanced|deep>, /status, /context, /help, /exit");
@@ -903,9 +666,15 @@ async fn run_interactive_line_session(runtime: &mut AgentRuntime, memory: &mut M
             continue;
         }
 
-        let outcome =
-            handle_interactive_input(runtime, memory, line, &mut turn_count, &mut recent_turns, None)
-                .await?;
+        let outcome = handle_interactive_input(
+            runtime,
+            memory,
+            line,
+            &mut turn_count,
+            &mut recent_turns,
+            None,
+        )
+        .await?;
         for msg in outcome.messages {
             println!("{msg}");
         }
@@ -1028,7 +797,12 @@ async fn handle_interactive_input(
                 exit_requested: false,
             });
         }
-        if runtime.config.llm.provider.eq_ignore_ascii_case("openrouter") {
+        if runtime
+            .config
+            .llm
+            .provider
+            .eq_ignore_ascii_case("openrouter")
+        {
             runtime.config.llm.openrouter_model = model.to_string();
         } else {
             runtime.config.llm.ollama_model = model.to_string();
@@ -1106,56 +880,16 @@ async fn handle_interactive_input(
     *turn_count += 1;
     if should_run_sleep_cycle(runtime, memory, *turn_count) {
         let summary = memory.run_sleep_cycle()?;
-        messages.push(format!("aigent> internal sleep cycle: {}", summary.distilled));
+        messages.push(format!(
+            "aigent> internal sleep cycle: {}",
+            summary.distilled
+        ));
     }
 
     Ok(InputOutcome {
         messages,
         exit_requested: false,
     })
-}
-
-const COMMAND_CATALOG: [&str; 10] = [
-    "/model show",
-    "/model list",
-    "/model provider ",
-    "/model set ",
-    "/model key ",
-    "/model test",
-    "/think ",
-    "/status",
-    "/context",
-    "/exit",
-];
-
-fn command_suggestions(input: &str) -> Vec<&'static str> {
-    if !input.starts_with('/') {
-        return Vec::new();
-    }
-    COMMAND_CATALOG
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.starts_with(input))
-        .take(4)
-        .collect()
-}
-
-fn collect_workspace_files(root: &Path) -> Result<Vec<String>> {
-    let mut files = Vec::new();
-    for entry in WalkBuilder::new(root).hidden(false).git_ignore(true).build() {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        files.push(rel.display().to_string());
-    }
-    files.sort();
-    Ok(files)
 }
 
 fn parse_model_provider_from_command(line: &str) -> CliModelProvider {
@@ -1180,7 +914,10 @@ async fn collect_model_lines(provider: CliModelProvider) -> Result<Vec<String>> 
         lines.extend(ollama.into_iter().map(|model| format!("- {model}")));
     }
 
-    if matches!(provider, CliModelProvider::All | CliModelProvider::Openrouter) {
+    if matches!(
+        provider,
+        CliModelProvider::All | CliModelProvider::Openrouter
+    ) {
         let openrouter = list_openrouter_models().await?;
         lines.push(format!("openrouter models ({})", openrouter.len()));
         lines.extend(openrouter.into_iter().map(|model| format!("- {model}")));
@@ -1314,7 +1051,11 @@ fn run_phase_review_gate(
         config.memory.backend = "eventlog".to_string();
         config_changed = true;
     }
-    if !config.memory.auto_sleep_mode.eq_ignore_ascii_case("nightly") {
+    if !config
+        .memory
+        .auto_sleep_mode
+        .eq_ignore_ascii_case("nightly")
+    {
         config.memory.auto_sleep_mode = "nightly".to_string();
         config_changed = true;
     }
@@ -1355,7 +1096,10 @@ fn run_phase_review_gate(
         },
         GateCheck {
             name: "sleep mode nightly",
-            passed: config.memory.auto_sleep_mode.eq_ignore_ascii_case("nightly"),
+            passed: config
+                .memory
+                .auto_sleep_mode
+                .eq_ignore_ascii_case("nightly"),
             details: format!(
                 "mode={} window={:02}:00-{:02}:00",
                 config.memory.auto_sleep_mode,
@@ -1399,11 +1143,7 @@ fn run_phase_review_gate(
     println!("phase review gate (phase 0-2)");
     println!("- auto-remediation: enabled for fixable checks");
     for check in &checks {
-        let marker = if check.passed {
-            "PASS"
-        } else {
-            "FAIL"
-        };
+        let marker = if check.passed { "PASS" } else { "FAIL" };
         println!("- [{marker}] {} ({})", check.name, check.details);
     }
     println!("- summary: {passed}/{total} checks passed");
@@ -1469,7 +1209,11 @@ fn memory_layer_label(layer: CliMemoryLayer) -> &'static str {
     }
 }
 
-fn should_run_sleep_cycle(runtime: &AgentRuntime, memory: &MemoryManager, turn_count: usize) -> bool {
+fn should_run_sleep_cycle(
+    runtime: &AgentRuntime,
+    memory: &MemoryManager,
+    turn_count: usize,
+) -> bool {
     let mode = runtime.config.memory.auto_sleep_mode.trim().to_lowercase();
 
     if mode == "nightly" {
