@@ -1,20 +1,23 @@
-use std::collections::VecDeque;
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
-use chrono::{Local, Timelike};
+use chrono::Local;
 use clap::{Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use tracing_subscriber::EnvFilter;
 
 use aigent_config::AppConfig;
-use aigent_daemon::{AgentRuntime, BackendEvent, ConversationTurn};
+use aigent_daemon::{
+    BackendEvent, DaemonClient, run_unified_daemon,
+};
 use aigent_llm::{list_ollama_models, list_openrouter_models};
 use aigent_memory::event_log::MemoryEventLog;
 use aigent_memory::{MemoryManager, MemoryTier};
@@ -62,13 +65,6 @@ enum Commands {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliThinkingLevel {
-    Low,
-    Balanced,
-    Deep,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliMemoryLayer {
     All,
     Episodic,
@@ -82,11 +78,6 @@ enum CliModelProvider {
     All,
     Ollama,
     Openrouter,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CliDaemonChannel {
-    Telegram,
 }
 
 #[derive(Debug, Subcommand)]
@@ -132,11 +123,8 @@ async fn main() -> Result<()> {
     let config_exists = Path::new("config/default.toml").exists();
     let memory_log_path = Path::new(".aigent").join("memory").join("events.jsonl");
 
-    if let Some(channel) = std::env::var("AIGENT_DAEMON_WORKER")
-        .ok()
-        .and_then(|raw| parse_daemon_channel(&raw).ok())
-    {
-        run_daemon_worker(channel, config, &memory_log_path).await?;
+    if std::env::var("AIGENT_DAEMON_PROCESS").ok().as_deref() == Some("1") {
+        run_daemon_process(config, &memory_log_path).await?;
         return Ok(());
     }
 
@@ -241,6 +229,7 @@ struct DaemonPaths {
     pid_file: PathBuf,
     log_file: PathBuf,
     mode_file: PathBuf,
+    lock_file: PathBuf,
 }
 
 fn daemon_paths() -> DaemonPaths {
@@ -249,6 +238,7 @@ fn daemon_paths() -> DaemonPaths {
         pid_file: runtime_dir.join("daemon.pid"),
         log_file: runtime_dir.join("daemon.log"),
         mode_file: runtime_dir.join("daemon.mode"),
+        lock_file: runtime_dir.join("daemon.lock"),
         runtime_dir,
     }
 }
@@ -286,30 +276,24 @@ fn print_daemon_help() {
     println!("Usage: aigent daemon <start|stop|restart|status> [--force]");
 }
 
-fn parse_daemon_channel(raw: &str) -> Result<CliDaemonChannel> {
-    if raw.eq_ignore_ascii_case("telegram") {
-        Ok(CliDaemonChannel::Telegram)
-    } else {
-        bail!("unsupported daemon channel: {raw}")
-    }
-}
-
 fn daemon_start(force: bool) -> Result<()> {
     let config = AppConfig::load_from("config/default.toml")?;
     if config.needs_onboarding() {
         bail!("onboarding not complete; run `aigent onboard` first");
     }
 
-    if !config.integrations.telegram_enabled {
-        bail!("no messaging integrations enabled; enable Telegram in `aigent configuration`");
-    }
-
-    if !telegram_token_configured() {
-        bail!("TELEGRAM_BOT_TOKEN is missing; add it via `aigent configuration` or set it in .env");
-    }
-
     let paths = daemon_paths();
     fs::create_dir_all(&paths.runtime_dir)?;
+    let socket_path = PathBuf::from(&config.daemon.socket_path);
+
+    if is_socket_live(&socket_path) {
+        if !force {
+            bail!(
+                "daemon already running on socket {}; use `aigent daemon restart`",
+                socket_path.display()
+            );
+        }
+    }
 
     if let Some(pid) = read_pid(&paths.pid_file)? {
         if is_pid_running(pid) {
@@ -323,6 +307,10 @@ fn daemon_start(force: bool) -> Result<()> {
         let _ = fs::remove_file(&paths.pid_file);
     }
 
+    if socket_path.exists() {
+        let _ = fs::remove_file(&socket_path);
+    }
+
     let exe = std::env::current_exe()?;
     let out = OpenOptions::new()
         .create(true)
@@ -331,27 +319,34 @@ fn daemon_start(force: bool) -> Result<()> {
     let err = out.try_clone()?;
 
     let child = Command::new(exe)
-        .env(
-            "AIGENT_DAEMON_WORKER",
-            daemon_channel_label(CliDaemonChannel::Telegram),
-        )
+        .env("AIGENT_DAEMON_PROCESS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()?;
 
     fs::write(&paths.pid_file, child.id().to_string())?;
-    fs::write(&paths.mode_file, "telegram")?;
+    fs::write(&paths.mode_file, "unified")?;
 
     println!("daemon started");
     println!("- pid: {}", child.id());
-    println!("- integrations: telegram");
+    println!("- socket: {}", socket_path.display());
     println!("- log: {}", paths.log_file.display());
     Ok(())
 }
 
 fn daemon_stop() -> Result<()> {
+    let config = AppConfig::load_from("config/default.toml")?;
     let paths = daemon_paths();
+    let client = DaemonClient::new(&config.daemon.socket_path);
+
+    if tokio::runtime::Runtime::new()?
+        .block_on(client.graceful_shutdown())
+        .is_ok()
+    {
+        println!("daemon stop requested gracefully");
+    }
+
     let Some(pid) = read_pid(&paths.pid_file)? else {
         println!("daemon is not running");
         return Ok(());
@@ -370,17 +365,22 @@ fn daemon_stop() -> Result<()> {
 }
 
 fn daemon_status() -> Result<()> {
+    let config = AppConfig::load_from("config/default.toml")?;
     let paths = daemon_paths();
+    let socket_path = PathBuf::from(&config.daemon.socket_path);
     let mode = fs::read_to_string(&paths.mode_file)
         .unwrap_or_else(|_| "unknown".to_string())
         .trim()
         .to_string();
 
+    let socket_live = is_socket_live(&socket_path);
+
     if let Some(pid) = read_pid(&paths.pid_file)? {
-        if is_pid_running(pid) {
+        if is_pid_running(pid) || socket_live {
             println!("daemon status: running");
             println!("- pid: {pid}");
             println!("- channel: {mode}");
+            println!("- socket: {}", socket_path.display());
             println!("- log: {}", paths.log_file.display());
             return Ok(());
         }
@@ -388,8 +388,13 @@ fn daemon_status() -> Result<()> {
 
     println!("daemon status: stopped");
     println!("- channel: {mode}");
+    println!("- socket: {}", socket_path.display());
     println!("- log: {}", paths.log_file.display());
     Ok(())
+}
+
+fn is_socket_live(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 fn read_pid(path: &Path) -> Result<Option<u32>> {
@@ -437,36 +442,63 @@ fn terminate_pid(pid: u32) -> Result<()> {
     }
 }
 
-async fn run_daemon_worker(
-    channel: CliDaemonChannel,
-    config: AppConfig,
-    memory_log_path: &Path,
-) -> Result<()> {
-    match channel {
-        CliDaemonChannel::Telegram => run_telegram_runtime(config, memory_log_path).await,
+async fn run_daemon_process(config: AppConfig, memory_log_path: &Path) -> Result<()> {
+    let paths = daemon_paths();
+    fs::create_dir_all(&paths.runtime_dir)?;
+    let lock_file = File::create(&paths.lock_file)?;
+    lock_file
+        .try_lock_exclusive()
+        .map_err(|_| anyhow::anyhow!("another daemon instance already holds the lock"))?;
+
+    fs::write(&paths.pid_file, std::process::id().to_string())?;
+    fs::write(&paths.mode_file, "unified")?;
+
+    let socket_path = config.daemon.socket_path.clone();
+    let daemon = run_unified_daemon(config, memory_log_path, &socket_path);
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        tokio::select! {
+            _ = sigterm.recv() => {},
+            _ = sigint.recv() => {},
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+
+    #[cfg(not(unix))]
+    let terminate = async {
+        tokio::signal::ctrl_c().await?;
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        result = daemon => {
+            result?;
+        }
+        result = terminate => {
+            result?;
+            let client = DaemonClient::new(&socket_path);
+            let _ = client.graceful_shutdown().await;
+        }
     }
+
+    let _ = fs::remove_file(&paths.pid_file);
+    let _ = fs::remove_file(&paths.lock_file);
+    Ok(())
 }
 
 async fn run_start_mode(config: AppConfig, memory_log_path: &Path) -> Result<()> {
     let interactive_terminal = io::stdin().is_terminal() && io::stdout().is_terminal();
 
+    ensure_daemon_running(&config)?;
+
     if interactive_terminal {
-        let mut service_worker = spawn_connected_service_worker(&config)?;
-
-        let mut memory = MemoryManager::with_event_log(memory_log_path)?;
-        seed_identity_memory(&mut memory, &config.agent.name)?;
-
-        let runtime = AgentRuntime::new(config);
-        runtime.run().await?;
         println!("{}", aigent_ui::tui::banner());
-        let session_result = run_interactive_session(runtime, memory).await;
-
-        if let Some(child) = service_worker.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        return session_result;
+        let client = DaemonClient::new(&config.daemon.socket_path);
+        return run_interactive_session(&config, client).await;
     }
 
     if config.integrations.telegram_enabled {
@@ -476,40 +508,6 @@ async fn run_start_mode(config: AppConfig, memory_log_path: &Path) -> Result<()>
     bail!(
         "no interactive terminal detected and no messaging integrations enabled; run in a terminal or enable Telegram in `aigent configuration`"
     )
-}
-
-fn spawn_connected_service_worker(config: &AppConfig) -> Result<Option<Child>> {
-    if !config.integrations.telegram_enabled {
-        return Ok(None);
-    }
-
-    if !telegram_token_configured() {
-        println!(
-            "warning: Telegram integration enabled but TELEGRAM_BOT_TOKEN is missing; running local TUI only"
-        );
-        return Ok(None);
-    }
-
-    let paths = daemon_paths();
-    fs::create_dir_all(&paths.runtime_dir)?;
-    let out = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&paths.log_file)?;
-    let err = out.try_clone()?;
-
-    let child = Command::new(std::env::current_exe()?)
-        .env("AIGENT_DAEMON_WORKER", "telegram")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()?;
-
-    println!(
-        "connected services: telegram worker started (pid {})",
-        child.id()
-    );
-    Ok(Some(child))
 }
 
 async fn run_telegram_runtime(config: AppConfig, memory_log_path: &Path) -> Result<()> {
@@ -523,113 +521,99 @@ async fn run_telegram_runtime(config: AppConfig, memory_log_path: &Path) -> Resu
         );
     }
 
-    let mut memory = MemoryManager::with_event_log(memory_log_path)?;
-    seed_identity_memory(&mut memory, &config.agent.name)?;
-
-    let mut runtime = AgentRuntime::new(config);
-    runtime.run().await?;
-    start_bot(&mut runtime, &mut memory).await
+    let _ = memory_log_path;
+    ensure_daemon_running(&config)?;
+    let client = DaemonClient::new(&config.daemon.socket_path);
+    start_bot(client).await
 }
 
-fn daemon_channel_label(channel: CliDaemonChannel) -> &'static str {
-    match channel {
-        CliDaemonChannel::Telegram => "telegram",
-    }
-}
-
-fn telegram_token_configured() -> bool {
-    std::env::var("TELEGRAM_BOT_TOKEN")
-        .ok()
-        .map(|token| !token.trim().is_empty())
-        .unwrap_or(false)
-}
-
-fn seed_identity_memory(memory: &mut MemoryManager, bot_name: &str) -> Result<()> {
-    let marker = format!("my name is {bot_name}").to_lowercase();
-    let already_seeded = memory
-        .entries_by_tier(MemoryTier::Core)
-        .iter()
-        .any(|entry| entry.content.to_lowercase().contains(&marker));
-
-    if !already_seeded {
-        let identity = format!("My name is {bot_name}. I am your evolving AI companion.");
-        memory.record(MemoryTier::Core, identity, "onboarding-identity")?;
+fn ensure_daemon_running(config: &AppConfig) -> Result<()> {
+    let socket_path = PathBuf::from(&config.daemon.socket_path);
+    if is_socket_live(&socket_path) {
+        return Ok(());
     }
 
-    Ok(())
+    daemon_start(false)?;
+    for _ in 0..40 {
+        if is_socket_live(&socket_path) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "daemon did not become ready on socket {}",
+        socket_path.display()
+    )
 }
 
-async fn run_interactive_session(
-    mut runtime: AgentRuntime,
-    mut memory: MemoryManager,
-) -> Result<()> {
+async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return run_interactive_line_session(&mut runtime, &mut memory).await;
+        return run_interactive_line_session(daemon).await;
     }
 
     let (backend_tx, backend_rx) = aigent_ui::tui::create_backend_channel();
-    let mut app = aigent_ui::App::new(backend_rx, &runtime.config);
+    let mut app = aigent_ui::App::new(backend_rx, config);
     app.push_assistant_message(format!(
         "{} is online. Type /help for commands.",
-        runtime.config.agent.name
+        config.agent.name
     ));
-
-    let turn_count: usize = 0;
-    let recent_turns: VecDeque<ConversationTurn> = VecDeque::new();
-    let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
-    let memory = Arc::new(tokio::sync::Mutex::new(memory));
-    let turn_count = Arc::new(tokio::sync::Mutex::new(turn_count));
-    let recent_turns = Arc::new(tokio::sync::Mutex::new(recent_turns));
 
     aigent_ui::tui::run_app_with(&mut app, |command| {
         let backend_tx = backend_tx.clone();
-        let runtime = runtime.clone();
-        let memory = memory.clone();
-        let turn_count = turn_count.clone();
-        let recent_turns = recent_turns.clone();
+        let daemon = daemon.clone();
 
         async move {
             match command {
                 aigent_ui::UiCommand::Quit => {}
                 aigent_ui::UiCommand::Submit(line) => {
-                    tokio::spawn(async move {
-                        let _ = backend_tx.send(BackendEvent::Thinking);
-
-                        let (tx_chunk, mut rx_chunk) = tokio::sync::mpsc::channel(100);
-                        let tx_backend_chunks = backend_tx.clone();
-                        tokio::spawn(async move {
-                            while let Some(chunk) = rx_chunk.recv().await {
-                                let _ = tx_backend_chunks.send(BackendEvent::Token(chunk));
-                            }
-                        });
-
-                        let mut runtime = runtime.lock().await;
-                        let mut memory = memory.lock().await;
-                        let mut turn_count = turn_count.lock().await;
-                        let mut recent_turns = recent_turns.lock().await;
-
-                        let outcome = handle_interactive_input(
-                            &mut *runtime,
-                            &mut *memory,
-                            &line,
-                            &mut *turn_count,
-                            &mut *recent_turns,
-                            Some(tx_chunk),
-                        )
-                        .await;
-
-                        match outcome {
-                            Ok(outcome) => {
+                    if line == "/help" {
+                        let _ = backend_tx.send(BackendEvent::Token(
+                            "Commands: /help, /status, /memory, /exit, or ask anything".to_string(),
+                        ));
+                        let _ = backend_tx.send(BackendEvent::Done);
+                        return Ok(());
+                    }
+                    if line == "/status" {
+                        match daemon.get_status().await {
+                            Ok(status) => {
+                                let text = format!(
+                                    "bot: {}\nprovider: {}\nmodel: {}\nthinking: {}\nmemories: {}\nuptime: {}s",
+                                    status.bot_name,
+                                    status.provider,
+                                    status.model,
+                                    status.thinking_level,
+                                    status.memory_total,
+                                    status.uptime_secs
+                                );
+                                let _ = backend_tx.send(BackendEvent::Token(text));
                                 let _ = backend_tx.send(BackendEvent::Done);
-                                for msg in outcome.messages {
-                                    let _ = backend_tx.send(BackendEvent::Token(msg));
-                                    let _ = backend_tx.send(BackendEvent::Done);
-                                }
                             }
                             Err(err) => {
                                 let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
                             }
                         }
+                        return Ok(());
+                    }
+                    if line == "/memory" {
+                        match daemon.get_memory_peek(5).await {
+                            Ok(peek) => {
+                                let text = if peek.is_empty() {
+                                    "(no memory entries)".to_string()
+                                } else {
+                                    peek.join("\n")
+                                };
+                                let _ = backend_tx.send(BackendEvent::Token(text));
+                                let _ = backend_tx.send(BackendEvent::Done);
+                            }
+                            Err(err) => {
+                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    tokio::spawn(async move {
+                        let _ = daemon.stream_submit(line, backend_tx.clone()).await;
                     });
                 }
             }
@@ -639,19 +623,13 @@ async fn run_interactive_session(
     .await
 }
 
-async fn run_interactive_line_session(
-    runtime: &mut AgentRuntime,
-    memory: &mut MemoryManager,
-) -> Result<()> {
+async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
     println!("interactive mode");
     println!("commands: /model show|provider <ollama|openrouter>|set <model>|key <api-key>|test");
     println!("          /think <low|balanced|deep>, /status, /context, /help, /exit");
     println!("or type any message to chat with Aigent");
 
     let stdin = io::stdin();
-    let mut turn_count: usize = 0;
-    let mut recent_turns: VecDeque<ConversationTurn> = VecDeque::new();
-
     loop {
         let mut line = String::new();
         let bytes = stdin.read_line(&mut line)?;
@@ -665,246 +643,30 @@ async fn run_interactive_line_session(
             continue;
         }
 
-        let outcome = handle_interactive_input(
-            runtime,
-            memory,
-            line,
-            &mut turn_count,
-            &mut recent_turns,
-            None,
-        )
-        .await?;
-        for msg in outcome.messages {
-            println!("{msg}");
-        }
-        if outcome.exit_requested {
+        if line == "/exit" {
+            println!("session closed");
             break;
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        daemon.stream_submit(line.to_string(), tx).await?;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                BackendEvent::Token(chunk) => print!("{chunk}"),
+                BackendEvent::Done => {
+                    println!();
+                    break;
+                }
+                BackendEvent::Error(err) => {
+                    println!("error: {err}");
+                    break;
+                }
+                _ => {}
+            }
         }
     }
 
     Ok(())
-}
-
-struct InputOutcome {
-    messages: Vec<String>,
-    exit_requested: bool,
-}
-
-async fn handle_interactive_input(
-    runtime: &mut AgentRuntime,
-    memory: &mut MemoryManager,
-    line: &str,
-    turn_count: &mut usize,
-    recent_turns: &mut VecDeque<ConversationTurn>,
-    tx: Option<tokio::sync::mpsc::Sender<String>>,
-) -> Result<InputOutcome> {
-    if line == "/exit" {
-        return Ok(InputOutcome {
-            messages: vec!["session closed".to_string()],
-            exit_requested: true,
-        });
-    }
-
-    if line == "/help" {
-        return Ok(InputOutcome {
-            messages: vec![
-                "/model show".to_string(),
-                "/model list [ollama|openrouter]".to_string(),
-                "/model provider <ollama|openrouter>".to_string(),
-                "/model set <model>".to_string(),
-                "/model key <openrouter-api-key>".to_string(),
-                "/model test".to_string(),
-                "/think <low|balanced|deep>".to_string(),
-                "/status".to_string(),
-                "/context".to_string(),
-                "/exit".to_string(),
-            ],
-            exit_requested: false,
-        });
-    }
-
-    if line == "/status" {
-        return Ok(InputOutcome {
-            messages: vec![
-                format!("bot: {}", runtime.config.agent.name),
-                format!("provider: {}", runtime.config.llm.provider),
-                format!("model: {}", runtime.config.active_model()),
-                format!("thinking: {}", runtime.config.agent.thinking_level),
-                format!("stored memories: {}", memory.all().len()),
-                format!("recent conversation turns: {}", recent_turns.len()),
-                format!("sleep mode: {}", runtime.config.memory.auto_sleep_mode),
-                format!(
-                    "night sleep window: {:02}:00-{:02}:00 (local)",
-                    runtime.config.memory.night_sleep_start_hour,
-                    runtime.config.memory.night_sleep_end_hour
-                ),
-            ],
-            exit_requested: false,
-        });
-    }
-
-    if line == "/context" {
-        let snapshot = runtime.environment_snapshot(memory, recent_turns.len());
-        let mut messages = vec!["environment context:".to_string()];
-        messages.extend(snapshot.lines().map(ToString::to_string));
-        return Ok(InputOutcome {
-            messages,
-            exit_requested: false,
-        });
-    }
-
-    if line == "/model show" {
-        return Ok(InputOutcome {
-            messages: vec![
-                format!("provider: {}", runtime.config.llm.provider),
-                format!("model: {}", runtime.config.active_model()),
-            ],
-            exit_requested: false,
-        });
-    }
-
-    if line == "/model list" || line.starts_with("/model list ") {
-        let provider = parse_model_provider_from_command(line);
-        let messages = collect_model_lines(provider).await?;
-        return Ok(InputOutcome {
-            messages,
-            exit_requested: false,
-        });
-    }
-
-    if let Some(provider) = line.strip_prefix("/model provider ") {
-        let provider = provider.trim().to_lowercase();
-        if provider == "ollama" || provider == "openrouter" {
-            runtime.config.llm.provider = provider;
-            runtime.config.save_to("config/default.toml")?;
-            return Ok(InputOutcome {
-                messages: vec!["provider updated".to_string()],
-                exit_requested: false,
-            });
-        }
-        return Ok(InputOutcome {
-            messages: vec!["invalid provider, expected ollama or openrouter".to_string()],
-            exit_requested: false,
-        });
-    }
-
-    if let Some(model) = line.strip_prefix("/model set ") {
-        let model = model.trim();
-        if model.is_empty() {
-            return Ok(InputOutcome {
-                messages: vec!["model cannot be empty".to_string()],
-                exit_requested: false,
-            });
-        }
-        if runtime
-            .config
-            .llm
-            .provider
-            .eq_ignore_ascii_case("openrouter")
-        {
-            runtime.config.llm.openrouter_model = model.to_string();
-        } else {
-            runtime.config.llm.ollama_model = model.to_string();
-        }
-        runtime.config.save_to("config/default.toml")?;
-        return Ok(InputOutcome {
-            messages: vec!["model updated".to_string()],
-            exit_requested: false,
-        });
-    }
-
-    if let Some(api_key) = line.strip_prefix("/model key ") {
-        let api_key = api_key.trim();
-        if api_key.is_empty() {
-            return Ok(InputOutcome {
-                messages: vec!["api key cannot be empty".to_string()],
-                exit_requested: false,
-            });
-        }
-        upsert_env_value(Path::new(".env"), "OPENROUTER_API_KEY", api_key)?;
-        dotenvy::from_path_override(".env").ok();
-        return Ok(InputOutcome {
-            messages: vec!["openrouter key saved to .env".to_string()],
-            exit_requested: false,
-        });
-    }
-
-    if line == "/model test" {
-        let message = match runtime.test_model_connection().await {
-            Ok(result) => format!("aigent> model test ok: {result}"),
-            Err(error) => format!("aigent> model test failed: {error}"),
-        };
-        return Ok(InputOutcome {
-            messages: vec![message],
-            exit_requested: false,
-        });
-    }
-
-    if let Some(level) = line.strip_prefix("/think ") {
-        let parsed = parse_thinking_level(level);
-        return Ok(InputOutcome {
-            messages: match parsed {
-                Some(level) => {
-                    runtime.config.agent.thinking_level = thinking_level_label(level).to_string();
-                    runtime.config.save_to("config/default.toml")?;
-                    vec!["thinking level updated".to_string()]
-                }
-                None => vec!["invalid thinking level, expected low, balanced, or deep".to_string()],
-            },
-            exit_requested: false,
-        });
-    }
-
-    let mut messages = Vec::new();
-    let recent_context = recent_turns.iter().cloned().collect::<Vec<_>>();
-    let is_streaming = tx.is_some();
-    let reply = if let Some(tx) = tx {
-        runtime
-            .respond_and_remember_stream(memory, line, &recent_context, tx)
-            .await?
-    } else {
-        runtime
-            .respond_and_remember(memory, line, &recent_context)
-            .await?
-    };
-    if !is_streaming {
-        messages.push(format!("aigent> {reply}"));
-    }
-
-    recent_turns.push_back(ConversationTurn {
-        user: line.to_string(),
-        assistant: reply.clone(),
-    });
-    while recent_turns.len() > 8 {
-        let _ = recent_turns.pop_front();
-    }
-
-    *turn_count += 1;
-    if should_run_sleep_cycle(runtime, memory, *turn_count) {
-        let summary = memory.run_sleep_cycle()?;
-        messages.push(format!(
-            "aigent> internal sleep cycle: {}",
-            summary.distilled
-        ));
-    }
-
-    Ok(InputOutcome {
-        messages,
-        exit_requested: false,
-    })
-}
-
-fn parse_model_provider_from_command(line: &str) -> CliModelProvider {
-    if let Some(raw) = line.strip_prefix("/model list") {
-        let provider = raw.trim().to_lowercase();
-        if provider == "ollama" {
-            return CliModelProvider::Ollama;
-        }
-        if provider == "openrouter" {
-            return CliModelProvider::Openrouter;
-        }
-    }
-    CliModelProvider::All
 }
 
 async fn collect_model_lines(provider: CliModelProvider) -> Result<Vec<String>> {
@@ -1211,78 +973,3 @@ fn memory_layer_label(layer: CliMemoryLayer) -> &'static str {
     }
 }
 
-fn should_run_sleep_cycle(
-    runtime: &AgentRuntime,
-    memory: &MemoryManager,
-    turn_count: usize,
-) -> bool {
-    let mode = runtime.config.memory.auto_sleep_mode.trim().to_lowercase();
-
-    if mode == "nightly" {
-        let now = Local::now();
-        let start = runtime.config.memory.night_sleep_start_hour.min(23);
-        let end = runtime.config.memory.night_sleep_end_hour.min(23);
-        let in_window = if start == end {
-            true
-        } else if start < end {
-            (start..end).contains(&(now.hour() as u8))
-        } else {
-            (now.hour() as u8) >= start || (now.hour() as u8) < end
-        };
-
-        if !in_window {
-            return false;
-        }
-
-        let today = now.date_naive();
-        let already_slept_today = memory.all().iter().any(|entry| {
-            entry.source.starts_with("sleep:cycle")
-                && entry.created_at.with_timezone(&Local).date_naive() == today
-        });
-
-        return !already_slept_today;
-    }
-
-    let interval = runtime.config.memory.auto_sleep_turn_interval.max(1);
-    turn_count % interval == 0
-}
-
-fn parse_thinking_level(raw: &str) -> Option<CliThinkingLevel> {
-    match raw.trim().to_lowercase().as_str() {
-        "low" => Some(CliThinkingLevel::Low),
-        "balanced" => Some(CliThinkingLevel::Balanced),
-        "deep" => Some(CliThinkingLevel::Deep),
-        _ => None,
-    }
-}
-
-fn thinking_level_label(level: CliThinkingLevel) -> &'static str {
-    match level {
-        CliThinkingLevel::Low => "low",
-        CliThinkingLevel::Balanced => "balanced",
-        CliThinkingLevel::Deep => "deep",
-    }
-}
-
-fn upsert_env_value(path: &Path, key: &str, value: &str) -> Result<()> {
-    let existing = fs::read_to_string(path).unwrap_or_default();
-    let mut updated = Vec::new();
-    let mut replaced = false;
-
-    for line in existing.lines() {
-        if line.trim_start().starts_with(&format!("{key}=")) {
-            updated.push(format!("{key}={value}"));
-            replaced = true;
-        } else {
-            updated.push(line.to_string());
-        }
-    }
-
-    if !replaced {
-        updated.push(format!("{key}={value}"));
-    }
-
-    let content = format!("{}\n", updated.join("\n"));
-    fs::write(path, content)?;
-    Ok(())
-}

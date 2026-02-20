@@ -6,8 +6,14 @@ use aigent_llm::{LlmRouter, Provider};
 use aigent_memory::{MemoryManager, MemoryTier};
 use tokio::sync::mpsc;
 
+mod client;
+mod commands;
 mod events;
+mod server;
+pub use client::DaemonClient;
+pub use commands::{ClientCommand, DaemonStatus, ServerEvent};
 pub use events::{BackendEvent, ToolCallInfo, ToolResult};
+pub use server::run_unified_daemon;
 
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {

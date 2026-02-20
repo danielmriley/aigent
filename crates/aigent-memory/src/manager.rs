@@ -245,6 +245,10 @@ impl MemoryManager {
         Ok(summary)
     }
 
+    pub fn flush_all(&mut self) -> Result<()> {
+        self.sync_vault_projection()
+    }
+
     fn sync_vault_projection(&self) -> Result<()> {
         if let Some(path) = &self.vault_path {
             export_obsidian_vault(self.all(), path)?;

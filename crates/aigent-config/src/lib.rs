@@ -113,6 +113,20 @@ pub struct IntegrationsConfig {
     pub telegram_enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonConfig {
+    pub socket_path: String,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            socket_path: "/tmp/aigent.sock".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -123,6 +137,7 @@ pub struct AppConfig {
     pub telemetry: TelemetryConfig,
     pub onboarding: OnboardingConfig,
     pub integrations: IntegrationsConfig,
+    pub daemon: DaemonConfig,
 }
 
 impl AppConfig {
