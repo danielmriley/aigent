@@ -767,7 +767,7 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                 aigent_ui::UiCommand::Submit(line) => {
                     if line == "/help" {
                         let _ = backend_tx.send(BackendEvent::Token(
-                            "Commands: /help, /status, /memory, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
+                            "Commands: /help, /status, /memory, /sleep, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
                         ));
                         let _ = backend_tx.send(BackendEvent::Done);
                         return Ok(());
@@ -776,13 +776,15 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                         match daemon.get_status().await {
                             Ok(status) => {
                                 let text = format!(
-                                    "bot: {}\nprovider: {}\nmodel: {}\nthinking: {}\nmemory: {} total (core={}, semantic={}, episodic={})\nuptime: {}s",
+                                    "bot: {}\nprovider: {}\nmodel: {}\nthinking: {}\nmemory: {} total (core={} profile={} reflective={} semantic={} episodic={})\nuptime: {}s",
                                     status.bot_name,
                                     status.provider,
                                     status.model,
                                     status.thinking_level,
                                     status.memory_total,
                                     status.memory_core,
+                                    status.memory_user_profile,
+                                    status.memory_reflective,
                                     status.memory_semantic,
                                     status.memory_episodic,
                                     status.uptime_secs
@@ -805,6 +807,19 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                                     peek.join("\n")
                                 };
                                 let _ = backend_tx.send(BackendEvent::Token(text));
+                                let _ = backend_tx.send(BackendEvent::Done);
+                            }
+                            Err(err) => {
+                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    if line == "/sleep" {
+                        match daemon.run_sleep_cycle().await {
+                            Ok(msg) => {
+                                let _ = backend_tx.send(BackendEvent::Token(msg));
                                 let _ = backend_tx.send(BackendEvent::Done);
                             }
                             Err(err) => {
@@ -957,6 +972,7 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
             println!("/help");
             println!("/status");
             println!("/memory");
+            println!("/sleep  -- trigger an agentic sleep cycle now");
             println!("/model show");
             println!("/model list [ollama|openrouter]");
             println!("/model provider <ollama|openrouter>");
@@ -972,8 +988,15 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
             println!("provider: {}", status.provider);
             println!("model: {}", status.model);
             println!("thinking: {}", status.thinking_level);
-            println!("memory: {} total (core={}, semantic={}, episodic={})",
-                status.memory_total, status.memory_core, status.memory_semantic, status.memory_episodic);
+            println!(
+                "memory: {} total (core={} profile={} reflective={} semantic={} episodic={})",
+                status.memory_total,
+                status.memory_core,
+                status.memory_user_profile,
+                status.memory_reflective,
+                status.memory_semantic,
+                status.memory_episodic
+            );
             println!("uptime: {}s", status.uptime_secs);
             continue;
         }
@@ -984,6 +1007,14 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
                 println!("(no memory entries)");
             } else {
                 println!("{}", peek.join("\n"));
+            }
+            continue;
+        }
+
+        if line == "/sleep" {
+            match daemon.run_sleep_cycle().await {
+                Ok(msg) => println!("{msg}"),
+                Err(err) => eprintln!("error: {err}"),
             }
             continue;
         }

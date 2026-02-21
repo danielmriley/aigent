@@ -176,6 +176,18 @@ impl DaemonClient {
         bail!("daemon reload config response missing")
     }
 
+    pub async fn run_sleep_cycle(&self) -> Result<String> {
+        let events = self
+            .request_events(ClientCommand::RunSleepCycle)
+            .await?;
+        for event in events {
+            if let ServerEvent::Ack(msg) = event {
+                return Ok(msg);
+            }
+        }
+        bail!("daemon sleep cycle response missing")
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<aigent_tools::ToolSpec>> {
         let events = self.request_events(ClientCommand::ListTools).await?;
         for event in events {

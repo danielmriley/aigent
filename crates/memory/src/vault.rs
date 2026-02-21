@@ -202,6 +202,8 @@ fn tier_slug(tier: MemoryTier) -> &'static str {
         MemoryTier::Episodic => "episodic",
         MemoryTier::Semantic => "semantic",
         MemoryTier::Procedural => "procedural",
+        MemoryTier::Reflective => "reflective",
+        MemoryTier::UserProfile => "user-profile",
         MemoryTier::Core => "core",
     }
 }

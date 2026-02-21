@@ -695,7 +695,7 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                 aigent_ui::UiCommand::Submit(line) => {
                     if line == "/help" {
                         let _ = backend_tx.send(BackendEvent::Token(
-                            "Commands: /help, /status, /memory, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
+                            "Commands: /help, /status, /memory, /sleep, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
                         ));
                         let _ = backend_tx.send(BackendEvent::Done);
                         return Ok(());
@@ -730,6 +730,19 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                                     peek.join("\n")
                                 };
                                 let _ = backend_tx.send(BackendEvent::Token(text));
+                                let _ = backend_tx.send(BackendEvent::Done);
+                            }
+                            Err(err) => {
+                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
+                            }
+                        }
+                        return Ok(());
+                    }
+
+                    if line == "/sleep" {
+                        match daemon.run_sleep_cycle().await {
+                            Ok(msg) => {
+                                let _ = backend_tx.send(BackendEvent::Token(msg));
                                 let _ = backend_tx.send(BackendEvent::Done);
                             }
                             Err(err) => {
@@ -831,6 +844,7 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
             println!("/help");
             println!("/status");
             println!("/memory");
+            println!("/sleep  -- trigger an agentic sleep cycle now");
             println!("/model show");
             println!("/model list [ollama|openrouter]");
             println!("/model provider <ollama|openrouter>");
@@ -857,6 +871,14 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
                 println!("(no memory entries)");
             } else {
                 println!("{}", peek.join("\n"));
+            }
+            continue;
+        }
+
+        if line == "/sleep" {
+            match daemon.run_sleep_cycle().await {
+                Ok(msg) => println!("{msg}"),
+                Err(err) => eprintln!("error: {err}"),
             }
             continue;
         }

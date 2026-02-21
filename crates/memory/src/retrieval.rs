@@ -1,9 +1,19 @@
+/// Memory retrieval and context assembly.
+///
+/// Scoring model (weights sum to 1.0):
+/// ```text
+/// score = tier(0.35) + recency(0.20) + lexical(0.25) + embedding(0.15) + confidence(0.05)
+/// ```
+/// When no embedding backend is available the embedding weight is redistributed
+/// to lexical and recency.
 use std::collections::{BTreeSet, HashSet};
 
 use chrono::Utc;
+use tracing::trace;
 
 use crate::schema::{MemoryEntry, MemoryTier};
 
+/// A ranked memory item with its computed score and human-readable rationale.
 #[derive(Debug, Clone)]
 pub struct RankedMemoryContext {
     pub entry: MemoryEntry,
@@ -11,6 +21,16 @@ pub struct RankedMemoryContext {
     pub rationale: String,
 }
 
+/// Build a ranked, deduplicated context window for LLM prompt injection.
+///
+/// * `matches`      – candidate non-Core entries (Episodic, Semantic, Procedural,
+///                    Reflective, UserProfile)
+/// * `core_entries` – Core entries (always injected; scored for ordering)
+/// * `query`        – the user's current message (used for lexical relevance)
+/// * `limit`        – maximum number of items returned
+///
+/// Core and UserProfile entries are given strong tier boosts so they tend to
+/// appear first even with modest lexical overlap.
 pub fn assemble_context_with_provenance(
     matches: Vec<MemoryEntry>,
     core_entries: Vec<MemoryEntry>,
@@ -20,36 +40,20 @@ pub fn assemble_context_with_provenance(
     let mut combined = core_entries;
     combined.extend(matches);
 
+    // Deduplicate by ID.
     let mut seen_ids = HashSet::new();
     combined.retain(|entry| seen_ids.insert(entry.id));
 
     let query_terms = tokenize(query);
     let now = Utc::now();
 
-    let mut ranked = combined
+    let mut ranked: Vec<RankedMemoryContext> = combined
         .into_iter()
         .map(|entry| {
-            let tier_score = tier_priority(entry.tier);
-            let recency_score = recency_score(now, entry.created_at);
-            let relevance_score = relevance_score(&entry.content, &query_terms);
-            let confidence_score = entry.confidence.clamp(0.0, 1.0);
-
-            let score = (tier_score * 0.4)
-                + (recency_score * 0.25)
-                + (relevance_score * 0.25)
-                + (confidence_score * 0.1);
-
-            let rationale = format!(
-                "tier={tier_score:.2}; recency={recency_score:.2}; relevance={relevance_score:.2}; confidence={confidence_score:.2}"
-            );
-
-            RankedMemoryContext {
-                entry,
-                score,
-                rationale,
-            }
+            let embedding_sim = cosine_similarity_if_available(&entry, &[]);
+            score_entry(&entry, &query_terms, now, embedding_sim)
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     ranked.sort_by(|left, right| {
         right
@@ -61,6 +65,51 @@ pub fn assemble_context_with_provenance(
     ranked.into_iter().take(limit).collect()
 }
 
+/// Score a single entry given the current query terms and optional embedding similarity.
+pub fn score_entry(
+    entry: &MemoryEntry,
+    query_terms: &BTreeSet<String>,
+    now: chrono::DateTime<Utc>,
+    embedding_cos_sim: Option<f32>,
+) -> RankedMemoryContext {
+    let tier_score = tier_priority(entry.tier);
+    let recency = recency_score(now, entry.created_at);
+    let lexical = lexical_relevance_score(&entry.content, query_terms);
+    let confidence = entry.confidence.clamp(0.0, 1.0);
+
+    let score = if let Some(emb) = embedding_cos_sim {
+        // Hybrid: tier + recency + lexical + embedding + confidence
+        (tier_score * 0.35) + (recency * 0.20) + (lexical * 0.25) + (emb * 0.15) + (confidence * 0.05)
+    } else {
+        // Lexical-only fallback: redistribute embedding weight to lexical/recency
+        (tier_score * 0.35) + (recency * 0.25) + (lexical * 0.35) + (confidence * 0.05)
+    };
+
+    let rationale = match embedding_cos_sim {
+        Some(emb) => format!(
+            "tier={tier_score:.2}; recency={recency:.2}; lexical={lexical:.2}; emb={emb:.2}; conf={confidence:.2}"
+        ),
+        None => format!(
+            "tier={tier_score:.2}; recency={recency:.2}; lexical={lexical:.2}; conf={confidence:.2}"
+        ),
+    };
+
+    trace!(
+        id = %entry.id,
+        tier = ?entry.tier,
+        score,
+        %rationale,
+        "scored memory entry"
+    );
+
+    RankedMemoryContext {
+        entry: entry.clone(),
+        score,
+        rationale,
+    }
+}
+
+/// Legacy helper: assemble without provenance metadata.
 pub fn assemble_context(
     matches: Vec<MemoryEntry>,
     core_entries: Vec<MemoryEntry>,
@@ -71,37 +120,74 @@ pub fn assemble_context(
         .collect()
 }
 
+// ── Tier priority ─────────────────────────────────────────────────────────────
+
 fn tier_priority(tier: MemoryTier) -> f32 {
     match tier {
-        MemoryTier::Core => 1.0,
-        MemoryTier::Semantic => 0.75,
-        MemoryTier::Procedural => 0.6,
-        MemoryTier::Episodic => 0.5,
+        MemoryTier::Core => 1.00,
+        MemoryTier::UserProfile => 0.90,
+        MemoryTier::Reflective => 0.75,
+        MemoryTier::Semantic => 0.65,
+        MemoryTier::Procedural => 0.55,
+        MemoryTier::Episodic => 0.40,
     }
 }
 
+// ── Recency ───────────────────────────────────────────────────────────────────
+
 fn recency_score(now: chrono::DateTime<Utc>, created_at: chrono::DateTime<Utc>) -> f32 {
-    let age_seconds = (now - created_at).num_seconds().max(0) as f32;
-    let age_hours = age_seconds / 3600.0;
-    1.0 / (1.0 + (age_hours / 24.0))
+    let age_secs = (now - created_at).num_seconds().max(0) as f32;
+    let age_hours = age_secs / 3600.0;
+    // Half-life ~48 h — very recent memories score ≈1.0, week-old ≈0.35
+    1.0 / (1.0 + (age_hours / 48.0))
 }
 
-fn relevance_score(content: &str, query_terms: &BTreeSet<String>) -> f32 {
+// ── Lexical relevance ─────────────────────────────────────────────────────────
+
+fn lexical_relevance_score(content: &str, query_terms: &BTreeSet<String>) -> f32 {
     if query_terms.is_empty() {
         return 0.0;
     }
-
     let content_terms = tokenize(content);
     let overlap = query_terms.intersection(&content_terms).count() as f32;
     overlap / query_terms.len() as f32
 }
 
-fn tokenize(text: &str) -> BTreeSet<String> {
+pub(crate) fn tokenize(text: &str) -> BTreeSet<String> {
     text.split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| token.len() >= 3)
-        .map(|token| token.to_lowercase())
+        .filter(|t| t.len() >= 3)
+        .map(|t| t.to_lowercase())
         .collect()
 }
+
+// ── Embedding cosine similarity ───────────────────────────────────────────────
+
+/// Returns cosine similarity between the entry's stored embedding and a fresh
+/// query embedding, or `None` if either is absent.
+///
+/// `query_vec` is empty in the common case when no embedding backend is configured.
+pub fn cosine_similarity_if_available(entry: &MemoryEntry, query_vec: &[f32]) -> Option<f32> {
+    if query_vec.is_empty() {
+        return None;
+    }
+    let entry_vec = entry.embedding.as_deref()?;
+    Some(cosine_similarity(entry_vec, query_vec))
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 {
+        return 0.0;
+    }
+    (dot / (mag_a * mag_b)).clamp(0.0, 1.0)
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -120,6 +206,8 @@ mod tests {
             source: "test".to_string(),
             confidence: 0.8,
             valence: 0.0,
+            tags: Vec::new(),
+            embedding: None,
             created_at: Utc::now() - Duration::hours(age_hours),
             provenance_hash: "hash".to_string(),
         }
@@ -142,6 +230,22 @@ mod tests {
     }
 
     #[test]
+    fn user_profile_outranks_episodic_without_query_overlap() -> Result<()> {
+        let profile = sample_entry(
+            MemoryTier::UserProfile,
+            "user prefers dark mode and concise answers",
+            24,
+        );
+        let episodic = sample_entry(MemoryTier::Episodic, "some other fact", 1);
+
+        let ranked =
+            assemble_context_with_provenance(vec![episodic, profile.clone()], vec![], "", 2);
+
+        assert_eq!(ranked.first().map(|item| item.entry.id), Some(profile.id));
+        Ok(())
+    }
+
+    #[test]
     fn query_overlap_increases_rank_for_relevant_memories() -> Result<()> {
         let unrelated = sample_entry(MemoryTier::Semantic, "i enjoy mountain hiking", 1);
         let relevant = sample_entry(
@@ -158,6 +262,22 @@ mod tests {
         );
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(relevant.id));
+        Ok(())
+    }
+
+    #[test]
+    fn reflective_tier_ranks_above_episodic() -> Result<()> {
+        let reflective = sample_entry(
+            MemoryTier::Reflective,
+            "I should follow up on project X next time",
+            2,
+        );
+        let episodic = sample_entry(MemoryTier::Episodic, "user mentioned project X briefly", 1);
+
+        let ranked =
+            assemble_context_with_provenance(vec![reflective.clone(), episodic], vec![], "", 2);
+
+        assert_eq!(ranked.first().map(|item| item.entry.id), Some(reflective.id));
         Ok(())
     }
 }

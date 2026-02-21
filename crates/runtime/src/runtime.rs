@@ -4,7 +4,7 @@ use tracing::{debug, info, instrument, warn};
 
 use aigent_config::AppConfig;
 use aigent_llm::{LlmRouter, Provider};
-use aigent_memory::{MemoryManager, MemoryTier};
+use aigent_memory::{MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights};
 use tokio::sync::mpsc;
 
 use crate::BackendEvent;
@@ -84,20 +84,28 @@ impl AgentRuntime {
         // Persist the user turn immediately so it survives a restart.
         memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input")?;
         let stats = memory.stats();
-        debug!(core = stats.core, episodic = stats.episodic, semantic = stats.semantic, "memory state before context assembly");
+        debug!(
+            core = stats.core,
+            user_profile = stats.user_profile,
+            reflective = stats.reflective,
+            episodic = stats.episodic,
+            semantic = stats.semantic,
+            "memory state before context assembly"
+        );
 
-        let context = memory.context_for_prompt_ranked(user_message, 8);
+        // Retrieve ranked context (Core + UserProfile + Reflective always included).
+        let context = memory.context_for_prompt_ranked(user_message, 10);
         debug!(context_items = context.len(), "assembled memory context");
 
         let context_block = context
             .iter()
             .map(|item| {
                 format!(
-                    "- [{:?}] score={:.2} source={} :: {}",
+                    "- [{:?}] score={:.2} src={} :: {}",
                     item.entry.tier,
                     item.score,
                     item.entry.source,
-                    truncate_for_prompt(&item.entry.content, 300),
+                    truncate_for_prompt(&item.entry.content, 280),
                 )
             })
             .collect::<Vec<_>>()
@@ -106,14 +114,21 @@ impl AgentRuntime {
         // Authoritative header — the LLM must use these counts, not try to count
         // context items, which would give wrong answers about memory state.
         let memory_header = format!(
-            "[Memory state: total={} core={} semantic={} episodic={} — do not count items below to determine these totals]",
-            stats.total, stats.core, stats.semantic, stats.episodic
+            "[Memory: total={} core={} profile={} reflective={} semantic={} episodic={} — use these counts; do not re-count below]",
+            stats.total, stats.core, stats.user_profile, stats.reflective, stats.semantic, stats.episodic
         );
         let context_block = if context_block.is_empty() {
             format!("{memory_header}\n(no relevant memories retrieved)")
         } else {
             format!("{memory_header}\n{context_block}")
         };
+
+        // Build a dedicated user-profile section when available.
+        let user_profile_block = memory
+            .user_profile_block()
+            .map(|block| format!("\n\nUSER PROFILE:\n{block}"))
+            .unwrap_or_default();
+
         let environment_block = self.environment_snapshot(memory, recent_turns.len());
 
         let recent_conversation = recent_turns
@@ -144,13 +159,18 @@ impl AgentRuntime {
 
         let thought_style = self.config.agent.thinking_level.to_lowercase();
         let prompt = format!(
-            "You are {}. Thinking depth: {}.\nUse ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate continuity, and MEMORY CONTEXT for durable background facts.\nNever repeat previous answers unless asked.\nRespond directly and specifically to the LATEST user message.\n\nENVIRONMENT CONTEXT:\n{}\n\nRECENT CONVERSATION:\n{}\n\nMEMORY CONTEXT:\n{}\n\nLATEST USER MESSAGE:\n{}\n\nASSISTANT RESPONSE:",
-            self.config.agent.name,
-            thought_style,
-            environment_block,
-            conversation_block,
-            context_block,
-            user_message
+            "You are {name}. Thinking depth: {thought_style}.\n\
+             Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
+             continuity, and MEMORY CONTEXT for durable background facts.\n\
+             Never repeat previous answers unless asked.\n\
+             Respond directly and specifically to the LATEST user message.{profile_block}\n\n\
+             ENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
+            name = self.config.agent.name,
+            profile_block = user_profile_block,
+            env = environment_block,
+            conv = conversation_block,
+            mem = context_block,
+            msg = user_message
         );
 
         info!(provider = ?primary, model = %self.config.active_model(), "sending prompt to LLM");
@@ -172,6 +192,41 @@ impl AgentRuntime {
         }
 
         Ok(reply)
+    }
+
+    /// Run an agentic sleep cycle: build a reflection prompt, call the LLM,
+    /// parse the insights, and apply them to memory.
+    ///
+    /// Falls back to passive-only distillation if the LLM call fails.
+    #[instrument(skip(self, memory))]
+    pub async fn run_agentic_sleep_cycle(&self, memory: &mut MemoryManager) -> Result<SleepSummary> {
+        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
+            Provider::OpenRouter
+        } else {
+            Provider::Ollama
+        };
+
+        let prompt = memory.agentic_sleep_prompt();
+        info!(prompt_len = prompt.len(), "agentic sleep: sending reflection prompt to LLM");
+
+        match self.llm.chat_with_fallback(primary, self.config.active_model(), &prompt).await {
+            Ok((_provider, reply)) => {
+                info!(reply_len = reply.len(), "agentic sleep: LLM reply received");
+                let insights = parse_agentic_insights(&reply);
+                let summary_text = Some(format!(
+                    "Agentic sleep: {} learned, {} follow-ups, {} reflections, {} profile updates",
+                    insights.learned_about_user.len(),
+                    insights.follow_ups.len(),
+                    insights.reflective_thoughts.len(),
+                    insights.user_profile_updates.len(),
+                ));
+                memory.apply_agentic_sleep_insights(insights, summary_text)
+            }
+            Err(err) => {
+                warn!(?err, "agentic sleep: LLM unavailable, falling back to passive distillation");
+                memory.run_sleep_cycle()
+            }
+        }
     }
 
     /// Legacy single-shot turn helper. Callers should use the server path
@@ -219,18 +274,21 @@ impl AgentRuntime {
         let timestamp = Utc::now().to_rfc3339();
         let git_present = std::path::Path::new(".git").exists();
 
+        let stats = memory.stats();
         format!(
-            "- utc_time: {timestamp}\n- os: {}\n- arch: {}\n- cwd: {cwd}\n- git_repo_present: {git_present}\n- provider: {}\n- model: {}\n- thinking_level: {}\n- memory_total: {}\n- memory_core: {}\n- memory_semantic: {}\n- memory_episodic: {}\n- memory_procedural: {}\n- recent_conversation_turns: {recent_turn_count}",
+            "- utc_time: {timestamp}\n- os: {}\n- arch: {}\n- cwd: {cwd}\n- git_repo_present: {git_present}\n- provider: {}\n- model: {}\n- thinking_level: {}\n- memory_total: {}\n- memory_core: {}\n- memory_user_profile: {}\n- memory_reflective: {}\n- memory_semantic: {}\n- memory_episodic: {}\n- memory_procedural: {}\n- recent_conversation_turns: {recent_turn_count}",
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.config.llm.provider,
             self.config.active_model(),
             self.config.agent.thinking_level,
-            memory.all().len(),
-            memory.entries_by_tier(MemoryTier::Core).len(),
-            memory.entries_by_tier(MemoryTier::Semantic).len(),
-            memory.entries_by_tier(MemoryTier::Episodic).len(),
-            memory.entries_by_tier(MemoryTier::Procedural).len(),
+            stats.total,
+            stats.core,
+            stats.user_profile,
+            stats.reflective,
+            stats.semantic,
+            stats.episodic,
+            stats.procedural,
         )
     }
 }

@@ -10,6 +10,8 @@ pub enum MemoryTier {
     Episodic,
     Semantic,
     Procedural,
+    Reflective,
+    UserProfile,
     Core,
 }
 

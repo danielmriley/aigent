@@ -43,6 +43,8 @@ impl DaemonState {
             thinking_level: self.runtime.config.agent.thinking_level.clone(),
             memory_total: stats.total,
             memory_core: stats.core,
+            memory_user_profile: stats.user_profile,
+            memory_reflective: stats.reflective,
             memory_semantic: stats.semantic,
             memory_episodic: stats.episodic,
             uptime_secs: self.started_at.elapsed().as_secs(),
@@ -143,7 +145,12 @@ pub async fn run_unified_daemon(
     {
         let mut state = state.lock().await;
         let _ = state.memory.flush_all();
-        let _ = state.memory.run_sleep_cycle();
+        // Run agentic sleep on shutdown for a final consolidation pass.
+        // Use std::mem::take to satisfy the borrow checker (runtime + memory
+        // cannot be borrowed simultaneously through the same struct).
+        let mut memory = std::mem::take(&mut state.memory);
+        let _ = state.runtime.run_agentic_sleep_cycle(&mut memory).await;
+        state.memory = memory;
         let _ = state.memory.flush_all();
     }
     let _ = std::fs::remove_file(&socket_path);
@@ -251,8 +258,14 @@ async fn handle_connection(
                                 % state.runtime.config.memory.auto_sleep_turn_interval
                                 == 0
                         {
-                            if let Ok(summary) = memory.run_sleep_cycle() {
-                                extras.push(format!("internal sleep cycle: {}", summary.distilled));
+                            // Use agentic sleep for richer consolidation.
+                            let sleep_result = state
+                                .runtime
+                                .run_agentic_sleep_cycle(&mut memory)
+                                .await;
+                            match sleep_result {
+                                Ok(summary) => extras.push(format!("sleep cycle: {}", summary.distilled)),
+                                Err(err) => warn!(?err, "auto agentic sleep cycle failed"),
                             }
                         }
 
@@ -368,6 +381,20 @@ async fn handle_connection(
         }
         ClientCommand::Ping => {
             send_event(&mut write_half, ServerEvent::Ack("pong".to_string())).await?;
+        }
+        ClientCommand::RunSleepCycle => {
+            let mut state = state.lock().await;
+            // Use mem::take to satisfy the borrow checker (runtime + memory
+            // cannot be borrowed simultaneously through the same struct).
+            let mut memory = std::mem::take(&mut state.memory);
+            let result = state.runtime.run_agentic_sleep_cycle(&mut memory).await;
+            state.memory = memory;
+            let _ = state.memory.flush_all();
+            let msg = match result {
+                Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
+                Err(err) => format!("sleep cycle failed: {err}"),
+            };
+            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
         }
     }
 

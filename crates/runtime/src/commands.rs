@@ -12,6 +12,8 @@ pub struct DaemonStatus {
     pub thinking_level: String,
     pub memory_total: usize,
     pub memory_core: usize,
+    pub memory_user_profile: usize,
+    pub memory_reflective: usize,
     pub memory_semantic: usize,
     pub memory_episodic: usize,
     pub uptime_secs: u64,
@@ -30,6 +32,8 @@ pub enum ClientCommand {
     Ping,
     /// Open a persistent connection that receives broadcast events from all turns.
     Subscribe,
+    /// Manually trigger an agentic sleep cycle for memory consolidation.
+    RunSleepCycle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

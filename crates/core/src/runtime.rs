@@ -199,18 +199,21 @@ impl AgentRuntime {
         let timestamp = Utc::now().to_rfc3339();
         let git_present = std::path::Path::new(".git").exists();
 
+        let stats = memory.stats();
         format!(
-            "- utc_time: {timestamp}\n- os: {}\n- arch: {}\n- cwd: {cwd}\n- git_repo_present: {git_present}\n- provider: {}\n- model: {}\n- thinking_level: {}\n- memory_total: {}\n- memory_core: {}\n- memory_semantic: {}\n- memory_episodic: {}\n- memory_procedural: {}\n- recent_conversation_turns: {recent_turn_count}",
+            "- utc_time: {timestamp}\n- os: {}\n- arch: {}\n- cwd: {cwd}\n- git_repo_present: {git_present}\n- provider: {}\n- model: {}\n- thinking_level: {}\n- memory_total: {}\n- memory_core: {}\n- memory_user_profile: {}\n- memory_reflective: {}\n- memory_semantic: {}\n- memory_episodic: {}\n- memory_procedural: {}\n- recent_conversation_turns: {recent_turn_count}",
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.config.llm.provider,
             self.config.active_model(),
             self.config.agent.thinking_level,
-            memory.all().len(),
-            memory.entries_by_tier(MemoryTier::Core).len(),
-            memory.entries_by_tier(MemoryTier::Semantic).len(),
-            memory.entries_by_tier(MemoryTier::Episodic).len(),
-            memory.entries_by_tier(MemoryTier::Procedural).len(),
+            stats.total,
+            stats.core,
+            stats.user_profile,
+            stats.reflective,
+            stats.semantic,
+            stats.episodic,
+            stats.procedural,
         )
     }
 }
