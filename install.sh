@@ -42,5 +42,17 @@ if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
   echo "Note: ${INSTALL_DIR} is not in PATH for this shell."
 fi
 
-echo "Run: aigent --version"
-echo "Then: aigent onboard"
+# Restart the daemon if it is currently running, so it picks up the new binary.
+SOCKET_PATH=""
+if command -v grep >/dev/null 2>&1 && [[ -f "config/default.toml" ]]; then
+  SOCKET_PATH=$(grep -E '^\s*socket_path\s*=' config/default.toml | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+fi
+SOCKET_PATH="${SOCKET_PATH:-/tmp/aigent.sock}"
+PID_FILE=".aigent/runtime/daemon.pid"
+if [[ -S "$SOCKET_PATH" ]] || ([[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null); then
+  echo "Restarting daemon to pick up new binary..."
+  "$INSTALL_PATH" daemon restart --force && echo "Daemon restarted." || echo "Warning: daemon restart failed — run 'aigent daemon restart' manually."
+else
+  echo "Run: aigent --version"
+  echo "Then: aigent onboard"
+fi

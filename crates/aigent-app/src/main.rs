@@ -396,7 +396,13 @@ fn daemon_start(force: bool) -> Result<()> {
         let _ = fs::remove_file(&socket_path);
     }
 
-    let exe = std::env::current_exe()?;
+    // Remove stale lock file so a previously crashed or unclean daemon doesn't
+    // block startup. Safe because we've already confirmed no live process holds it.
+    if force && paths.lock_file.exists() {
+        let _ = fs::remove_file(&paths.lock_file);
+    }
+
+    let exe = std::env::current_exe()?;;
     let out = OpenOptions::new()
         .create(true)
         .append(true)
@@ -464,6 +470,7 @@ async fn daemon_stop() -> Result<()> {
     terminate_pid(pid)?;
     wait_for_pid_exit(pid, Duration::from_secs(4));
     let _ = fs::remove_file(&paths.pid_file);
+    let _ = fs::remove_file(&paths.lock_file);
     println!("daemon stopped (pid {pid})");
     Ok(())
 }
