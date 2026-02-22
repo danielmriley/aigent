@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -11,7 +12,7 @@ use tracing::{error, info, warn};
 
 use aigent_config::AppConfig;
 use aigent_exec::{ExecutionPolicy, ToolExecutor};
-use aigent_memory::MemoryManager;
+use aigent_memory::{EmbedFn, MemoryManager, MemoryTier};
 use aigent_tools::ToolRegistry;
 
 use crate::{
@@ -29,6 +30,8 @@ struct DaemonState {
     recent_turns: VecDeque<ConversationTurn>,
     turn_count: usize,
     started_at: Instant,
+    /// Timestamp of the last completed conversation turn (persisted in-process).
+    last_turn_at: Option<DateTime<Utc>>,
     /// Broadcast sender — fans out external-source BackendEvents to all subscribers.
     event_tx: broadcast::Sender<BackendEvent>,
 }
@@ -63,6 +66,32 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
     }
 }
 
+/// Build a synchronous embedding function that calls the Ollama `/api/embeddings`
+/// endpoint.  Falls back to `None` silently so the system continues to work
+/// when Ollama is unavailable.
+fn make_ollama_embed_fn(model: &str) -> EmbedFn {
+    let model = model.to_string();
+    let base_url = std::env::var("OLLAMA_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    let url = format!("{}/api/embeddings", base_url.trim_end_matches('/'));
+
+    Arc::new(move |text: &str| {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .ok()?;
+        let body = serde_json::json!({ "model": model, "prompt": text });
+        let resp = client.post(&url).json(&body).send().ok()?;
+        let json: serde_json::Value = resp.json().ok()?;
+        let embedding = json["embedding"]
+            .as_array()?
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect::<Vec<f32>>();
+        if embedding.is_empty() { None } else { Some(embedding) }
+    })
+}
+
 pub async fn run_unified_daemon(
     config: AppConfig,
     memory_log_path: impl AsRef<Path>,
@@ -74,6 +103,14 @@ pub async fn run_unified_daemon(
     }
 
     let mut memory = MemoryManager::with_event_log(memory_log_path)?;
+
+    // Wire in the Ollama embedding backend so all new entries are automatically
+    // embedded and retrieval uses hybrid lexical+vector scoring.
+    {
+        let embed_model = config.llm.ollama_model.clone();
+        memory.set_embed_fn(make_ollama_embed_fn(&embed_model));
+        info!(model = %embed_model, "embedding backend configured");
+    }
 
     // Auto-seed Core identity if it's missing (safety net for upgrades or
     // first-run cases where onboarding seeded the config but not the event log).
@@ -114,12 +151,83 @@ pub async fn run_unified_daemon(
         recent_turns: VecDeque::new(),
         turn_count: 0,
         started_at: Instant::now(),
+        last_turn_at: None,
         event_tx,
     }));
 
     let listener = UnixListener::bind(&socket_path)?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     info!(path = %socket_path.display(), "unified daemon listening");
+
+    // Background compaction: remove old episodic entries every 24 hours so the
+    // event log stays bounded even when the main sleep cycle doesn't fire.
+    {
+        let compaction_state = state.clone();
+        let mut compaction_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(24 * 60 * 60);
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        let mut s = compaction_state.lock().await;
+                        match s.memory.compact_episodic(7) {
+                            Ok(removed) if removed > 0 => {
+                                info!(removed, "background episodic compaction complete");
+                            }
+                            Ok(_) => {}
+                            Err(err) => warn!(?err, "background episodic compaction failed"),
+                        }
+                    }
+                    changed = compaction_rx.changed() => {
+                        if changed.is_ok() && *compaction_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Background agentic sleep: consolidates memory and evolves personality
+    // every N hours (default 8) without requiring an explicit CLI command.
+    // Offset by half the interval so it doesn't co-fire with compaction.
+    {
+        let sleep_state = state.clone();
+        let mut sleep_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let hours = std::env::var("AIGENT_SLEEP_INTERVAL_HOURS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(8);
+            let interval = std::time::Duration::from_secs(hours * 60 * 60);
+            // Initial offset: half the interval.
+            tokio::select! {
+                _ = tokio::time::sleep(interval / 2) => {}
+                changed = sleep_rx.changed() => {
+                    if changed.is_ok() && *sleep_rx.borrow() { return; }
+                }
+            }
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        let mut s = sleep_state.lock().await;
+                        let mut memory = std::mem::take(&mut s.memory);
+                        match s.runtime.run_agentic_sleep_cycle(&mut memory).await {
+                            Ok(ref summary) if !summary.distilled.is_empty() => {
+                                info!(summary = %summary.distilled, "background sleep cycle complete");
+                            }
+                            Ok(_) => {}
+                            Err(ref err) => warn!(?err, "background sleep cycle failed"),
+                        }
+                        s.memory = memory;
+                    }
+                    changed = sleep_rx.changed() => {
+                        if changed.is_ok() && *sleep_rx.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -235,14 +343,16 @@ async fn handle_connection(
             let outcome = {
                 let mut state = state.lock().await;
                 let recent = state.recent_turns.iter().cloned().collect::<Vec<_>>();
+                let last_turn_at = state.last_turn_at;
                 let mut memory = std::mem::take(&mut state.memory);
                 let reply_result = state
                     .runtime
-                    .respond_and_remember_stream(&mut memory, &user, &recent, chunk_tx)
+                    .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
                     .await;
 
                 let outcome = match reply_result {
                     Ok(reply) => {
+                        state.last_turn_at = Some(Utc::now());
                         state.recent_turns.push_back(ConversationTurn {
                             user,
                             assistant: reply,
@@ -328,13 +438,28 @@ async fn handle_connection(
             send_event(&mut write_half, ServerEvent::MemoryPeek(peek)).await?;
         }
         ClientCommand::ExecuteTool { name, args } => {
-            let state = state.lock().await;
+            let mut state = state.lock().await;
             let result = state
                 .tool_executor
                 .execute(&state.tool_registry, &name, &args)
                 .await;
             match result {
                 Ok(output) => {
+                    // Record tool outcome so the sleep cycle can reason about
+                    // tool-use patterns and add TOOL_INSIGHT entries.
+                    let outcome_text = format!(
+                        "Tool '{}' {}: {}",
+                        name,
+                        if output.success { "succeeded" } else { "failed" },
+                        &output.output[..output.output.len().min(200)],
+                    );
+                    if let Err(err) = state.memory.record(
+                        MemoryTier::Procedural,
+                        outcome_text,
+                        format!("tool-execution:{name}"),
+                    ) {
+                        warn!(?err, tool = %name, "failed to record tool outcome to procedural memory");
+                    }
                     send_event(
                         &mut write_half,
                         ServerEvent::ToolResult {

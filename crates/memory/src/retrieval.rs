@@ -23,11 +23,13 @@ pub struct RankedMemoryContext {
 
 /// Build a ranked, deduplicated context window for LLM prompt injection.
 ///
-/// * `matches`      – candidate non-Core entries (Episodic, Semantic, Procedural,
-///                    Reflective, UserProfile)
-/// * `core_entries` – Core entries (always injected; scored for ordering)
-/// * `query`        – the user's current message (used for lexical relevance)
-/// * `limit`        – maximum number of items returned
+/// * `matches`        – candidate non-Core entries (Episodic, Semantic, Procedural,
+///   Reflective, UserProfile)
+/// * `core_entries`   – Core entries (always injected; scored for ordering)
+/// * `query`          – the user's current message (used for lexical relevance)
+/// * `limit`          – maximum number of items returned
+/// * `query_embedding`– optional pre-computed embedding of `query`; when
+///   `Some`, hybrid lexical+vector scoring is used.
 ///
 /// Core and UserProfile entries are given strong tier boosts so they tend to
 /// appear first even with modest lexical overlap.
@@ -36,6 +38,7 @@ pub fn assemble_context_with_provenance(
     core_entries: Vec<MemoryEntry>,
     query: &str,
     limit: usize,
+    query_embedding: Option<Vec<f32>>,
 ) -> Vec<RankedMemoryContext> {
     let mut combined = core_entries;
     combined.extend(matches);
@@ -45,12 +48,13 @@ pub fn assemble_context_with_provenance(
     combined.retain(|entry| seen_ids.insert(entry.id));
 
     let query_terms = tokenize(query);
+    let query_emb_slice: &[f32] = query_embedding.as_deref().unwrap_or(&[]);
     let now = Utc::now();
 
     let mut ranked: Vec<RankedMemoryContext> = combined
         .into_iter()
         .map(|entry| {
-            let embedding_sim = cosine_similarity_if_available(&entry, &[]);
+            let embedding_sim = cosine_similarity_if_available(&entry, query_emb_slice);
             score_entry(&entry, &query_terms, now, embedding_sim)
         })
         .collect();
@@ -114,7 +118,7 @@ pub fn assemble_context(
     matches: Vec<MemoryEntry>,
     core_entries: Vec<MemoryEntry>,
 ) -> Vec<MemoryEntry> {
-    assemble_context_with_provenance(matches, core_entries, "", 12)
+    assemble_context_with_provenance(matches, core_entries, "", 12, None)
         .into_iter()
         .map(|item| item.entry)
         .collect()
@@ -153,10 +157,21 @@ fn lexical_relevance_score(content: &str, query_terms: &BTreeSet<String>) -> f32
     overlap / query_terms.len() as f32
 }
 
+/// Common English stop words excluded from the lexical term set.
+/// Filtering these prevents high-frequency words from creating false-positive
+/// relevance scores that dilute genuine semantic matches.
+const STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "was", "has", "are", "not", "this", "that",
+    "with", "from", "have", "you", "can", "its", "will", "but", "they",
+    "all", "been", "also", "into", "more", "than", "when", "who", "what",
+    "how", "out", "our", "new", "now",
+];
+
 pub(crate) fn tokenize(text: &str) -> BTreeSet<String> {
     text.split(|ch: char| !ch.is_alphanumeric())
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_lowercase())
+        .filter(|t| !STOP_WORDS.contains(&t.as_str()))
         .collect()
 }
 
@@ -223,6 +238,7 @@ mod tests {
             vec![core.clone()],
             "what is your name",
             2,
+            None,
         );
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(core.id));
@@ -239,7 +255,7 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "some other fact", 1);
 
         let ranked =
-            assemble_context_with_provenance(vec![episodic, profile.clone()], vec![], "", 2);
+            assemble_context_with_provenance(vec![episodic, profile.clone()], vec![], "", 2, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(profile.id));
         Ok(())
@@ -259,6 +275,7 @@ mod tests {
             vec![],
             "create milestone project plan",
             2,
+            None,
         );
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(relevant.id));
@@ -275,9 +292,48 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "user mentioned project X briefly", 1);
 
         let ranked =
-            assemble_context_with_provenance(vec![reflective.clone(), episodic], vec![], "", 2);
+            assemble_context_with_provenance(vec![reflective.clone(), episodic], vec![], "", 2, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(reflective.id));
         Ok(())
+    }
+
+    #[test]
+    fn embedding_similarity_lifts_matching_entry_above_unrelated() -> Result<()> {
+        // Two Semantic entries with the same tier/recency; the one with a
+        // similar embedding to the query should rank first.
+        let mut close = sample_entry(MemoryTier::Semantic, "rust async performance tips", 1);
+        let mut far = sample_entry(MemoryTier::Semantic, "buying groceries at the market", 1);
+
+        // Query vector: [1, 0, 0]
+        // Close entry embedding: [0.9, 0.1, 0]  (high cosine similarity)
+        // Far entry embedding:   [0, 0, 1]       (orthogonal = 0 similarity)
+        close.embedding = Some(vec![0.9_f32, 0.1, 0.0]);
+        far.embedding = Some(vec![0.0_f32, 0.0, 1.0]);
+        let query_embedding = Some(vec![1.0_f32, 0.0, 0.0]);
+
+        let ranked = assemble_context_with_provenance(
+            vec![close.clone(), far],
+            vec![],
+            "rust async",
+            2,
+            query_embedding,
+        );
+
+        assert_eq!(
+            ranked.first().map(|item| item.entry.id),
+            Some(close.id),
+            "expected embedding-similar entry to rank first"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_words_are_excluded_from_tokenize() {
+        let terms = super::tokenize("the project was a success");
+        assert!(!terms.contains("the"), "'the' should be filtered as stop word");
+        assert!(!terms.contains("was"), "'was' should be filtered as stop word");
+        assert!(terms.contains("project"), "'project' should be present");
+        assert!(terms.contains("success"), "'success' should be present");
     }
 }

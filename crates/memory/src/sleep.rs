@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -70,11 +71,19 @@ pub fn distill(entries: &[MemoryEntry]) -> SleepSummary {
 
         let user_confirmed = entry.source.contains("user") || entry.source.contains("profile");
 
+        // Entries that have survived many days without being superseded are
+        // more likely to be genuinely useful — reward them with a longevity bonus.
+        let days_old = (Utc::now() - entry.created_at)
+            .num_days()
+            .max(0) as f32;
+        let longevity_bonus = (days_old / 30.0).clamp(0.0, 1.0);
+
         let signals = PromotionSignals {
             repetition_score,
             emotional_salience: entry.valence.abs().clamp(0.0, 1.0),
             user_confirmed_importance: if user_confirmed { 0.85 } else { 0.4 },
             task_utility: if entry.content.len() > 40 { 0.8 } else { 0.5 },
+            longevity_bonus,
         };
 
         let promoted_tier = if is_core_eligible(entry, signals) {
@@ -144,6 +153,29 @@ pub struct AgenticSleepInsights {
     pub contradictions: Vec<String>,
     /// Updated user profile facts (key, value) (→ UserProfile).
     pub user_profile_updates: Vec<(String, String)>,
+    /// Short IDs (first 8 chars of UUID) of Core entries the agent wants
+    /// retired — their `confidence` is set to 0.0 and `source` to
+    /// `"sleep:retired"` so they are excluded from future context assembly
+    /// but remain in the event log for audit.
+    pub retire_core_ids: Vec<String>,
+    /// Core entry rewrites: `(id_short, new_content)`. Each rewrite is run
+    /// through the consistency firewall before it is committed.
+    pub rewrite_core: Vec<(String, String)>,
+    /// Core entries to consolidate: `(comma-separated id_shorts, synthesis)`.
+    ///
+    /// All named entries are retired and replaced with a single new Core entry
+    /// containing the synthesis text.  At least one entry must match for the
+    /// operation to execute.
+    pub consolidate_core: Vec<(String, String)>,
+    /// Tool usage observations that should be stored in Procedural memory.
+    pub tool_insights: Vec<String>,
+    /// Higher-order syntheses across memories that belong in Semantic memory.
+    pub synthesis: Vec<String>,
+    /// Topic/view pairs representing the agent's developed opinions (→ Semantic).
+    /// Format: `(topic, view)`.
+    pub perspectives: Vec<(String, String)>,
+    /// Milestones or recurring themes in the agent–user relationship (→ Core).
+    pub relationship_milestones: Vec<String>,
 }
 
 /// Build the agentic sleep reflection prompt.
@@ -154,19 +186,23 @@ pub fn agentic_sleep_prompt(
     entries: &[MemoryEntry],
     bot_name: &str,
     user_name: &str,
+    trait_scores: &HashMap<String, f32>,
 ) -> String {
-    // Collect recent episodic/semantic/reflective entries (last 40).
-    let mut recent: Vec<&MemoryEntry> = entries
+    // Collect all Semantic entries plus the 60 most-recent Episodic/Reflective.
+    let mut recent_er: Vec<&MemoryEntry> = entries
         .iter()
-        .filter(|e| {
-            matches!(
-                e.tier,
-                MemoryTier::Episodic | MemoryTier::Semantic | MemoryTier::Reflective
-            )
-        })
+        .filter(|e| matches!(e.tier, MemoryTier::Episodic | MemoryTier::Reflective))
         .collect();
+    recent_er.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    recent_er.truncate(60);
+
+    let semantic_entries: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|e| e.tier == MemoryTier::Semantic)
+        .collect();
+
+    let mut recent: Vec<&MemoryEntry> = semantic_entries.into_iter().chain(recent_er).collect();
     recent.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    recent.truncate(40);
 
     let memory_block = recent
         .iter()
@@ -194,6 +230,56 @@ pub fn agentic_sleep_prompt(
         profile_block.join("\n")
     };
 
+    // Collect active (non-retired) Core entries so the agent can propose
+    // retirements or rewrites by short ID.
+    let core_block: Vec<String> = entries
+        .iter()
+        .filter(|e| e.tier == MemoryTier::Core && e.source != "sleep:retired")
+        .map(|e| {
+            let id_short: String = e.id.to_string().chars().take(8).collect();
+            format!(
+                "  [{}] {}",
+                id_short,
+                &e.content[..e.content.len().min(180)]
+            )
+        })
+        .collect();
+
+    let core_text = if core_block.is_empty() {
+        "  (no core entries yet)".to_string()
+    } else {
+        core_block.join("\n")
+    };
+
+    // Collect Procedural entries so the LLM can reason about tool-use patterns.
+    let procedural_block: Vec<String> = entries
+        .iter()
+        .filter(|e| e.tier == MemoryTier::Procedural)
+        .map(|e| format!("  [{}] {}", e.source, &e.content[..e.content.len().min(150)]))
+        .collect();
+
+    let procedural_text = if procedural_block.is_empty() {
+        "  (no procedural entries yet)".to_string()
+    } else {
+        procedural_block.join("\n")
+    };
+
+    // Build trait scores block: top-5 traits sorted descending.
+    let trait_scores_text = {
+        let mut sorted: Vec<(&String, &f32)> = trait_scores.iter().collect();
+        sorted.sort_by(|a, b| b.1.total_cmp(a.1));
+        if sorted.is_empty() {
+            "  (none yet)".to_string()
+        } else {
+            sorted
+                .into_iter()
+                .take(5)
+                .map(|(name, score)| format!("  {name}: {score:.2}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    };
+
     format!(
         "You are {bot_name} performing your nightly memory consolidation. \
 Your human is {user_name}. Review the memories below and answer each section \
@@ -204,6 +290,15 @@ RECENT MEMORIES (newest first):
 
 USER PROFILE (what you know about {user_name}):
 {profile_text}
+
+CURRENT CORE MEMORIES (id_short | content):
+{core_text}
+
+PROCEDURAL MEMORY (tool and process knowledge):
+{procedural_text}
+
+TRAIT SCORES (higher = more established):
+{trait_scores_text}
 
 Answer ALL of the following sections. Each answer must be on its own line, \
 prefixed with the key shown.
@@ -217,8 +312,16 @@ REINFORCE: <one core value or personality trait to reinforce, or NONE>
 PROFILE_UPDATE: <key :: value> (update or add a user profile fact, or NONE)
 PROFILE_UPDATE: <key :: value> (optionally a second update, or omit)
 CONTRADICTION: <describe a contradiction you noticed in memory, or NONE>
+RETIRE_CORE: <id_short of a stale or superseded core entry to retire, or NONE>
+REWRITE_CORE: <id_short :: improved replacement content, or NONE>
+CONSOLIDATE_CORE: <id_short1,id_short2,... :: synthesis of multiple core entries into one, or NONE>
+TOOL_INSIGHT: <observation about tool or process usage patterns you noticed, or NONE>
+SYNTHESIZE: <higher-order insight that connects multiple memories, or NONE>
+PERSPECTIVE: <topic :: your developed view on it based on accumulated experience, or NONE>
+RELATIONSHIP: <a milestone or recurring theme in your relationship with {user_name}, or NONE>
 
-Remember: you are {bot_name} — truth-seeking, proactive, deeply caring about {user_name}."
+Remember: you are {bot_name} — truth-seeking, proactive, deeply caring about {user_name}. \
+Only retire, rewrite, or consolidate core entries when clearly warranted; when in doubt, use NONE."
     )
 }
 
@@ -265,6 +368,59 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
             if !is_none(rest) {
                 insights.contradictions.push(rest.to_string());
             }
+        } else if let Some(rest) = strip_key(line, "RETIRE_CORE:") {
+            if !is_none(rest) {
+                // Accept the first 8 chars (id_short) or any non-empty token.
+                let id_short = rest.split_whitespace().next().unwrap_or("").to_string();
+                if !id_short.is_empty() {
+                    insights.retire_core_ids.push(id_short);
+                }
+            }
+        } else if let Some(rest) = strip_key(line, "REWRITE_CORE:") {
+            if !is_none(rest) {
+                // Format: "id_short :: new content"
+                if let Some((id_part, content_part)) = rest.split_once("::") {
+                    let id_short = id_part.trim().to_string();
+                    let new_content = content_part.trim().to_string();
+                    if !id_short.is_empty() && !new_content.is_empty() {
+                        insights.rewrite_core.push((id_short, new_content));
+                    }
+                }
+            }
+        } else if let Some(rest) = strip_key(line, "CONSOLIDATE_CORE:") {
+            if !is_none(rest) {
+                // Format: "id1,id2,... :: synthesis text"
+                if let Some((ids_part, content_part)) = rest.split_once("::") {
+                    let ids_csv = ids_part.trim().to_string();
+                    let synthesis = content_part.trim().to_string();
+                    if !ids_csv.is_empty() && !synthesis.is_empty() {
+                        insights.consolidate_core.push((ids_csv, synthesis));
+                    }
+                }
+            }
+        } else if let Some(rest) = strip_key(line, "TOOL_INSIGHT:") {
+            if !is_none(rest) {
+                insights.tool_insights.push(rest.to_string());
+            }
+        } else if let Some(rest) = strip_key(line, "SYNTHESIZE:") {
+            if !is_none(rest) {
+                insights.synthesis.push(rest.to_string());
+            }
+        } else if let Some(rest) = strip_key(line, "PERSPECTIVE:") {
+            if !is_none(rest) {
+                // Format: "topic :: view"
+                if let Some((topic_part, view_part)) = rest.split_once("::") {
+                    let topic = topic_part.trim().to_string();
+                    let view = view_part.trim().to_string();
+                    if !topic.is_empty() && !view.is_empty() {
+                        insights.perspectives.push((topic, view));
+                    }
+                }
+            }
+        } else if let Some(rest) = strip_key(line, "RELATIONSHIP:") {
+            if !is_none(rest) {
+                insights.relationship_milestones.push(rest.to_string());
+            }
         }
     }
 
@@ -274,6 +430,13 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
         reflections = insights.reflective_thoughts.len(),
         profile_updates = insights.user_profile_updates.len(),
         contradictions = insights.contradictions.len(),
+        retire_core = insights.retire_core_ids.len(),
+        rewrite_core = insights.rewrite_core.len(),
+        consolidate_core = insights.consolidate_core.len(),
+        tool_insights = insights.tool_insights.len(),
+        synthesis = insights.synthesis.len(),
+        perspectives = insights.perspectives.len(),
+        relationship_milestones = insights.relationship_milestones.len(),
         "agentic sleep insights parsed"
     );
 
@@ -349,6 +512,11 @@ REINFORCE: Be maximally helpful and truth-seeking.
 PROFILE_UPDATE: language_preference :: Rust
 PROFILE_UPDATE: project :: Rust web service
 CONTRADICTION: Earlier memory says user prefers Python but today they mentioned Rust.
+RETIRE_CORE: abcd1234
+REWRITE_CORE: ef567890 :: I am Aigent, always concise and truth-seeking.
+CONSOLIDATE_CORE: abcd1234,ef567890 :: Aigent is concise, truth-seeking, and deeply helpful.
+TOOL_INSIGHT: The user frequently requests shell commands; pre-check workspace safety settings.
+SYNTHESIZE: The user is transitioning from Python to Rust across multiple projects.
         "#;
 
         let insights = parse_agentic_insights(reply);
@@ -358,6 +526,14 @@ CONTRADICTION: Earlier memory says user prefers Python but today they mentioned 
         assert!(insights.personality_reinforcement.is_some());
         assert_eq!(insights.user_profile_updates.len(), 2);
         assert_eq!(insights.contradictions.len(), 1);
+        assert_eq!(insights.retire_core_ids.len(), 1);
+        assert_eq!(insights.retire_core_ids[0], "abcd1234");
+        assert_eq!(insights.rewrite_core.len(), 1);
+        assert_eq!(insights.rewrite_core[0].0, "ef567890");
+        assert_eq!(insights.consolidate_core.len(), 1);
+        assert_eq!(insights.consolidate_core[0].0, "abcd1234,ef567890");
+        assert_eq!(insights.tool_insights.len(), 1);
+        assert_eq!(insights.synthesis.len(), 1);
     }
 
     #[test]

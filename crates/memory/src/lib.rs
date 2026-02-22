@@ -7,6 +7,7 @@ pub mod profile;
 pub mod retrieval;
 pub mod schema;
 pub mod scorer;
+pub mod sentiment;
 pub mod sleep;
 pub mod store;
 pub mod vault;

@@ -1,6 +1,7 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, instrument, warn};
+use uuid::Uuid;
 
 use aigent_config::AppConfig;
 use aigent_llm::{LlmRouter, Provider};
@@ -63,7 +64,7 @@ impl AgentRuntime {
         recent_turns: &[ConversationTurn],
     ) -> Result<String> {
         let (tx, _rx) = mpsc::channel(100);
-        self.respond_and_remember_stream(memory, user_message, recent_turns, tx)
+        self.respond_and_remember_stream(memory, user_message, recent_turns, None, tx)
             .await
     }
 
@@ -73,6 +74,7 @@ impl AgentRuntime {
         memory: &mut MemoryManager,
         user_message: &str,
         recent_turns: &[ConversationTurn],
+        last_turn_at: Option<DateTime<Utc>>,
         tx: mpsc::Sender<String>,
     ) -> Result<String> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
@@ -83,6 +85,44 @@ impl AgentRuntime {
 
         // Persist the user turn immediately so it survives a restart.
         memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input")?;
+
+        // Improvement 1: extract structured profile signals from the user message
+        // immediately, without waiting for the nightly sleep cycle.
+        let profile_signals = crate::micro_profile::extract_inline_profile_signals(user_message);
+        for (key, value, category) in &profile_signals {
+            if let Err(err) = memory.record_user_profile_keyed(key, value, category) {
+                warn!(?err, key, "micro-profile signal failed");
+            }
+        }
+        if !profile_signals.is_empty() {
+            debug!(count = profile_signals.len(), "micro-profile signals extracted");
+        }
+
+        // Collect pending follow-ups on the first turn of a new conversation,
+        // or when the user is returning after a significant absence (≥4h).
+        let is_returning_after_absence = last_turn_at
+            .map(|t| (Utc::now() - t).num_hours() >= 4)
+            .unwrap_or(false);
+        let pending_follow_ups: Vec<(Uuid, String)> =
+            if recent_turns.is_empty() || is_returning_after_absence {
+                memory.pending_follow_up_ids()
+            } else {
+                Vec::new()
+            };
+
+        let follow_up_block = if pending_follow_ups.is_empty() {
+            String::new()
+        } else {
+            let items = pending_follow_ups
+                .iter()
+                .map(|(_, text)| format!("- {text}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\nPENDING FOLLOW-UPS (things you wanted to raise with {user_name}):\n{items}\n[If appropriate, acknowledge these naturally at the start of your response.]",
+                user_name = memory.user_name_from_core().unwrap_or_else(|| "the user".to_string()),
+            )
+        };
         let stats = memory.stats();
         debug!(
             core = stats.core,
@@ -163,10 +203,11 @@ impl AgentRuntime {
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
              continuity, and MEMORY CONTEXT for durable background facts.\n\
              Never repeat previous answers unless asked.\n\
-             Respond directly and specifically to the LATEST user message.{profile_block}\n\n\
+             Respond directly and specifically to the LATEST user message.{profile_block}{follow_ups}\n\n\
              ENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
             name = self.config.agent.name,
             profile_block = user_profile_block,
+            follow_ups = follow_up_block,
             env = environment_block,
             conv = conversation_block,
             mem = context_block,
@@ -189,6 +230,16 @@ impl AgentRuntime {
             format!("assistant-reply:model={}", self.config.active_model()),
         ) {
             warn!(?err, "failed to persist assistant reply to episodic memory");
+        }
+
+        // Consume any follow-ups that were injected into this turn's prompt.
+        if !pending_follow_ups.is_empty() {
+            let ids: Vec<Uuid> = pending_follow_ups.iter().map(|(id, _)| *id).collect();
+            if let Err(err) = memory.consume_follow_ups(&ids) {
+                warn!(?err, "failed to consume delivered follow-up entries");
+            } else {
+                debug!(count = ids.len(), "follow-up entries consumed after delivery");
+            }
         }
 
         Ok(reply)
@@ -251,7 +302,7 @@ impl AgentRuntime {
         });
 
         match self
-            .respond_and_remember_stream(&mut memory, &turn.user, &[], chunk_tx)
+            .respond_and_remember_stream(&mut memory, &turn.user, &[], None, chunk_tx)
             .await
         {
             Ok(_) => {

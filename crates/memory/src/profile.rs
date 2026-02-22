@@ -1,8 +1,10 @@
-/// UserProfile memory helpers.
-///
-/// UserProfile entries are stored with sources like `user-profile:preference`,
-/// `user-profile:goal`, `user-profile:fact`, etc.  These functions help build
-/// a human-readable user profile block for use in LLM prompts.
+//! UserProfile memory helpers.
+//!
+//! UserProfile entries are stored with sources like `user-profile:preference`,
+//! `user-profile:goal`, `user-profile:fact`, etc.  These functions help build
+//! a human-readable user profile block for use in LLM prompts.
+
+use std::collections::HashMap;
 
 use crate::schema::{MemoryEntry, MemoryTier};
 
@@ -26,20 +28,44 @@ pub fn user_profile_entries(entries: &[MemoryEntry]) -> Vec<&MemoryEntry> {
 /// Format a compact user-profile block for inclusion in LLM prompts.
 ///
 /// Returns `None` if no profile entries exist.
+///
+/// Deduplicates by key (the content segment before the first `:`), keeping
+/// only the most-recently updated entry for each key so that stale or
+/// contradictory entries from older profile updates don't appear alongside
+/// newer ones.
 pub fn format_user_profile_block(entries: &[MemoryEntry]) -> Option<String> {
-    let profile = user_profile_entries(entries);
-    if profile.is_empty() {
+    let all_profile = user_profile_entries(entries);
+    if all_profile.is_empty() {
         return None;
     }
 
-    // Group by source category.
+    // Deduplicate by key: for each leading "key:" prefix, keep the latest entry.
+    let mut by_key: HashMap<String, &MemoryEntry> = HashMap::new();
+    for entry in &all_profile {
+        let key = entry
+            .content
+            .split(':')
+            .next()
+            .map(|k| k.trim().to_lowercase())
+            .unwrap_or_default();
+        by_key
+            .entry(key)
+            .and_modify(|existing| {
+                if entry.created_at > existing.created_at {
+                    *existing = entry;
+                }
+            })
+            .or_insert(entry);
+    }
+
+    // Group deduplicated entries by source category.
     let mut preferences = Vec::new();
     let mut goals = Vec::new();
     let mut facts = Vec::new();
     let mut style = Vec::new();
     let mut other = Vec::new();
 
-    for entry in profile {
+    for entry in by_key.values() {
         let s = entry.source.as_str();
         if s.contains("preference") {
             preferences.push(entry.content.as_str());

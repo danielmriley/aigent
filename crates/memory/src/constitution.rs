@@ -1,8 +1,8 @@
-/// Aigent's immutable AI constitution.
-///
-/// The constitution is seeded into [`crate::schema::MemoryTier::Core`] at
-/// onboarding and re-reinforced during every agentic sleep cycle.  It defines
-/// Aigent's non-negotiable personality, values, and relationship model.
+//! Aigent's immutable AI constitution.
+//!
+//! The constitution is seeded into [`crate::schema::MemoryTier::Core`] at
+//! onboarding and re-reinforced during every agentic sleep cycle.  It defines
+//! Aigent's non-negotiable personality, values, and relationship model.
 
 pub const CONSTITUTION_VERSION: &str = "1.0";
 

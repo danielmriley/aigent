@@ -44,20 +44,54 @@ impl MemoryEventLog {
         Ok(())
     }
 
+    /// Atomically replace the event log with a new set of events.
+    ///
+    /// Crash-safety guarantee: the new content is written to a `.tmp` sibling
+    /// file, `fsync`'d, then renamed over the original.  A crash at any point
+    /// before the rename leaves the original file untouched.  A crash after
+    /// the rename leaves a consistent new file.  The `.tmp` file is cleaned up
+    /// on any error path.
     pub fn overwrite(&self, events: &[MemoryRecordEvent]) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
+        // Derive `.tmp` path by appending `.tmp` to the full filename.
+        let tmp_path = {
+            let filename = self
+                .path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "events.jsonl".to_string());
+            self.path.with_file_name(format!("{filename}.tmp"))
+        };
 
-        for event in events {
-            let line = serde_json::to_string(event)?;
-            writeln!(file, "{line}")?;
+        // Write to the temp file first.
+        let write_result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            for event in events {
+                let line = serde_json::to_string(event)?;
+                writeln!(file, "{line}")?;
+            }
+            // Flush userspace buffers and sync to disk before rename.
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
+        // Atomic rename: if this returns Ok the new file is fully consistent.
+        if let Err(err) = fs::rename(&tmp_path, &self.path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
         }
 
         Ok(())

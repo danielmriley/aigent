@@ -1,6 +1,7 @@
 mod client;
 mod commands;
 mod events;
+pub mod micro_profile;
 mod runtime;
 mod server;
 
