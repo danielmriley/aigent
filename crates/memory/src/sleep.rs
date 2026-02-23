@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
+use uuid::Uuid;
 
 use crate::schema::{MemoryEntry, MemoryTier};
 use crate::scorer::{PromotionSignals, is_core_eligible};
@@ -86,9 +87,19 @@ pub fn distill(entries: &[MemoryEntry]) -> SleepSummary {
             longevity_bonus,
         };
 
+        // Require at least one meaningful signal beyond bare confidence so
+        // low-salience, one-off Episodic entries don't inflate Semantic.
+        // `repetition_score > 0.34` requires two or more occurrences (1/3 ≈ 0.333
+        // for a single entry, 2/3 ≈ 0.667 for two).
+        // `user_confirmed_importance >= 0.85` accepts user-sourced entries directly.
         let promoted_tier = if is_core_eligible(entry, signals) {
             MemoryTier::Core
-        } else if entry.confidence >= 0.65 {
+        } else if entry.confidence >= 0.65
+            && (signals.repetition_score > 0.34
+                || signals.emotional_salience > 0.3
+                || signals.longevity_bonus > 0.3
+                || signals.user_confirmed_importance >= 0.85)
+        {
             MemoryTier::Semantic
         } else {
             continue;
@@ -136,7 +147,38 @@ pub fn distill(entries: &[MemoryEntry]) -> SleepSummary {
     }
 }
 
+/// Return the UUIDs of Semantic entries that have grown stale and should be
+/// pruned during an agentic sleep cycle.
+///
+/// Criteria: older than `max_age_days`, `confidence < 0.5`, and not sourced
+/// from a user-confirmed or synthesis entry (those are treated as more reliable).
+///
+/// This models natural forgetting — weakly-held facts that nobody has referenced
+/// in months are dropped to keep the context window relevant and bounded.
+pub fn decay_stale_semantic(entries: &[MemoryEntry], max_age_days: i64) -> Vec<Uuid> {
+    let now = Utc::now();
+    entries
+        .iter()
+        .filter(|e| {
+            e.tier == MemoryTier::Semantic
+                && e.confidence < 0.5
+                && !e.source.contains("user")
+                && !e.source.starts_with("agentic-sleep:synthesis")
+                && (now - e.created_at).num_days() > max_age_days
+        })
+        .map(|e| e.id)
+        .collect()
+}
+
 // ── Agentic sleep ─────────────────────────────────────────────────────────────
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values.
+fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
 
 /// Structured output from the LLM's nightly reflection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -176,6 +218,13 @@ pub struct AgenticSleepInsights {
     pub perspectives: Vec<(String, String)>,
     /// Milestones or recurring themes in the agent–user relationship (→ Core).
     pub relationship_milestones: Vec<String>,
+    /// Agent-proposed refinement of its own communication style (→ IdentityKernel).
+    pub communication_style_update: Option<String>,
+    /// New long-term goals to add to the identity kernel (→ IdentityKernel).
+    pub long_goal_additions: Vec<String>,
+    /// LLM-corrected valence scores for important memories.
+    /// Format: `(id_short, valence ∈ [-1.0, 1.0])`.
+    pub valence_corrections: Vec<(String, f32)>,
 }
 
 /// Build the agentic sleep reflection prompt.
@@ -207,11 +256,18 @@ pub fn agentic_sleep_prompt(
     let memory_block = recent
         .iter()
         .map(|e| {
+            // Give Reflective and Semantic entries more room — they contain
+            // richer context the LLM needs during consolidation.
+            let max_len = match e.tier {
+                MemoryTier::Reflective | MemoryTier::Semantic => 400,
+                MemoryTier::Procedural => 300,
+                _ => 200,
+            };
             format!(
                 "  [{:?}] {} :: {}",
                 e.tier,
                 e.created_at.format("%Y-%m-%d %H:%M"),
-                &e.content[..e.content.len().min(200)]
+                truncate_str(&e.content, max_len)
             )
         })
         .collect::<Vec<_>>()
@@ -221,7 +277,7 @@ pub fn agentic_sleep_prompt(
     let profile_block: Vec<String> = entries
         .iter()
         .filter(|e| e.tier == MemoryTier::UserProfile)
-        .map(|e| format!("  [{}] {}", e.source, &e.content[..e.content.len().min(150)]))
+        .map(|e| format!("  [{}] {}", e.source, truncate_str(&e.content, 150)))
         .collect();
 
     let profile_text = if profile_block.is_empty() {
@@ -240,7 +296,7 @@ pub fn agentic_sleep_prompt(
             format!(
                 "  [{}] {}",
                 id_short,
-                &e.content[..e.content.len().min(180)]
+                truncate_str(&e.content, 300)
             )
         })
         .collect();
@@ -255,7 +311,7 @@ pub fn agentic_sleep_prompt(
     let procedural_block: Vec<String> = entries
         .iter()
         .filter(|e| e.tier == MemoryTier::Procedural)
-        .map(|e| format!("  [{}] {}", e.source, &e.content[..e.content.len().min(150)]))
+        .map(|e| format!("  [{}] {}", e.source, truncate_str(&e.content, 300)))
         .collect();
 
     let procedural_text = if procedural_block.is_empty() {
@@ -319,6 +375,9 @@ TOOL_INSIGHT: <observation about tool or process usage patterns you noticed, or 
 SYNTHESIZE: <higher-order insight that connects multiple memories, or NONE>
 PERSPECTIVE: <topic :: your developed view on it based on accumulated experience, or NONE>
 RELATIONSHIP: <a milestone or recurring theme in your relationship with {user_name}, or NONE>
+STYLE_UPDATE: <one sentence refining your communication style based on recent interaction patterns, or NONE>
+GOAL_ADD: <one new long-term goal to pursue based on patterns you noticed today, or NONE>
+VALENCE: <id_short :: score> (correct the emotional tone of one important memory to a value in [-1.0, 1.0]; use sparingly — only when the emotional significance was clearly wrong or missed, or NONE)
 
 Remember: you are {bot_name} — truth-seeking, proactive, deeply caring about {user_name}. \
 Only retire, rewrite, or consolidate core entries when clearly warranted; when in doubt, use NONE."
@@ -421,6 +480,26 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
             if !is_none(rest) {
                 insights.relationship_milestones.push(rest.to_string());
             }
+        } else if let Some(rest) = strip_key(line, "STYLE_UPDATE:") {
+            if !is_none(rest) && insights.communication_style_update.is_none() {
+                insights.communication_style_update = Some(rest.to_string());
+            }
+        } else if let Some(rest) = strip_key(line, "GOAL_ADD:") {
+            if !is_none(rest) {
+                insights.long_goal_additions.push(rest.to_string());
+            }
+        } else if let Some(rest) = strip_key(line, "VALENCE:") {
+            if !is_none(rest) {
+                // Format: "id_short :: score"
+                if let Some((id_part, score_part)) = rest.split_once("::") {
+                    let id_short = id_part.trim().to_string();
+                    if let Ok(score) = score_part.trim().parse::<f32>() {
+                        if (-1.0..=1.0).contains(&score) && !id_short.is_empty() {
+                            insights.valence_corrections.push((id_short, score));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -437,6 +516,9 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
         synthesis = insights.synthesis.len(),
         perspectives = insights.perspectives.len(),
         relationship_milestones = insights.relationship_milestones.len(),
+        style_update = insights.communication_style_update.is_some(),
+        goal_additions = insights.long_goal_additions.len(),
+        valence_corrections = insights.valence_corrections.len(),
         "agentic sleep insights parsed"
     );
 
@@ -517,6 +599,9 @@ REWRITE_CORE: ef567890 :: I am Aigent, always concise and truth-seeking.
 CONSOLIDATE_CORE: abcd1234,ef567890 :: Aigent is concise, truth-seeking, and deeply helpful.
 TOOL_INSIGHT: The user frequently requests shell commands; pre-check workspace safety settings.
 SYNTHESIZE: The user is transitioning from Python to Rust across multiple projects.
+STYLE_UPDATE: Direct and technically precise, with warmth.
+GOAL_ADD: Help the user grow as a Rust systems programmer.
+VALENCE: abcd1234 :: 0.8
         "#;
 
         let insights = parse_agentic_insights(reply);
@@ -534,14 +619,97 @@ SYNTHESIZE: The user is transitioning from Python to Rust across multiple projec
         assert_eq!(insights.consolidate_core[0].0, "abcd1234,ef567890");
         assert_eq!(insights.tool_insights.len(), 1);
         assert_eq!(insights.synthesis.len(), 1);
+        // New fields
+        assert_eq!(
+            insights.communication_style_update.as_deref(),
+            Some("Direct and technically precise, with warmth.")
+        );
+        assert_eq!(insights.long_goal_additions.len(), 1);
+        assert_eq!(insights.valence_corrections.len(), 1);
+        assert_eq!(insights.valence_corrections[0].0, "abcd1234");
+        assert!((insights.valence_corrections[0].1 - 0.8).abs() < 0.001);
     }
 
     #[test]
     fn parse_agentic_insights_handles_none_entries() {
-        let reply = "LEARNED: NONE\nFOLLOW_UP: none\nREFLECT: NONE\nREINFORCE: NONE\n";
+        let reply = "LEARNED: NONE\nFOLLOW_UP: none\nREFLECT: NONE\nREINFORCE: NONE\nSTYLE_UPDATE: NONE\nGOAL_ADD: NONE\nVALENCE: NONE\n";
         let insights = parse_agentic_insights(reply);
         assert!(insights.learned_about_user.is_empty());
         assert!(insights.follow_ups.is_empty());
         assert!(insights.personality_reinforcement.is_none());
+        assert!(insights.communication_style_update.is_none());
+        assert!(insights.long_goal_additions.is_empty());
+        assert!(insights.valence_corrections.is_empty());
+    }
+
+    #[test]
+    fn valence_correction_rejects_out_of_range_scores() {
+        let reply = "VALENCE: abcd1234 :: 2.5\nVALENCE: ef567890 :: -1.5\nVALENCE: 12345678 :: 0.5\n";
+        let insights = parse_agentic_insights(reply);
+        // Only the in-range score [0.5] should be accepted.
+        assert_eq!(insights.valence_corrections.len(), 1);
+        assert_eq!(insights.valence_corrections[0].0, "12345678");
+    }
+
+    #[test]
+    fn distill_gate_requires_signal_beyond_confidence() {
+        // Entry with high confidence but zero signals should NOT be promoted.
+        let no_signal = entry(
+            MemoryTier::Episodic,
+            "mundane note with zero emotional or repetition signal",
+            "assistant-reply",
+            0.80,
+        );
+        // Override valence to 0.0 so emotional_salience = 0.
+        let mut no_signal = no_signal;
+        no_signal.valence = 0.0;
+        let summary = distill(&[no_signal]);
+        assert!(
+            summary.promotions.is_empty(),
+            "entry with no signal beyond confidence should not be promoted"
+        );
+
+        // User-sourced entry (source contains "user") — user_confirmed_importance
+        // rises to 0.85, which satisfies the gate even without repetition.
+        let with_signal = entry(MemoryTier::Episodic, "I am so frustrated, everything failed", "user-chat", 0.80);
+        let summary = distill(&[with_signal]);
+        assert!(
+            !summary.promotions.is_empty(),
+            "user-confirmed entry should be promoted even without repetition"
+        );
+    }
+
+    #[test]
+    fn decay_stale_semantic_returns_old_low_confidence_entries() {
+        use chrono::Duration;
+
+        let old_date = Utc::now() - Duration::days(100);
+
+        let make_semantic = |conf: f32| MemoryEntry {
+            id: uuid::Uuid::new_v4(),
+            tier: MemoryTier::Semantic,
+            content: "some old semantic fact".to_string(),
+            source: "sleep:cycle".to_string(),
+            confidence: conf,
+            valence: 0.0,
+            tags: Vec::new(),
+            embedding: None,
+            created_at: old_date,
+            provenance_hash: "test".to_string(),
+        };
+
+        let stale_a = make_semantic(0.3);
+        let stale_b = make_semantic(0.4);
+        let stale_c = make_semantic(0.2);
+        let durable = make_semantic(0.7); // high confidence — should NOT decay
+
+        let entries = vec![stale_a.clone(), stale_b.clone(), stale_c.clone(), durable.clone()];
+        let decayed = super::decay_stale_semantic(&entries, 90);
+
+        assert_eq!(decayed.len(), 3, "expected 3 stale entries, got {}", decayed.len());
+        assert!(!decayed.contains(&durable.id), "high-confidence entry must not decay");
+        assert!(decayed.contains(&stale_a.id));
+        assert!(decayed.contains(&stale_b.id));
+        assert!(decayed.contains(&stale_c.id));
     }
 }

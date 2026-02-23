@@ -377,13 +377,11 @@ fn daemon_start(force: bool) -> Result<()> {
     fs::create_dir_all(&paths.runtime_dir)?;
     let socket_path = PathBuf::from(&config.daemon.socket_path);
 
-    if is_socket_live(&socket_path) {
-        if !force {
-            bail!(
-                "daemon already running on socket {}; use `aigent daemon restart`",
-                socket_path.display()
-            );
-        }
+    if is_socket_live(&socket_path) && !force {
+        bail!(
+            "daemon already running on socket {}; use `aigent daemon restart`",
+            socket_path.display()
+        );
     }
 
     if let Some(pid) = read_pid(&paths.pid_file)? {

@@ -34,6 +34,9 @@ pub enum ClientCommand {
     Subscribe,
     /// Manually trigger an agentic sleep cycle for memory consolidation.
     RunSleepCycle,
+    /// Manually trigger the full nightly multi-agent sleep cycle.
+    /// Falls back to single-agent if the LLM is unavailable.
+    RunMultiAgentSleepCycle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

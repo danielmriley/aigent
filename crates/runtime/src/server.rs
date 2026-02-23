@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -34,6 +34,8 @@ struct DaemonState {
     last_turn_at: Option<DateTime<Utc>>,
     /// Broadcast sender — fans out external-source BackendEvents to all subscribers.
     event_tx: broadcast::Sender<BackendEvent>,
+    /// Instant of the last successful multi-agent sleep cycle run.
+    last_multi_agent_sleep_at: Option<std::time::Instant>,
 }
 
 impl DaemonState {
@@ -69,10 +71,10 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
 /// Build a synchronous embedding function that calls the Ollama `/api/embeddings`
 /// endpoint.  Falls back to `None` silently so the system continues to work
 /// when Ollama is unavailable.
-fn make_ollama_embed_fn(model: &str) -> EmbedFn {
+fn make_ollama_embed_fn(model: &str, base_url: &str) -> EmbedFn {
     let model = model.to_string();
-    let base_url = std::env::var("OLLAMA_BASE_URL")
-        .unwrap_or_else(|_| "http://localhost:11434".to_string());
+    // Allow the environment variable to override the config value at runtime.
+    let base_url = std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| base_url.to_string());
     let url = format!("{}/api/embeddings", base_url.trim_end_matches('/'));
 
     Arc::new(move |text: &str| {
@@ -108,7 +110,8 @@ pub async fn run_unified_daemon(
     // embedded and retrieval uses hybrid lexical+vector scoring.
     {
         let embed_model = config.llm.ollama_model.clone();
-        memory.set_embed_fn(make_ollama_embed_fn(&embed_model));
+        let embed_base_url = config.llm.ollama_base_url.clone();
+        memory.set_embed_fn(make_ollama_embed_fn(&embed_model, &embed_base_url));
         info!(model = %embed_model, "embedding backend configured");
     }
 
@@ -138,10 +141,30 @@ pub async fn run_unified_daemon(
     let tool_registry = aigent_exec::default_registry(workspace_root);
     let tool_executor = ToolExecutor::new(policy);
 
+    // Extract sleep scheduling config before `config` is moved into the runtime.
+    let sleep_quiet_start = config.memory.night_sleep_start_hour as u32;
+    let sleep_quiet_end = config.memory.night_sleep_end_hour as u32;
+    let sleep_interval_hours: u64 = std::env::var("AIGENT_SLEEP_INTERVAL_HOURS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+
     let runtime = AgentRuntime::new(config);
     runtime.run().await?;
 
     let (event_tx, _) = broadcast::channel::<BackendEvent>(BROADCAST_CAP);
+
+    // Recover the last multi-agent sleep timestamp from persisted memory so
+    // the 22-hour rate-limit survives daemon restarts.
+    let last_multi_agent_sleep_at = memory
+        .all()
+        .iter()
+        .filter(|e| e.source == "sleep:multi-agent-cycle")
+        .max_by_key(|e| e.created_at)
+        .and_then(|e| {
+            let age = (Utc::now() - e.created_at).to_std().ok()?;
+            Instant::now().checked_sub(age)
+        });
 
     let state = Arc::new(Mutex::new(DaemonState {
         runtime,
@@ -153,6 +176,7 @@ pub async fn run_unified_daemon(
         started_at: Instant::now(),
         last_turn_at: None,
         event_tx,
+        last_multi_agent_sleep_at,
     }));
 
     let listener = UnixListener::bind(&socket_path)?;
@@ -188,43 +212,130 @@ pub async fn run_unified_daemon(
         });
     }
 
-    // Background agentic sleep: consolidates memory and evolves personality
-    // every N hours (default 8) without requiring an explicit CLI command.
-    // Offset by half the interval so it doesn't co-fire with compaction.
+    // Task A — Frequent passive distillation (every 8h, no quiet window required).
+    // Runs memory.run_sleep_cycle() (heuristic only, no LLM) so it is safe to run
+    // at any time. Skip only if a conversation happened in the last 5 minutes.
     {
         let sleep_state = state.clone();
         let mut sleep_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            let hours = std::env::var("AIGENT_SLEEP_INTERVAL_HOURS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(8);
-            let interval = std::time::Duration::from_secs(hours * 60 * 60);
-            // Initial offset: half the interval.
-            tokio::select! {
-                _ = tokio::time::sleep(interval / 2) => {}
-                changed = sleep_rx.changed() => {
-                    if changed.is_ok() && *sleep_rx.borrow() { return; }
-                }
-            }
+            let passive_interval = std::time::Duration::from_secs(sleep_interval_hours * 60 * 60);
+            let poll_interval = std::time::Duration::from_secs(5 * 60);
+            let mut last_passive_at = std::time::Instant::now()
+                .checked_sub(passive_interval / 2)
+                .unwrap_or_else(std::time::Instant::now);
+
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(interval) => {
-                        let mut s = sleep_state.lock().await;
-                        let mut memory = std::mem::take(&mut s.memory);
-                        match s.runtime.run_agentic_sleep_cycle(&mut memory).await {
-                            Ok(ref summary) if !summary.distilled.is_empty() => {
-                                info!(summary = %summary.distilled, "background sleep cycle complete");
-                            }
-                            Ok(_) => {}
-                            Err(ref err) => warn!(?err, "background sleep cycle failed"),
-                        }
-                        s.memory = memory;
-                    }
+                    _ = tokio::time::sleep(poll_interval) => {}
                     changed = sleep_rx.changed() => {
                         if changed.is_ok() && *sleep_rx.borrow() { break; }
+                        continue;
                     }
                 }
+
+                if last_passive_at.elapsed() < passive_interval {
+                    continue;
+                }
+
+                // Skip if conversation is actively ongoing.
+                let recently_active = {
+                    let s = sleep_state.lock().await;
+                    s.last_turn_at
+                        .map(|t| (Utc::now() - t).num_minutes() < 5)
+                        .unwrap_or(false)
+                };
+                if recently_active {
+                    continue;
+                }
+
+                last_passive_at = std::time::Instant::now();
+                let mut s = sleep_state.lock().await;
+                let mut memory = std::mem::take(&mut s.memory);
+                match memory.run_sleep_cycle() {
+                    Ok(ref summary) if !summary.promoted_ids.is_empty() => {
+                        info!(
+                            promoted = summary.promoted_ids.len(),
+                            "background passive distillation complete"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(ref err) => warn!(?err, "background passive distillation failed"),
+                }
+                s.memory = memory;
+            }
+        });
+    }
+
+    // Task B — Nightly multi-agent consolidation (once per night, in quiet window).
+    // Runs runtime.run_multi_agent_sleep_cycle() which calls 4 LLM specialists
+    // plus a synthesis agent. Gated by:
+    //   1. Must be within the quiet window (night_sleep_start_hour..night_sleep_end_hour)
+    //   2. At least 22 hours since the last multi-agent cycle
+    //   3. No conversation in the last 15 minutes
+    {
+        let sleep_state = state.clone();
+        let mut sleep_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let min_gap = std::time::Duration::from_secs(22 * 60 * 60);
+            let poll_interval = std::time::Duration::from_secs(5 * 60);
+
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(poll_interval) => {}
+                    changed = sleep_rx.changed() => {
+                        if changed.is_ok() && *sleep_rx.borrow() { break; }
+                        continue;
+                    }
+                }
+
+                // Time-of-day guard: only consolidate in the quiet window.
+                let hour = Utc::now().hour();
+                let in_quiet_window = if sleep_quiet_start <= sleep_quiet_end {
+                    hour >= sleep_quiet_start && hour < sleep_quiet_end
+                } else {
+                    hour >= sleep_quiet_start || hour < sleep_quiet_end
+                };
+                if !in_quiet_window {
+                    continue;
+                }
+
+                // Rate-limit: at least 22h since last multi-agent cycle.
+                let already_ran = {
+                    let s = sleep_state.lock().await;
+                    s.last_multi_agent_sleep_at
+                        .map(|t| t.elapsed() < min_gap)
+                        .unwrap_or(false)
+                };
+                if already_ran {
+                    continue;
+                }
+
+                // Conversation recency guard.
+                let recently_active = {
+                    let s = sleep_state.lock().await;
+                    s.last_turn_at
+                        .map(|t| (Utc::now() - t).num_minutes() < 15)
+                        .unwrap_or(false)
+                };
+                if recently_active {
+                    continue;
+                }
+
+                // All guards passed — run the nightly multi-agent cycle.
+                let mut s = sleep_state.lock().await;
+                let mut memory = std::mem::take(&mut s.memory);
+                match s.runtime.run_multi_agent_sleep_cycle(&mut memory).await {
+                    Ok(ref summary) if !summary.distilled.is_empty() => {
+                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                        info!(summary = %summary.distilled, "background multi-agent sleep cycle complete");
+                    }
+                    Ok(_) => {
+                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                    }
+                    Err(ref err) => warn!(?err, "background multi-agent sleep cycle failed"),
+                }
+                s.memory = memory;
             }
         });
     }
@@ -518,6 +629,18 @@ async fn handle_connection(
             let msg = match result {
                 Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
                 Err(err) => format!("sleep cycle failed: {err}"),
+            };
+            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+        }
+        ClientCommand::RunMultiAgentSleepCycle => {
+            let mut state = state.lock().await;
+            let mut memory = std::mem::take(&mut state.memory);
+            let result = state.runtime.run_multi_agent_sleep_cycle(&mut memory).await;
+            state.memory = memory;
+            let _ = state.memory.flush_all();
+            let msg = match result {
+                Ok(summary) => format!("multi-agent sleep cycle complete: {}", summary.distilled),
+                Err(err) => format!("multi-agent sleep cycle failed: {err}"),
             };
             send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
         }

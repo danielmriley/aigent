@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+use uuid::Uuid;
+
 use crate::schema::MemoryEntry;
 
 #[derive(Debug, Default)]
@@ -49,5 +51,34 @@ impl MemoryStore {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Remove a single entry by its full UUID.
+    ///
+    /// Returns `true` if the entry was found and removed, `false` otherwise.
+    pub fn remove(&mut self, id: Uuid) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.id != id);
+        if self.entries.len() < before {
+            self.seen_ids.remove(&id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update the `valence` field of the first entry whose UUID string starts
+    /// with `id_short` (the first N chars used as a short identifier).
+    ///
+    /// The value is clamped to `[-1.0, 1.0]`.  Returns `true` if an entry
+    /// was found and updated.
+    pub fn update_valence_by_id_short(&mut self, id_short: &str, valence: f32) -> bool {
+        for entry in &mut self.entries {
+            if entry.id.to_string().starts_with(id_short) {
+                entry.valence = valence.clamp(-1.0, 1.0);
+                return true;
+            }
+        }
+        false
     }
 }

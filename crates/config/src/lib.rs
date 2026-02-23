@@ -32,6 +32,9 @@ pub struct LlmConfig {
     pub ollama_model: String,
     pub openrouter_model: String,
     pub ollama_local_first: bool,
+    /// Base URL for the Ollama API.  Overridden at runtime by the
+    /// `OLLAMA_BASE_URL` environment variable when set.
+    pub ollama_base_url: String,
 }
 
 impl Default for LlmConfig {
@@ -41,6 +44,7 @@ impl Default for LlmConfig {
             ollama_model: "llama3.1:8b".to_string(),
             openrouter_model: "openai/gpt-4o-mini".to_string(),
             ollama_local_first: true,
+            ollama_base_url: "http://localhost:11434".to_string(),
         }
     }
 }
@@ -55,6 +59,9 @@ pub struct MemoryConfig {
     pub night_sleep_start_hour: u8,
     pub night_sleep_end_hour: u8,
     pub core_rewrite_requires_approval: bool,
+    /// Number of non-anchor entries per multi-agent sleep batch.
+    /// Core and UserProfile entries are always replicated into every batch.
+    pub multi_agent_sleep_batch_size: usize,
 }
 
 impl Default for MemoryConfig {
@@ -67,6 +74,7 @@ impl Default for MemoryConfig {
             night_sleep_start_hour: 22,
             night_sleep_end_hour: 6,
             core_rewrite_requires_approval: true,
+            multi_agent_sleep_batch_size: 60,
         }
     }
 }

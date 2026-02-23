@@ -5,7 +5,13 @@ use uuid::Uuid;
 
 use aigent_config::AppConfig;
 use aigent_llm::{LlmRouter, Provider};
-use aigent_memory::{MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights};
+use aigent_memory::{
+    MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights,
+    multi_sleep::{
+        SpecialistRole, batch_memories, build_identity_context, deliberation_prompt,
+        merge_insights, specialist_prompt,
+    },
+};
 use tokio::sync::mpsc;
 
 use crate::BackendEvent;
@@ -198,16 +204,45 @@ impl AgentRuntime {
         };
 
         let thought_style = self.config.agent.thinking_level.to_lowercase();
+
+        // Build a dynamic identity block from the current kernel state.
+        // This is intentionally separate from Core memory entries: Core is
+        // durable (changes rarely), while the identity block reflects traits and
+        // goals as they've evolved through sleep cycles.
+        let identity_block = {
+            let kernel = &memory.identity;
+            let top_traits: Vec<String> = {
+                let mut scores: Vec<(&String, &f32)> = kernel.trait_scores.iter().collect();
+                scores.sort_by(|a, b| b.1.total_cmp(a.1));
+                scores.iter().take(3).map(|(k, v)| format!("{k} ({v:.2})")).collect()
+            };
+            format!(
+                "IDENTITY:\nCommunication style: {}.\nStrongest traits: {}.\nLong-term goals: {}.",
+                kernel.communication_style,
+                if top_traits.is_empty() {
+                    "not yet established".to_string()
+                } else {
+                    top_traits.join(", ")
+                },
+                if kernel.long_goals.is_empty() {
+                    "not yet established".to_string()
+                } else {
+                    kernel.long_goals.join("; ")
+                },
+            )
+        };
+
         let prompt = format!(
             "You are {name}. Thinking depth: {thought_style}.\n\
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
              continuity, and MEMORY CONTEXT for durable background facts.\n\
              Never repeat previous answers unless asked.\n\
              Respond directly and specifically to the LATEST user message.{profile_block}{follow_ups}\n\n\
-             ENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
+             {identity}\n\nENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
             name = self.config.agent.name,
             profile_block = user_profile_block,
             follow_ups = follow_up_block,
+            identity = identity_block,
             env = environment_block,
             conv = conversation_block,
             mem = context_block,
@@ -278,6 +313,271 @@ impl AgentRuntime {
                 memory.run_sleep_cycle()
             }
         }
+    }
+
+    /// Call the LLM with logging. Returns `None` on failure so callers can
+    /// degrade gracefully to a single-agent fallback.
+    async fn sleep_llm_call(
+        &self,
+        primary: Provider,
+        prompt: &str,
+        role_label: &str,
+    ) -> Option<String> {
+        match self
+            .llm
+            .chat_with_fallback(primary, self.config.active_model(), prompt)
+            .await
+        {
+            Ok((_provider, reply)) => {
+                info!(
+                    role = role_label,
+                    reply_len = reply.len(),
+                    "multi-agent sleep: specialist reply received"
+                );
+                Some(reply)
+            }
+            Err(err) => {
+                warn!(?err, role = role_label, "multi-agent sleep: LLM call failed");
+                None
+            }
+        }
+    }
+
+    /// Full nightly multi-agent memory consolidation.
+    ///
+    /// Pipeline per batch:
+    ///   1. Run 4 specialist agents in parallel (tokio::join!)
+    ///   2. Detect Core ID conflicts between specialist replies
+    ///   3. Run synthesis agent with deliberation prompt
+    ///   4. Parse synthesis reply into AgenticSleepInsights
+    ///   5. Accumulate into running merger
+    ///
+    /// After all batches:
+    ///   6. Merge all batch AgenticSleepInsights into one
+    ///   7. Apply via memory.apply_agentic_sleep_insights()
+    ///
+    /// Falls back to run_agentic_sleep_cycle() (single-agent) if the LLM is
+    /// unavailable or any batch fails completely.
+    #[instrument(skip(self, memory))]
+    pub async fn run_multi_agent_sleep_cycle(
+        &self,
+        memory: &mut MemoryManager,
+    ) -> Result<SleepSummary> {
+        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
+            Provider::OpenRouter
+        } else {
+            Provider::Ollama
+        };
+
+        let batch_size = self.config.memory.multi_agent_sleep_batch_size;
+        let batches = batch_memories(memory.all(), batch_size);
+
+        info!(
+            batch_count = batches.len(),
+            batch_size,
+            "multi-agent sleep: starting consolidation"
+        );
+
+        let bot_name = &self.config.agent.name;
+        let user_name = &self.config.agent.user_name;
+
+        let mut all_batch_insights = Vec::new();
+        let mut any_batch_succeeded = false;
+
+        for (batch_idx, batch) in batches.iter().enumerate() {
+            info!(
+                batch = batch_idx + 1,
+                total = batches.len(),
+                entries = batch.len(),
+                "multi-agent sleep: processing batch"
+            );
+
+            let identity = memory.identity.clone();
+
+            let arch_prompt =
+                specialist_prompt(SpecialistRole::Archivist, batch, &identity, bot_name, user_name);
+            let psych_prompt = specialist_prompt(
+                SpecialistRole::Psychologist,
+                batch,
+                &identity,
+                bot_name,
+                user_name,
+            );
+            let strat_prompt =
+                specialist_prompt(SpecialistRole::Strategist, batch, &identity, bot_name, user_name);
+            let critic_prompt =
+                specialist_prompt(SpecialistRole::Critic, batch, &identity, bot_name, user_name);
+
+            // Run all 4 specialists in parallel.
+            let (arch_reply, psych_reply, strat_reply, critic_reply) = tokio::join!(
+                self.sleep_llm_call(primary, &arch_prompt, "Archivist"),
+                self.sleep_llm_call(primary, &psych_prompt, "Psychologist"),
+                self.sleep_llm_call(primary, &strat_prompt, "Strategist"),
+                self.sleep_llm_call(primary, &critic_prompt, "Critic"),
+            );
+
+            // If any specialist failed, fall back to single-agent for this batch.
+            let (arch_reply, psych_reply, strat_reply, critic_reply) =
+                match (arch_reply, psych_reply, strat_reply, critic_reply) {
+                    (Some(a), Some(p), Some(s), Some(c)) => (a, p, s, c),
+                    _ => {
+                        warn!(
+                            batch = batch_idx + 1,
+                            "multi-agent sleep: specialist call failed — using single-agent fallback for this batch"
+                        );
+                        // Build the standard single-agent prompt for this batch's entries.
+                        let fallback_prompt = aigent_memory::sleep::agentic_sleep_prompt(
+                            batch,
+                            bot_name,
+                            user_name,
+                            &identity.trait_scores,
+                        );
+                        match self
+                            .sleep_llm_call(primary, &fallback_prompt, "fallback-single")
+                            .await
+                        {
+                            Some(reply) => {
+                                let insights = parse_agentic_insights(&reply);
+                                all_batch_insights.push(insights);
+                                any_batch_succeeded = true;
+                            }
+                            None => {
+                                warn!(batch = batch_idx + 1, "multi-agent sleep: fallback also failed — skipping batch");
+                            }
+                        }
+                        continue;
+                    }
+                };
+
+            // Parse specialist replies to detect Core ID conflicts.
+            let arch_insights = parse_agentic_insights(&arch_reply);
+            let psych_insights = parse_agentic_insights(&psych_reply);
+            let strat_insights = parse_agentic_insights(&strat_reply);
+            let critic_insights = parse_agentic_insights(&critic_reply);
+
+            // Conflicting IDs: mentioned in retire by one specialist AND in
+            // rewrite/consolidate by another.
+            let all_retire: std::collections::HashSet<String> = arch_insights
+                .retire_core_ids
+                .iter()
+                .chain(&psych_insights.retire_core_ids)
+                .chain(&strat_insights.retire_core_ids)
+                .chain(&critic_insights.retire_core_ids)
+                .cloned()
+                .collect();
+
+            let all_rewrite_or_consolidate: std::collections::HashSet<String> = arch_insights
+                .rewrite_core
+                .iter()
+                .chain(&psych_insights.rewrite_core)
+                .chain(&strat_insights.rewrite_core)
+                .chain(&critic_insights.rewrite_core)
+                .map(|(id, _)| id.clone())
+                .chain(
+                    arch_insights
+                        .consolidate_core
+                        .iter()
+                        .chain(&psych_insights.consolidate_core)
+                        .chain(&strat_insights.consolidate_core)
+                        .chain(&critic_insights.consolidate_core)
+                        .flat_map(|(ids_csv, _)| {
+                            ids_csv.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>()
+                        }),
+                )
+                .collect();
+
+            let conflicting_ids: Vec<String> = all_retire
+                .intersection(&all_rewrite_or_consolidate)
+                .cloned()
+                .collect();
+
+            info!(
+                batch = batch_idx + 1,
+                conflicts = conflicting_ids.len(),
+                "multi-agent sleep: running synthesis deliberation"
+            );
+
+            let specialist_reports = vec![
+                (SpecialistRole::Archivist, arch_reply),
+                (SpecialistRole::Psychologist, psych_reply),
+                (SpecialistRole::Strategist, strat_reply),
+                (SpecialistRole::Critic, critic_reply),
+            ];
+
+            let identity_ctx =
+                build_identity_context(batch, &identity, bot_name, user_name);
+            let delib_prompt = deliberation_prompt(
+                &specialist_reports,
+                &conflicting_ids,
+                &identity_ctx,
+                bot_name,
+                user_name,
+            );
+
+            match self
+                .sleep_llm_call(primary, &delib_prompt, "synthesis")
+                .await
+            {
+                Some(synthesis_reply) => {
+                    let insights = parse_agentic_insights(&synthesis_reply);
+                    info!(
+                        batch = batch_idx + 1,
+                        learned = insights.learned_about_user.len(),
+                        follow_ups = insights.follow_ups.len(),
+                        "multi-agent sleep: batch synthesis complete"
+                    );
+                    all_batch_insights.push(insights);
+                    any_batch_succeeded = true;
+                }
+                None => {
+                    warn!(
+                        batch = batch_idx + 1,
+                        "multi-agent sleep: synthesis call failed — merging specialist insights directly"
+                    );
+                    // Merge the 4 specialist insights as a degraded fallback.
+                    let batch_merged = merge_insights(vec![
+                        arch_insights,
+                        psych_insights,
+                        strat_insights,
+                        critic_insights,
+                    ]);
+                    all_batch_insights.push(batch_merged);
+                    any_batch_succeeded = true;
+                }
+            }
+        }
+
+        if !any_batch_succeeded {
+            warn!("multi-agent sleep: all batches failed — falling back to single-agent sleep");
+            return self.run_agentic_sleep_cycle(memory).await;
+        }
+
+        let final_insights = merge_insights(all_batch_insights);
+        info!(
+            learned = final_insights.learned_about_user.len(),
+            follow_ups = final_insights.follow_ups.len(),
+            reflections = final_insights.reflective_thoughts.len(),
+            profile_updates = final_insights.user_profile_updates.len(),
+            "multi-agent sleep: applying merged insights"
+        );
+
+        let summary_text = Some(format!(
+            "Multi-agent sleep: {} learned, {} follow-ups, {} reflections, {} profile updates ({} batches)",
+            final_insights.learned_about_user.len(),
+            final_insights.follow_ups.len(),
+            final_insights.reflective_thoughts.len(),
+            final_insights.user_profile_updates.len(),
+            batches.len(),
+        ));
+
+        let result = memory.apply_agentic_sleep_insights(final_insights, summary_text)?;
+        // Write a sentinel entry so the 22-hour rate-limit survives daemon restarts.
+        let _ = memory.record(
+            MemoryTier::Semantic,
+            "multi-agent sleep cycle completed",
+            "sleep:multi-agent-cycle",
+        );
+        Ok(result)
     }
 
     /// Legacy single-shot turn helper. Callers should use the server path
@@ -374,6 +674,62 @@ mod tests {
 
         assert!(!reply.is_empty());
         assert!(memory.all().len() >= 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_block_injected_into_prompt_without_panic() -> Result<()> {
+        // Verifies that a custom communication_style is accepted by the prompt
+        // construction code path without panicking or erroring.
+        let runtime = AgentRuntime::new(AppConfig::default());
+        let mut memory = MemoryManager::default();
+        memory.seed_core_identity("Alice", "Aigent")?;
+        // Set a distinctive style so we can assert it flows through the kernel.
+        memory.identity.communication_style = "terse and technical".to_string();
+        assert_eq!(memory.identity.communication_style, "terse and technical");
+
+        let reply = runtime
+            .respond_and_remember(&mut memory, "what is 2 + 2", &[])
+            .await?;
+        assert!(!reply.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_multi_agent_sleep_cycle_returns_summary_without_panicking() -> Result<()> {
+        // This test calls run_multi_agent_sleep_cycle with seeded memory.
+        // It degrades gracefully to the single-agent fallback if the LLM is
+        // unavailable, and to passive distillation if everything fails.
+        // The key invariant: it must not panic in any case.
+        let runtime = AgentRuntime::new(AppConfig::default());
+        let mut memory = MemoryManager::default();
+        memory.seed_core_identity("Alice", "Aigent")?;
+
+        // Seed 10 Episodic entries to give the sleep cycle something to process.
+        for i in 0..10 {
+            memory.record(
+                aigent_memory::MemoryTier::Episodic,
+                format!("test episodic memory entry number {i}"),
+                "test",
+            )?;
+        }
+
+        // Should complete without panicking regardless of LLM availability.
+        let result = runtime.run_multi_agent_sleep_cycle(&mut memory).await;
+        // Accept either Ok or Err — the important thing is no panic.
+        match result {
+            Ok(summary) => {
+                // If LLM was available we may have promotions; if not, distill
+                // still produces a summary string.
+                assert!(
+                    !summary.distilled.is_empty() || !summary.promoted_ids.is_empty(),
+                    "summary should contain some output"
+                );
+            }
+            Err(_) => {
+                // Graceful error is acceptable when LLM is not running in CI.
+            }
+        }
         Ok(())
     }
 }

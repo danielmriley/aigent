@@ -9,6 +9,7 @@ provider = "ollama"
 ollama_model = "gemma3:12b"
 openrouter_model = "openai/gpt-4o-mini"
 ollama_local_first = true
+ollama_base_url = "http://localhost:11434"
 
 [memory]
 backend = "eventlog"
@@ -18,6 +19,7 @@ auto_sleep_mode = "nightly"
 night_sleep_start_hour = 23
 night_sleep_end_hour = 4
 core_rewrite_requires_approval = true
+multi_agent_sleep_batch_size = 60
 
 [safety]
 approval_required = true

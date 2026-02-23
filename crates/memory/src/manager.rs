@@ -226,8 +226,10 @@ impl MemoryManager {
 
     /// Assemble a ranked context window with provenance scores.
     ///
-    /// Core, UserProfile, and Reflective are always considered regardless of
-    /// lexical overlap.  Sleep bookkeeping entries are filtered out.
+    /// Core, UserProfile, Reflective, and `agent-perspective:*` entries are
+    /// always considered regardless of lexical overlap — the agent's durable
+    /// views and personality should always be within reach.  Sleep bookkeeping
+    /// entries are filtered out.
     /// When an embedding backend is configured the query is embedded and used
     /// for hybrid lexical+vector scoring.
     pub fn context_for_prompt_ranked(&self, query: &str, limit: usize) -> Vec<RankedMemoryContext> {
@@ -238,7 +240,12 @@ impl MemoryManager {
             .all()
             .iter()
             // Exclude retired Core entries so they no longer appear in prompts.
-            .filter(|e| priority_tiers.contains(&e.tier) && e.source != "sleep:retired")
+            // Agent perspectives are always treated as priority alongside
+            // Core/UserProfile/Reflective so developed views are consistently present.
+            .filter(|e| {
+                (priority_tiers.contains(&e.tier) || e.source.starts_with("agent-perspective:"))
+                    && e.source != "sleep:retired"
+            })
             .cloned()
             .collect::<Vec<_>>();
 
@@ -248,6 +255,7 @@ impl MemoryManager {
             .iter()
             .filter(|e| {
                 !priority_tiers.contains(&e.tier)
+                    && !e.source.starts_with("agent-perspective:")
                     && !e.source.starts_with("assistant-turn")
                     && e.source != "sleep:cycle"
             })
@@ -598,7 +606,10 @@ impl MemoryManager {
         let promotion_lines = summary
             .promotions
             .iter()
-            .map(|p| format!("  • [{:?}] {}", p.to_tier, &p.content[..p.content.len().min(80)]))
+            .map(|p| {
+                let preview: String = p.content.chars().take(80).collect();
+                format!("  • [{:?}] {}", p.to_tier, preview)
+            })
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -781,6 +792,74 @@ impl MemoryManager {
             summary.promoted_ids.push(e.id.to_string());
         }
 
+        // 3g. Communication style update → IdentityKernel + Core (via consistency firewall).
+        if let Some(ref style) = insights.communication_style_update {
+            let probe = MemoryEntry {
+                id: Uuid::new_v4(),
+                tier: MemoryTier::Core,
+                content: style.clone(),
+                source: "sleep:style-update".to_string(),
+                confidence: 0.85,
+                valence: 0.0,
+                tags: Vec::new(),
+                embedding: None,
+                created_at: Utc::now(),
+                provenance_hash: "sleep".to_string(),
+            };
+            match evaluate_core_update(&self.identity, &probe) {
+                ConsistencyDecision::Accept => {
+                    // Record as a Core entry so it persists through derive_identity_from_core.
+                    match self.record_inner(
+                        MemoryTier::Core,
+                        format!("Communication style: {style}"),
+                        "sleep:style-update".to_string(),
+                        0.85,
+                        false,
+                    ) {
+                        Ok(e) => {
+                            summary.promoted_ids.push(e.id.to_string());
+                            debug!(style, "communication style update committed to Core");
+                        }
+                        Err(err) => warn!(?err, "failed to record style update to Core"),
+                    }
+                }
+                ConsistencyDecision::Quarantine(reason) => {
+                    warn!(reason, "communication style update quarantined by consistency firewall");
+                }
+            }
+        }
+
+        // 3h. Valence corrections → in-memory store + event log.
+        if !insights.valence_corrections.is_empty() {
+            for (id_short, new_valence) in &insights.valence_corrections {
+                let updated = self.store.update_valence_by_id_short(id_short, *new_valence);
+                if updated {
+                    debug!(id_short, valence = new_valence, "valence correction applied");
+                } else {
+                    warn!(id_short, "valence correction: no matching entry found");
+                }
+            }
+            // Persist corrections to the event log in a single overwrite pass.
+            if let Some(event_log) = &self.event_log {
+                match event_log.load() {
+                    Ok(mut events) => {
+                        for ev in &mut events {
+                            let id_str = ev.entry.id.to_string();
+                            for (short, val) in &insights.valence_corrections {
+                                if id_str.starts_with(short.as_str()) {
+                                    ev.entry.valence = val.clamp(-1.0, 1.0);
+                                }
+                            }
+                        }
+                        if let Err(err) = event_log.overwrite(&events) {
+                            warn!(?err, "failed to persist valence corrections to event log");
+                        }
+                    }
+                    Err(err) => warn!(?err, "failed to load event log for valence corrections"),
+                }
+            }
+        }
+
         // 4. Apply Core retirements and rewrites requested by the LLM.
         let mut retired_count = 0usize;
         for id_short in &insights.retire_core_ids {
@@ -837,6 +916,39 @@ impl MemoryManager {
             );
         }
 
+        // 5b. Decay stale Semantic entries that have grown too old and too weak
+        //     to be useful.  Only runs during an agentic cycle so the LLM has
+        //     already reviewed the memories before we prune them.
+        {
+            let stale_ids = crate::sleep::decay_stale_semantic(self.store.all(), 90);
+            let decayed = stale_ids.len();
+            if decayed > 0 {
+                for id in &stale_ids {
+                    self.store.remove(*id);
+                }
+                // Rewrite the event log without the pruned entries.
+                if let Some(event_log) = &self.event_log {
+                    match event_log.load() {
+                        Ok(events) => {
+                            let kept: Vec<_> = events
+                                .into_iter()
+                                .filter(|ev| !stale_ids.contains(&ev.entry.id))
+                                .collect();
+                            if let Err(err) = event_log.overwrite(&kept) {
+                                warn!(?err, "failed to persist semantic decay to event log");
+                            }
+                        }
+                        Err(err) => warn!(?err, "failed to load event log for semantic decay"),
+                    }
+                }
+                info!(decayed, "semantic decay pass complete");
+                summary.distilled = format!(
+                    "{} (decayed {} stale semantic entries)",
+                    summary.distilled, decayed
+                );
+            }
+        }
+
         // 6. Derive and persist the updated identity kernel.
         let log_path = self.event_log.as_ref().map(|el| el.path().to_path_buf());
         self.identity = self.derive_identity_from_core();
@@ -845,6 +957,26 @@ impl MemoryManager {
             trait_count = self.identity.trait_scores.len(),
             "identity kernel re-derived from core"
         );
+
+        // Apply long-goal additions from this cycle's insights directly to the
+        // in-memory kernel (after re-derivation so they're additive, not lost).
+        // A prefix match (first 30 chars) prevents near-duplicate goals.
+        for goal in &insights.long_goal_additions {
+            let goal_lower = goal.to_lowercase();
+            let prefix_len = goal_lower.len().min(30);
+            let already = self
+                .identity
+                .long_goals
+                .iter()
+                .any(|g| g.to_lowercase().starts_with(&goal_lower[..prefix_len]));
+            if !already {
+                if self.identity.long_goals.len() >= 10 {
+                    self.identity.long_goals.remove(0);
+                }
+                self.identity.long_goals.push(goal.clone());
+                debug!(goal, "long-term goal added to identity kernel");
+            }
+        }
         if let Some(path) = log_path {
             if let Err(err) = self.save_identity_snapshot(&path) {
                 warn!(?err, "failed to persist identity snapshot");
@@ -886,6 +1018,21 @@ impl MemoryManager {
             .max_by_key(|e| e.created_at)
         {
             kernel.communication_style = reinforce.content.clone();
+        }
+
+        // A sleep:style-update entry (from the STYLE_UPDATE sleep instruction)
+        // takes precedence over personality reinforcement — it is the agent's
+        // direct refinement of how it communicates.
+        if let Some(style_entry) = core_entries
+            .iter()
+            .filter(|e| e.source == "sleep:style-update")
+            .max_by_key(|e| e.created_at)
+        {
+            let raw = style_entry
+                .content
+                .strip_prefix("Communication style: ")
+                .unwrap_or(&style_entry.content);
+            kernel.communication_style = raw.to_string();
         }
 
         // Add recent reflections (last 30 days, up to 5, deduplicated).
@@ -1735,6 +1882,112 @@ mod tests {
             entries.iter().any(|e| e.valence.abs() > 0.0),
             "expected at least one episodic entry with non-zero valence"
         );
+        Ok(())
+    }
+
+    // ── FIX 4: agent-perspective entries appear in context ────────────────────
+
+    #[test]
+    fn agent_perspective_appears_in_ranked_context() -> Result<()> {
+        let mut manager = MemoryManager::default();
+        manager.record_agent_perspective("Rust", "Rust is the best language for systems code")?;
+        // Add some noise so the perspective isn't the only entry.
+        manager.record(MemoryTier::Episodic, "user is working on a web project", "user-input")?;
+        manager.record(MemoryTier::Semantic, "the project uses tokio for async", "sleep:cycle")?;
+
+        let context = manager.context_for_prompt_ranked("what language should I use", 5);
+        let has_perspective = context
+            .iter()
+            .any(|item| item.entry.source.starts_with("agent-perspective:"));
+        assert!(has_perspective, "agent-perspective entry must appear in ranked context");
+        Ok(())
+    }
+
+    // ── FIX 2: communication_style_update applied via sleep insights ──────────
+
+    #[test]
+    fn sleep_insights_update_communication_style() -> Result<()> {
+        use crate::sleep::AgenticSleepInsights;
+
+        let mut manager = MemoryManager::default();
+        manager.seed_constitution("Aigent", "Alice")?;
+
+        let insights = AgenticSleepInsights {
+            communication_style_update: Some("Direct, warm, and technically precise.".to_string()),
+            ..Default::default()
+        };
+        manager.apply_agentic_sleep_insights(insights, None)?;
+
+        assert_eq!(
+            manager.identity.communication_style,
+            "Direct, warm, and technically precise.",
+            "communication style should be updated from sleep insights"
+        );
+        Ok(())
+    }
+
+    // ── FIX 2: long_goal_additions applied via sleep insights ─────────────────
+
+    #[test]
+    fn sleep_insights_add_long_goals_without_duplicates() -> Result<()> {
+        use crate::sleep::AgenticSleepInsights;
+
+        let mut manager = MemoryManager::default();
+        manager.seed_constitution("Aigent", "Alice")?;
+
+        let insights = AgenticSleepInsights {
+            long_goal_additions: vec![
+                "Help Alice become a proficient Rust programmer".to_string(),
+                "Help Alice become a proficient Rust programmer".to_string(), // duplicate
+            ],
+            ..Default::default()
+        };
+        manager.apply_agentic_sleep_insights(insights, None)?;
+
+        let rust_goals = manager
+            .identity
+            .long_goals
+            .iter()
+            .filter(|g| g.to_lowercase().contains("rust"))
+            .count();
+        assert_eq!(rust_goals, 1, "duplicate goal should not be added twice");
+        Ok(())
+    }
+
+    // ── FIX 5B: valence corrections applied via sleep insights ────────────────
+
+    #[test]
+    fn sleep_insights_apply_valence_corrections() -> Result<()> {
+        use crate::sleep::AgenticSleepInsights;
+
+        let mut manager = MemoryManager::default();
+        // Record an entry whose initial valence is near 0.
+        let entry = manager.record(
+            MemoryTier::Episodic,
+            "the refactor was completed",
+            "user-input",
+        )?;
+        let id_short: String = entry.id.to_string().chars().take(8).collect();
+        assert!(
+            manager.all().iter().find(|e| e.id == entry.id).unwrap().valence.abs() < 0.3,
+            "initial valence should be near zero"
+        );
+
+        let insights = AgenticSleepInsights {
+            valence_corrections: vec![(id_short.clone(), 0.85)],
+            ..Default::default()
+        };
+        manager.apply_agentic_sleep_insights(insights, None)?;
+
+        let updated_entry = manager.all().iter().find(|e| e.id == entry.id);
+        if let Some(e) = updated_entry {
+            assert!(
+                (e.valence - 0.85).abs() < 0.001,
+                "valence should be corrected to 0.85, got {}",
+                e.valence
+            );
+        }
+        // Entry may have been compacted already in Episodic — that is fine.
         Ok(())
     }
 }

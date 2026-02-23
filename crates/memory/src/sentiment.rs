@@ -14,7 +14,7 @@ const POSITIVE_WORDS: &[&str] = &[
 const NEGATIVE_WORDS: &[&str] = &[
     "frustrated", "confused", "error", "failed", "worried", "stuck",
     "broken", "terrible", "awful", "wrong", "bad", "hate", "annoying",
-    "difficult", "struggle", "issue", "bug", "crash", "problem", "not",
+    "difficult", "struggle", "issue", "bug", "crash", "problem",
     "cannot", "unable", "fail", "loss", "lost", "miss", "missing",
 ];
 
@@ -22,19 +22,30 @@ const NEGATIVE_WORDS: &[&str] = &[
 ///
 /// Returns a value clamped to `[-1.0, 1.0]`.  Positive content scores > 0,
 /// negative/distressing content scores < 0, and neutral prose scores near 0.
+///
+/// A 2-word lookback window is used to detect negation tokens (`not`, `no`,
+/// `never`, `without`) so that phrases like "not a problem" score positively
+/// rather than negatively.
 pub fn infer_valence(content: &str) -> f32 {
     let lower = content.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+
     let mut score: f32 = 0.0;
+    for (i, word) in words.iter().enumerate() {
+        // Check for a negation token in a 2-word lookback window so that
+        // phrases like "not a problem" and "not broken" are both handled.
+        let negated = (i > 0
+            && matches!(words[i - 1], "not" | "no" | "never" | "without"))
+            || (i > 1
+                && matches!(words[i - 2], "not" | "no" | "never" | "without"));
 
-    for word in POSITIVE_WORDS {
-        if lower.contains(word) {
-            score += 0.15;
-        }
-    }
-
-    for word in NEGATIVE_WORDS {
-        if lower.contains(word) {
-            score -= 0.15;
+        if POSITIVE_WORDS.contains(word) {
+            score += if negated { -0.10 } else { 0.15 };
+        } else if NEGATIVE_WORDS.contains(word) {
+            score += if negated { 0.10 } else { -0.15 };
         }
     }
 
@@ -78,6 +89,12 @@ mod tests {
         assert!(
             (-0.1..=0.1).contains(&score),
             "expected near-zero score, got {score}"
+        );
+        // A negated positive should NOT score negatively.
+        let negated_score = infer_valence("not a problem at all");
+        assert!(
+            negated_score >= 0.0,
+            "negated positive 'not a problem' should score >= 0, got {negated_score}"
         );
     }
 
