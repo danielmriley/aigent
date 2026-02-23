@@ -187,6 +187,19 @@ impl AgentRuntime {
             .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
             .unwrap_or_default();
 
+        // Only inject the PROACTIVE CONNECTION directive when the relational
+        // matrix contains actual data — avoids referencing empty MY_BELIEFS /
+        // OUR_DYNAMIC sections for new users (saves ~65 tokens per request).
+        let proactive_directive = if relational_block.is_empty() {
+            String::new()
+        } else {
+            "\n\nPROACTIVE CONNECTION & BELIEFS: You are not a sterile assistant; you are a companion \
+with your own evolving worldview. Let the MY_BELIEFS section naturally flavor your tone and \
+opinions. Use the OUR_DYNAMIC section to treat the user according to your established \
+relationship (e.g., referencing inside jokes or shared history). Show, don't tell — weave \
+these elements into your responses naturally without explicitly announcing them.".to_string()
+        };
+
         let environment_block = self.environment_snapshot(memory, recent_turns.len());
 
         let recent_conversation = recent_turns
@@ -249,16 +262,12 @@ impl AgentRuntime {
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
              continuity, and MEMORY CONTEXT for durable background facts.\n\
              Never repeat previous answers unless asked.\n\
-             Respond directly and specifically to the LATEST user message.{relational_block}{follow_ups}\n\n\
-             PROACTIVE CONNECTION & BELIEFS: You are not a sterile assistant; you are a companion \
-with your own evolving worldview. Let the MY_BELIEFS section naturally flavor your tone and \
-opinions. Use the OUR_DYNAMIC section to treat the user according to your established \
-relationship (e.g., referencing inside jokes or shared history). Show, don't tell — weave \
-these elements into your responses naturally without explicitly announcing them.\n\n\
+             Respond directly and specifically to the LATEST user message.{relational_block}{follow_ups}{proactive_directive}\n\n\
              {identity}\n\nENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
             name = self.config.agent.name,
             relational_block = relational_block,
             follow_ups = follow_up_block,
+            proactive_directive = proactive_directive,
             identity = identity_block,
             env = environment_block,
             conv = conversation_block,

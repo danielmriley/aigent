@@ -396,31 +396,46 @@ impl MemoryManager {
         let mut agent_beliefs: Vec<String> = Vec::new();
         let mut relationship_dynamics: Vec<String> = Vec::new();
 
-        let profile_entries  = self.entries_by_tier(MemoryTier::UserProfile);
-        let reflective_entries = self.entries_by_tier(MemoryTier::Reflective);
+        // Single pass — no intermediate Vec allocations from entries_by_tier.
+        for entry in self.store.all().iter()
+            .filter(|e| e.tier == MemoryTier::UserProfile || e.tier == MemoryTier::Reflective)
+        {
+            // Source-based routing is zero-allocation (&str comparisons).
+            let src = entry.source.as_str();
+            let is_belief_src  = src.contains("critic")  || src.contains("belief");
+            let is_dynamic_src = src.contains("psychologist") || src == "sleep:relationship";
 
-        for entry in profile_entries.iter().chain(reflective_entries.iter()) {
-            let c = entry.content.to_lowercase();
-            let s = entry.source.to_lowercase();
-
-            if c.contains("belief") || c.contains("opinion") || c.contains("think")
-                || c.contains("feel about") || c.contains("my_belief")
-                || s.contains("belief") || s.contains("critic")
-                || c.starts_with("belief:") || c.starts_with("my_belief:")
-            {
-                // Compact: strip common prefixes the LLM writes
-                let cleaned = strip_tag_prefix(&entry.content, &["BELIEF:", "MY_BELIEF:", "OPINION:"]);
-                agent_beliefs.push(cleaned);
-            } else if c.contains("dynamic") || c.contains("relationship") || c.contains("joke")
-                || c.contains("rapport") || c.contains("our_dynamic") || c.contains("shared")
-                || s.contains("psychologist") || s.contains("relationship")
-                || c.starts_with("dynamic:") || c.starts_with("our_dynamic:")
-            {
-                let cleaned = strip_tag_prefix(&entry.content, &["DYNAMIC:", "OUR_DYNAMIC:", "RELATIONSHIP:"]);
-                relationship_dynamics.push(cleaned);
+            if is_belief_src {
+                agent_beliefs.push(strip_tag_prefix_lower(
+                    &entry.content,
+                    &["belief:", "my_belief:", "opinion:"],
+                ));
+            } else if is_dynamic_src {
+                relationship_dynamics.push(strip_tag_prefix_lower(
+                    &entry.content,
+                    &["dynamic:", "our_dynamic:", "relationship:"],
+                ));
             } else {
-                // Everything else is a user fact
-                user_facts.push(entry.content.clone());
+                // Content-based fallback — lowercase only for ambiguous entries.
+                let c = entry.content.to_ascii_lowercase();
+                if c.contains("belief") || c.contains("opinion") || c.contains("think")
+                    || c.contains("feel about") || c.contains("my_belief")
+                {
+                    agent_beliefs.push(strip_tag_prefix_lower(
+                        &entry.content,
+                        &["belief:", "my_belief:", "opinion:"],
+                    ));
+                } else if c.contains("dynamic") || c.contains("relationship")
+                    || c.contains("joke") || c.contains("rapport")
+                    || c.contains("our_dynamic") || c.contains("shared")
+                {
+                    relationship_dynamics.push(strip_tag_prefix_lower(
+                        &entry.content,
+                        &["dynamic:", "our_dynamic:", "relationship:"],
+                    ));
+                } else {
+                    user_facts.push(entry.content.clone());
+                }
             }
         }
 
@@ -551,6 +566,17 @@ impl MemoryManager {
                 MemoryTier::Reflective,
                 thought.clone(),
                 "sleep:reflection".to_string(),
+            ).await?;
+            extra_ids.push(e.id.to_string());
+        }
+
+        // relationship_milestones → Reflective (source = "sleep:relationship" routes to
+        // OUR_DYNAMIC bucket in relational_state_block via source-based detection)
+        for milestone in &insights.relationship_milestones {
+            let e = self.record_inner(
+                MemoryTier::Reflective,
+                milestone.clone(),
+                "sleep:relationship".to_string(),
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -713,12 +739,17 @@ impl MemoryManager {
 /// Strip a recognised tag prefix (e.g. `"BELIEF:"`, `"MY_BELIEF:"`) from the
 /// front of `s` (case-insensitive), trimming surrounding whitespace.
 /// If none of the `prefixes` match, `s` is returned unchanged.
-fn strip_tag_prefix(s: &str, prefixes: &[&str]) -> String {
-    let s_upper = s.to_uppercase();
+/// Strip a leading tag prefix from `s`, matching case-insensitively.
+/// `prefixes` must be **lowercase ASCII** (e.g. `"belief:"`).  Only the first
+/// 25 bytes of `s` are lowercased for comparison — the rest of the string is
+/// returned verbatim — avoiding a full-length heap copy on long entries.
+fn strip_tag_prefix_lower(s: &str, prefixes: &[&str]) -> String {
+    let window_len = s.len().min(25);
+    // to_ascii_lowercase() on a short slice is cheap (stack-friendly for ≤ 25 B).
+    let wl = s[..window_len].to_ascii_lowercase();
     for prefix in prefixes {
-        let p = prefix.to_uppercase();
-        if s_upper.starts_with(&p) {
-            return s[p.len()..].trim().to_string();
+        if wl.starts_with(prefix) {
+            return s[prefix.len()..].trim().to_string();
         }
     }
     s.to_string()
