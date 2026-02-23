@@ -47,4 +47,8 @@ pub enum ServerEvent {
     ToolList(Vec<aigent_tools::ToolSpec>),
     ToolResult { success: bool, output: String },
     Ack(String),
+    /// Incremental status line emitted during a long-running sleep cycle.
+    /// This is NOT a terminal event — the client continues reading until
+    /// `Ack` arrives.
+    StatusLine(String),
 }

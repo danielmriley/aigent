@@ -822,7 +822,16 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                     }
 
                     if line == "/sleep" {
-                        match daemon.run_sleep_cycle().await {
+                        // Show spinner immediately so the user knows we're working.
+                        let _ = backend_tx.send(BackendEvent::SleepCycleRunning);
+                        let tx_clone = backend_tx.clone();
+                        match daemon
+                            .run_sleep_cycle_with_progress(|msg| {
+                                let _ = tx_clone
+                                    .send(BackendEvent::Token(format!("[sleep] {msg}")));
+                            })
+                            .await
+                        {
                             Ok(msg) => {
                                 let _ = backend_tx.send(BackendEvent::Token(msg));
                                 let _ = backend_tx.send(BackendEvent::Done);
@@ -1017,7 +1026,11 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
         }
 
         if line == "/sleep" {
-            match daemon.run_sleep_cycle().await {
+            println!("Starting sleep cycle…");
+            match daemon
+                .run_sleep_cycle_with_progress(|msg| println!("  {msg}"))
+                .await
+            {
                 Ok(msg) => println!("{msg}"),
                 Err(err) => eprintln!("error: {err}"),
             }

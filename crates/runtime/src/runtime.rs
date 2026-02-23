@@ -309,13 +309,18 @@ these elements into your responses naturally without explicitly announcing them.
     ///
     /// Falls back to passive-only distillation if the LLM call fails.
     #[instrument(skip(self, memory))]
-    pub async fn run_agentic_sleep_cycle(&self, memory: &mut MemoryManager) -> Result<SleepSummary> {
+    pub async fn run_agentic_sleep_cycle(
+        &self,
+        memory: &mut MemoryManager,
+        progress: &mpsc::UnboundedSender<String>,
+    ) -> Result<SleepSummary> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
         } else {
             Provider::Ollama
         };
 
+        let _ = progress.send("Reflecting on today's memories…".into());
         let prompt = memory.agentic_sleep_prompt();
         info!(prompt_len = prompt.len(), "agentic sleep: sending reflection prompt to LLM");
 
@@ -330,6 +335,7 @@ these elements into your responses naturally without explicitly announcing them.
                     insights.reflective_thoughts.len(),
                     insights.user_profile_updates.len(),
                 ));
+                let _ = progress.send("Applying insights to memory…".into());
                 memory.apply_agentic_sleep_insights(insights, summary_text).await
             }
             Err(err) => {
@@ -386,6 +392,7 @@ these elements into your responses naturally without explicitly announcing them.
     pub async fn run_multi_agent_sleep_cycle(
         &self,
         memory: &mut MemoryManager,
+        progress: &mpsc::UnboundedSender<String>,
     ) -> Result<SleepSummary> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
@@ -401,6 +408,11 @@ these elements into your responses naturally without explicitly announcing them.
             batch_size,
             "multi-agent sleep: starting consolidation"
         );
+        let _ = progress.send(format!(
+            "Starting multi-agent memory consolidation ({} batch{})…",
+            batches.len(),
+            if batches.len() == 1 { "" } else { "es" }
+        ));
 
         let bot_name = &self.config.agent.name;
         let user_name = &self.config.agent.user_name;
@@ -415,6 +427,11 @@ these elements into your responses naturally without explicitly announcing them.
                 entries = batch.len(),
                 "multi-agent sleep: processing batch"
             );
+            let _ = progress.send(format!(
+                "Batch {}/{}: consulting 4 specialist agents in parallel…",
+                batch_idx + 1,
+                batches.len()
+            ));
 
             let identity = memory.identity.clone();
 
@@ -449,6 +466,11 @@ these elements into your responses naturally without explicitly announcing them.
                             batch = batch_idx + 1,
                             "multi-agent sleep: specialist call failed — using single-agent fallback for this batch"
                         );
+                        let _ = progress.send(format!(
+                            "Batch {}/{}: specialist unavailable — using single-agent fallback…",
+                            batch_idx + 1,
+                            batches.len()
+                        ));
                         // Build the standard single-agent prompt for this batch's entries.
                         let fallback_prompt = aigent_memory::sleep::agentic_sleep_prompt(
                             batch,
@@ -520,6 +542,16 @@ these elements into your responses naturally without explicitly announcing them.
                 conflicts = conflicting_ids.len(),
                 "multi-agent sleep: running synthesis deliberation"
             );
+            let _ = progress.send(format!(
+                "Batch {}/{}: synthesising specialist reports{}…",
+                batch_idx + 1,
+                batches.len(),
+                if conflicting_ids.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} conflict{})", conflicting_ids.len(), if conflicting_ids.len() == 1 { "" } else { "s" })
+                }
+            ));
 
             let specialist_reports = vec![
                 (SpecialistRole::Archivist, arch_reply),
@@ -573,7 +605,8 @@ these elements into your responses naturally without explicitly announcing them.
 
         if !any_batch_succeeded {
             warn!("multi-agent sleep: all batches failed — falling back to single-agent sleep");
-            return self.run_agentic_sleep_cycle(memory).await;
+            let _ = progress.send("All batches failed — falling back to single-agent sleep…".into());
+            return self.run_agentic_sleep_cycle(memory, progress).await;
         }
 
         let final_insights = merge_insights(all_batch_insights);
@@ -584,6 +617,11 @@ these elements into your responses naturally without explicitly announcing them.
             profile_updates = final_insights.user_profile_updates.len(),
             "multi-agent sleep: applying merged insights"
         );
+        let _ = progress.send(format!(
+            "Applying merged insights — {} learned, {} reflections…",
+            final_insights.learned_about_user.len(),
+            final_insights.reflective_thoughts.len(),
+        ));
 
         let summary_text = Some(format!(
             "Multi-agent sleep: {} learned, {} follow-ups, {} reflections, {} profile updates ({} batches)",
@@ -684,6 +722,7 @@ mod tests {
 
     use aigent_config::AppConfig;
     use aigent_memory::MemoryManager;
+    use tokio::sync::mpsc;
 
     use crate::AgentRuntime;
 
@@ -739,7 +778,8 @@ mod tests {
         }
 
         // Should complete without panicking regardless of LLM availability.
-        let result = runtime.run_multi_agent_sleep_cycle(&mut memory).await;
+        let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+        let result = runtime.run_multi_agent_sleep_cycle(&mut memory, &noop_tx).await;
         // Accept either Ok or Err — the important thing is no panic.
         match result {
             Ok(summary) => {

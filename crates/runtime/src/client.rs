@@ -177,15 +177,36 @@ impl DaemonClient {
     }
 
     pub async fn run_sleep_cycle(&self) -> Result<String> {
-        let events = self
-            .request_events(ClientCommand::RunSleepCycle)
-            .await?;
-        for event in events {
-            if let ServerEvent::Ack(msg) = event {
-                return Ok(msg);
+        self.run_sleep_cycle_with_progress(|_| {}).await
+    }
+
+    /// Run a sleep cycle and call `on_progress` with each incremental status
+    /// line as it arrives.  Returns the final completion message once the
+    /// cycle is done.  Use `run_sleep_cycle()` for a fire-and-forget variant.
+    pub async fn run_sleep_cycle_with_progress(
+        &self,
+        on_progress: impl Fn(&str),
+    ) -> Result<String> {
+        let stream = UnixStream::connect(&self.socket_path).await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let request = serde_json::to_string(&ClientCommand::RunSleepCycle)?;
+        write_half.write_all(request.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        write_half.flush().await?;
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                bail!("daemon closed connection during sleep cycle");
+            }
+            match serde_json::from_str::<ServerEvent>(line.trim())? {
+                ServerEvent::StatusLine(msg) => on_progress(&msg),
+                ServerEvent::Ack(msg) => return Ok(msg),
+                _ => {}
             }
         }
-        bail!("daemon sleep cycle response missing")
     }
 
     pub async fn list_tools(&self) -> Result<Vec<aigent_tools::ToolSpec>> {

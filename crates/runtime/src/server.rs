@@ -331,7 +331,8 @@ pub async fn run_unified_daemon(
                     let mem = std::mem::take(&mut s.memory);
                     (rt, mem)
                 };
-                let result = rt_clone.run_multi_agent_sleep_cycle(&mut memory).await;
+                let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+                let result = rt_clone.run_multi_agent_sleep_cycle(&mut memory, &noop_tx).await;
                 {
                     let mut s = sleep_state.lock().await;
                     s.memory = memory;
@@ -382,7 +383,8 @@ pub async fn run_unified_daemon(
             let mem = std::mem::take(&mut s.memory);
             (rt, mem)
         };
-        let _ = rt_clone.run_agentic_sleep_cycle(&mut memory).await;
+        let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+        let _ = rt_clone.run_agentic_sleep_cycle(&mut memory, &noop_tx).await;
         let mut s = state.lock().await;
         s.memory = memory;
         let _ = s.memory.flush_all();
@@ -466,78 +468,73 @@ async fn handle_connection(
                 }
             });
 
-            // ── Lock-minimisation: take everything we need, then release
-            //   the lock *before* the LLM call so other commands (status,
-            //   peek, etc.) can be served concurrently.
-            let (runtime_clone, recent, last_turn_at, mut memory) = {
-                let mut s = state.lock().await;
-                let rt = s.runtime.clone();
-                let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
-                let lta = s.last_turn_at;
-                let mem = std::mem::take(&mut s.memory);
-                (rt, recent, lta, mem)
-            };
-            // Lock is released here — LLM streaming runs without blocking it.
+            let outcome = {
+                let mut state = state.lock().await;
+                let recent = state.recent_turns.iter().cloned().collect::<Vec<_>>();
+                let last_turn_at = state.last_turn_at;
+                let mut memory = std::mem::take(&mut state.memory);
+                let reply_result = state
+                    .runtime
+                    .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
+                    .await;
 
-            let reply_result = runtime_clone
-                .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
-                .await;
-
-            // Re-acquire to commit memory and update conversation state.
-            let auto_sleep_needed = {
-                let mut s = state.lock().await;
-                let should_sleep = match &reply_result {
+                let outcome = match reply_result {
                     Ok(reply) => {
-                        s.last_turn_at = Some(Utc::now());
-                        s.recent_turns.push_back(ConversationTurn {
-                            user: user.clone(),
-                            assistant: reply.clone(),
+                        state.last_turn_at = Some(Utc::now());
+                        state.recent_turns.push_back(ConversationTurn {
+                            user,
+                            assistant: reply,
                         });
-                        while s.recent_turns.len() > 8 {
-                            let _ = s.recent_turns.pop_front();
+                        while state.recent_turns.len() > 8 {
+                            let _ = state.recent_turns.pop_front();
                         }
-                        s.turn_count += 1;
-                        s.runtime.config.memory.auto_sleep_turn_interval > 0
-                            && s.turn_count % s.runtime.config.memory.auto_sleep_turn_interval == 0
-                    }
-                    Err(_) => false,
-                };
-                // Per-entry vault note files are written incrementally in
-                // record_inner — no background flush needed here.
-                s.memory = memory;
-                should_sleep
-            };
-            // Lock released again.
+                        state.turn_count += 1;
 
-            // If auto-sleep is due, run it in a background task so the
-            // response reaches the client immediately.
-            if auto_sleep_needed {
-                let state_for_sleep = state.clone();
-                tokio::spawn(async move {
-                    let (rt, mut mem) = {
-                        let mut s = state_for_sleep.lock().await;
-                        (s.runtime.clone(), std::mem::take(&mut s.memory))
-                    };
-                    let result = rt.run_agentic_sleep_cycle(&mut mem).await;
-                    let mut s = state_for_sleep.lock().await;
-                    s.memory = mem;
-                    let _ = s.memory.flush_all();
-                    match result {
-                        Ok(summary) => info!(summary = %summary.distilled, "auto agentic sleep cycle complete"),
-                        Err(err) => warn!(?err, "auto agentic sleep cycle failed"),
+                        let mut extras = Vec::new();
+                        if state.runtime.config.memory.auto_sleep_turn_interval > 0
+                            && state.turn_count
+                                % state.runtime.config.memory.auto_sleep_turn_interval
+                                == 0
+                        {
+                            // Use agentic sleep for richer consolidation.
+                            let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+                        let sleep_result = state
+                                .runtime
+                                .run_agentic_sleep_cycle(&mut memory, &noop_tx)
+                                .await;
+                            match sleep_result {
+                                Ok(summary) => extras.push(format!("sleep cycle: {}", summary.distilled)),
+                                Err(err) => warn!(?err, "auto agentic sleep cycle failed"),
+                            }
+                        }
+
+                        Ok(extras)
                     }
-                });
-            }
+                    Err(err) => Err(err),
+                };
+
+                state.memory = memory;
+                // Sync the vault once per turn (deferred from per-record calls).
+                let _ = state.memory.flush_all();
+                outcome
+            };
 
             let _ = streamer.await;
             let mut writer = writer.lock().await;
-            match reply_result {
-                Ok(_) => {
+            match outcome {
+                Ok(extras) => {
                     send_event(
                         &mut writer,
                         ServerEvent::Backend(BackendEvent::MemoryUpdated),
                     )
                     .await?;
+                    for extra in extras {
+                        send_event(
+                            &mut writer,
+                            ServerEvent::Backend(BackendEvent::Token(extra)),
+                        )
+                        .await?;
+                    }
                     send_event(&mut writer, ServerEvent::Backend(BackendEvent::Done)).await?;
                     if is_external {
                         let _ = event_tx.send(BackendEvent::Done);
@@ -642,45 +639,89 @@ async fn handle_connection(
             send_event(&mut write_half, ServerEvent::Ack("pong".to_string())).await?;
         }
         ClientCommand::RunSleepCycle => {
-            // Clone the runtime and take memory out while holding the lock,
-            // then *release* the lock before the LLM call so that incoming
-            // chat requests are not blocked for the full sleep duration.
-            let (runtime, mut memory) = {
+            // Take memory out of state and release the lock before the LLM call.
+            // Spawn the cycle in a separate task so we can stream StatusLine
+            // progress events back to the client while it runs.
+            let (runtime, memory) = {
                 let mut s = state.lock().await;
                 let runtime = s.runtime.clone();
                 let memory = std::mem::take(&mut s.memory);
                 (runtime, memory)
             };
-            let result = runtime.run_agentic_sleep_cycle(&mut memory).await;
-            {
-                let mut s = state.lock().await;
-                s.memory = memory;
-                let _ = s.memory.flush_all();
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+            let (done_tx, mut done_rx) =
+                tokio::sync::oneshot::channel::<(String, MemoryManager)>();
+            tokio::spawn(async move {
+                let mut mem = memory;
+                let msg = match runtime.run_agentic_sleep_cycle(&mut mem, &progress_tx).await {
+                    Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
+                    Err(err) => format!("sleep cycle failed: {err}"),
+                };
+                let _ = done_tx.send((msg, mem));
+            });
+            loop {
+                tokio::select! {
+                    msg = progress_rx.recv() => {
+                        if let Some(msg) = msg {
+                            send_event(&mut write_half, ServerEvent::StatusLine(msg)).await?;
+                        }
+                    }
+                    result = &mut done_rx => {
+                        let (msg, memory_back) = result.expect("sleep task panicked");
+                        while let Ok(m) = progress_rx.try_recv() {
+                            send_event(&mut write_half, ServerEvent::StatusLine(m)).await?;
+                        }
+                        {
+                            let mut s = state.lock().await;
+                            s.memory = memory_back;
+                            let _ = s.memory.flush_all();
+                        }
+                        send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+                        break;
+                    }
+                }
             }
-            let msg = match result {
-                Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
-                Err(err) => format!("sleep cycle failed: {err}"),
-            };
-            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
         }
         ClientCommand::RunMultiAgentSleepCycle => {
-            let (runtime, mut memory) = {
+            let (runtime, memory) = {
                 let mut s = state.lock().await;
                 let runtime = s.runtime.clone();
                 let memory = std::mem::take(&mut s.memory);
                 (runtime, memory)
             };
-            let result = runtime.run_multi_agent_sleep_cycle(&mut memory).await;
-            {
-                let mut s = state.lock().await;
-                s.memory = memory;
-                let _ = s.memory.flush_all();
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+            let (done_tx, mut done_rx) =
+                tokio::sync::oneshot::channel::<(String, MemoryManager)>();
+            tokio::spawn(async move {
+                let mut mem = memory;
+                let msg = match runtime.run_multi_agent_sleep_cycle(&mut mem, &progress_tx).await {
+                    Ok(summary) => format!("multi-agent sleep cycle complete: {}", summary.distilled),
+                    Err(err) => format!("multi-agent sleep cycle failed: {err}"),
+                };
+                let _ = done_tx.send((msg, mem));
+            });
+            loop {
+                tokio::select! {
+                    msg = progress_rx.recv() => {
+                        if let Some(msg) = msg {
+                            send_event(&mut write_half, ServerEvent::StatusLine(msg)).await?;
+                        }
+                    }
+                    result = &mut done_rx => {
+                        let (msg, memory_back) = result.expect("sleep task panicked");
+                        while let Ok(m) = progress_rx.try_recv() {
+                            send_event(&mut write_half, ServerEvent::StatusLine(m)).await?;
+                        }
+                        {
+                            let mut s = state.lock().await;
+                            s.memory = memory_back;
+                            let _ = s.memory.flush_all();
+                        }
+                        send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+                        break;
+                    }
+                }
             }
-            let msg = match result {
-                Ok(summary) => format!("multi-agent sleep cycle complete: {}", summary.distilled),
-                Err(err) => format!("multi-agent sleep cycle failed: {err}"),
-            };
-            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
         }
     }
 
