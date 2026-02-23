@@ -382,20 +382,69 @@ impl MemoryManager {
         self.record_inner(MemoryTier::UserProfile, value.to_string(), source).await
     }
 
-    /// Build a human-readable block of all UserProfile entries for prompt
-    /// injection.  Returns `None` when there are no profile entries.
-    pub fn user_profile_block(&self) -> Option<String> {
-        let entries = self.entries_by_tier(MemoryTier::UserProfile);
-        if entries.is_empty() {
+    /// Build a high-density relational matrix block for prompt injection.
+    ///
+    /// Merges `UserProfile` and `Reflective` entries into three compressed
+    /// buckets:
+    ///   `[USER: …]`        — facts and preferences about the user
+    ///   `[MY_BELIEFS: …]`  — agent's own opinions / worldview stances
+    ///   `[OUR_DYNAMIC: …]` — relationship tone, shared history, inside jokes
+    ///
+    /// Returns `None` when all buckets are empty.
+    pub fn relational_state_block(&self) -> Option<String> {
+        let mut user_facts: Vec<String> = Vec::new();
+        let mut agent_beliefs: Vec<String> = Vec::new();
+        let mut relationship_dynamics: Vec<String> = Vec::new();
+
+        let profile_entries  = self.entries_by_tier(MemoryTier::UserProfile);
+        let reflective_entries = self.entries_by_tier(MemoryTier::Reflective);
+
+        for entry in profile_entries.iter().chain(reflective_entries.iter()) {
+            let c = entry.content.to_lowercase();
+            let s = entry.source.to_lowercase();
+
+            if c.contains("belief") || c.contains("opinion") || c.contains("think")
+                || c.contains("feel about") || c.contains("my_belief")
+                || s.contains("belief") || s.contains("critic")
+                || c.starts_with("belief:") || c.starts_with("my_belief:")
+            {
+                // Compact: strip common prefixes the LLM writes
+                let cleaned = strip_tag_prefix(&entry.content, &["BELIEF:", "MY_BELIEF:", "OPINION:"]);
+                agent_beliefs.push(cleaned);
+            } else if c.contains("dynamic") || c.contains("relationship") || c.contains("joke")
+                || c.contains("rapport") || c.contains("our_dynamic") || c.contains("shared")
+                || s.contains("psychologist") || s.contains("relationship")
+                || c.starts_with("dynamic:") || c.starts_with("our_dynamic:")
+            {
+                let cleaned = strip_tag_prefix(&entry.content, &["DYNAMIC:", "OUR_DYNAMIC:", "RELATIONSHIP:"]);
+                relationship_dynamics.push(cleaned);
+            } else {
+                // Everything else is a user fact
+                user_facts.push(entry.content.clone());
+            }
+        }
+
+        if user_facts.is_empty() && agent_beliefs.is_empty() && relationship_dynamics.is_empty() {
             return None;
         }
-        Some(
-            entries
-                .iter()
-                .map(|e| format!("- {}", e.content))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+
+        let fmt = |label: &str, items: &[String]| -> String {
+            if items.is_empty() {
+                return String::new();
+            }
+            format!("[{}: {}]", label, items.join("; "))
+        };
+
+        let parts: Vec<String> = [
+            fmt("USER",        &user_facts),
+            fmt("MY_BELIEFS",  &agent_beliefs),
+            fmt("OUR_DYNAMIC", &relationship_dynamics),
+        ]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+
+        Some(parts.join("\n"))
     }
 
     // ── Follow-ups ─────────────────────────────────────────────────────────
@@ -659,6 +708,20 @@ impl MemoryManager {
         }
         ("the assistant".to_string(), "the user".to_string())
     }
+}
+
+/// Strip a recognised tag prefix (e.g. `"BELIEF:"`, `"MY_BELIEF:"`) from the
+/// front of `s` (case-insensitive), trimming surrounding whitespace.
+/// If none of the `prefixes` match, `s` is returned unchanged.
+fn strip_tag_prefix(s: &str, prefixes: &[&str]) -> String {
+    let s_upper = s.to_uppercase();
+    for prefix in prefixes {
+        let p = prefix.to_uppercase();
+        if s_upper.starts_with(&p) {
+            return s[p.len()..].trim().to_string();
+        }
+    }
+    s.to_string()
 }
 
 /// Retire all Core `MemoryEntry` records whose UUID starts with one of the

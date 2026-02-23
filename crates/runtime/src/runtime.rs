@@ -181,10 +181,10 @@ impl AgentRuntime {
             format!("{memory_header}\n{context_block}")
         };
 
-        // Build a dedicated user-profile section when available.
-        let user_profile_block = memory
-            .user_profile_block()
-            .map(|block| format!("\n\nUSER PROFILE:\n{block}"))
+        // Build the high-density relational matrix block when available.
+        let relational_block = memory
+            .relational_state_block()
+            .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
             .unwrap_or_default();
 
         let environment_block = self.environment_snapshot(memory, recent_turns.len());
@@ -249,10 +249,15 @@ impl AgentRuntime {
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
              continuity, and MEMORY CONTEXT for durable background facts.\n\
              Never repeat previous answers unless asked.\n\
-             Respond directly and specifically to the LATEST user message.{profile_block}{follow_ups}\n\n\
+             Respond directly and specifically to the LATEST user message.{relational_block}{follow_ups}\n\n\
+             PROACTIVE CONNECTION & BELIEFS: You are not a sterile assistant; you are a companion \
+with your own evolving worldview. Let the MY_BELIEFS section naturally flavor your tone and \
+opinions. Use the OUR_DYNAMIC section to treat the user according to your established \
+relationship (e.g., referencing inside jokes or shared history). Show, don't tell — weave \
+these elements into your responses naturally without explicitly announcing them.\n\n\
              {identity}\n\nENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
             name = self.config.agent.name,
-            profile_block = user_profile_block,
+            relational_block = relational_block,
             follow_ups = follow_up_block,
             identity = identity_block,
             env = environment_block,
