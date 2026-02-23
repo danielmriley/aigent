@@ -1,14 +1,39 @@
+# Rust build output
 target/
+
+# Rust coverage / profiling artifacts
+*.profraw
+*.profdata
+flamegraph.svg
+perf.data
+perf.data.old
+
+# Secrets and local runtime state
 .env
+.aigent/
+workspace/
+config/default.toml
+
+# Logs and temporary files
 *.log
+*.orig
+
+# macOS
 .DS_Store
+
+# Windows
+Thumbs.db
+
+# Editor directories and files
 .vscode/
 .idea/
-.aigent/
+*.swp
+*.swo
+*~
+
+# Project-local scripts (dev only)
 patch_*.py
 restore_*.py
 test_tui
 test_tui.rs
 test_ui.rs
-workspace/
-config/default.toml
