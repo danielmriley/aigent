@@ -190,26 +190,24 @@ impl AgentRuntime {
         // Only inject the PROACTIVE CONNECTION directive when the relational
         // matrix contains actual data — avoids referencing empty MY_BELIEFS /
         // OUR_DYNAMIC sections for new users (saves ~65 tokens per request).
-        let proactive_directive = if relational_block.is_empty() {
-            String::new()
+        // &'static str avoids allocating the directive string on every request.
+        let proactive_directive: &str = if relational_block.is_empty() {
+            ""
         } else {
             "\n\nPROACTIVE CONNECTION & BELIEFS: You are not a sterile assistant; you are a companion \
 with your own evolving worldview. Let the MY_BELIEFS section naturally flavor your tone and \
 opinions. Use the OUR_DYNAMIC section to treat the user according to your established \
 relationship (e.g., referencing inside jokes or shared history). Show, don't tell — weave \
-these elements into your responses naturally without explicitly announcing them.".to_string()
+these elements into your responses naturally without explicitly announcing them."
         };
 
         let environment_block = self.environment_snapshot(memory, recent_turns.len());
 
-        let recent_conversation = recent_turns
+        // Slice directly to the last 6 turns — avoids the double-collect
+        // (rev → take → cloned → collect → into_iter → rev) that was used before.
+        let start = recent_turns.len().saturating_sub(6);
+        let recent_conversation = recent_turns[start..]
             .iter()
-            .rev()
-            .take(6)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
             .enumerate()
             .map(|(index, turn)| {
                 format!(

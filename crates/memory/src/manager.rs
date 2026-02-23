@@ -416,18 +416,24 @@ impl MemoryManager {
                     &["dynamic:", "our_dynamic:", "relationship:"],
                 ));
             } else {
-                // Content-based fallback — lowercase only for ambiguous entries.
-                let c = entry.content.to_ascii_lowercase();
-                if c.contains("belief") || c.contains("opinion") || c.contains("think")
-                    || c.contains("feel about") || c.contains("my_belief")
+                // Content-based fallback — zero-alloc case-insensitive scan.
+                // "think" and "shared" are intentionally excluded: both are too
+                // broad and produce false positives on ordinary user-fact entries
+                // ("User likes to think carefully", "User shared their name").
+                if contains_icase(&entry.content, "belief")
+                    || contains_icase(&entry.content, "opinion")
+                    || contains_icase(&entry.content, "feel about")
+                    || contains_icase(&entry.content, "my_belief")
                 {
                     agent_beliefs.push(strip_tag_prefix_lower(
                         &entry.content,
                         &["belief:", "my_belief:", "opinion:"],
                     ));
-                } else if c.contains("dynamic") || c.contains("relationship")
-                    || c.contains("joke") || c.contains("rapport")
-                    || c.contains("our_dynamic") || c.contains("shared")
+                } else if contains_icase(&entry.content, "dynamic")
+                    || contains_icase(&entry.content, "relationship")
+                    || contains_icase(&entry.content, "joke")
+                    || contains_icase(&entry.content, "rapport")
+                    || contains_icase(&entry.content, "our_dynamic")
                 {
                     relationship_dynamics.push(strip_tag_prefix_lower(
                         &entry.content,
@@ -736,13 +742,25 @@ impl MemoryManager {
     }
 }
 
-/// Strip a recognised tag prefix (e.g. `"BELIEF:"`, `"MY_BELIEF:"`) from the
-/// front of `s` (case-insensitive), trimming surrounding whitespace.
-/// If none of the `prefixes` match, `s` is returned unchanged.
+/// Case-insensitive substring search with zero heap allocation.
+/// Scans `haystack` bytes using `eq_ignore_ascii_case`.
+#[inline]
+fn contains_icase(haystack: &str, needle: &str) -> bool {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 /// Strip a leading tag prefix from `s`, matching case-insensitively.
 /// `prefixes` must be **lowercase ASCII** (e.g. `"belief:"`).  Only the first
-/// 25 bytes of `s` are lowercased for comparison — the rest of the string is
-/// returned verbatim — avoiding a full-length heap copy on long entries.
+/// 25 bytes of `s` are lowercased for comparison — the rest is returned
+/// verbatim — avoiding a full-length heap copy on long entries.
 fn strip_tag_prefix_lower(s: &str, prefixes: &[&str]) -> String {
     let window_len = s.len().min(25);
     // to_ascii_lowercase() on a short slice is cheap (stack-friendly for ≤ 25 B).
