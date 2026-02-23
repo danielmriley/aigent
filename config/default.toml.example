@@ -1,12 +1,15 @@
+# Copy this file to config/default.toml and customise for your setup.
+# Run `aigent onboard` to have the wizard fill it in interactively.
+
 [agent]
-name = "Zenith"
-user_name = "Daniel"
-workspace_path = "/home/daniel/Projects/aigent/./workspace"
+name = "Aigent"
+user_name = ""
+workspace_path = "./workspace"
 thinking_level = "balanced"
 
 [llm]
 provider = "ollama"
-ollama_model = "gemma3:12b"
+ollama_model = "llama3.1:8b"
 openrouter_model = "openai/gpt-4o-mini"
 ollama_local_first = true
 ollama_base_url = "http://localhost:11434"
@@ -16,24 +19,24 @@ backend = "eventlog"
 auto_sleep_minutes = 120
 auto_sleep_turn_interval = 6
 auto_sleep_mode = "nightly"
-night_sleep_start_hour = 23
-night_sleep_end_hour = 4
+night_sleep_start_hour = 22
+night_sleep_end_hour = 6
 core_rewrite_requires_approval = true
 multi_agent_sleep_batch_size = 60
 
 [safety]
 approval_required = true
-allow_shell = true
-allow_wasm = true
+allow_shell = false
+allow_wasm = false
 
 [telemetry]
 log_level = "info"
 
 [onboarding]
-completed = true
+completed = false
 
 [integrations]
-telegram_enabled = true
+telegram_enabled = false
 
 [daemon]
 socket_path = "/tmp/aigent.sock"

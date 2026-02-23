@@ -1,5 +1,4 @@
 target/
-Cargo.lock
 .env
 *.log
 .DS_Store
@@ -12,3 +11,4 @@ test_tui
 test_tui.rs
 test_ui.rs
 workspace/
+config/default.toml
