@@ -22,7 +22,7 @@ pub struct ConversationTurn {
     pub assistant: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AgentRuntime {
     pub config: AppConfig,
     llm: LlmRouter,
@@ -95,13 +95,13 @@ impl AgentRuntime {
         };
 
         // Persist the user turn immediately so it survives a restart.
-        memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input")?;
+        memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input").await?;
 
         // Improvement 1: extract structured profile signals from the user message
         // immediately, without waiting for the nightly sleep cycle.
         let profile_signals = crate::micro_profile::extract_inline_profile_signals(user_message);
         for (key, value, category) in &profile_signals {
-            if let Err(err) = memory.record_user_profile_keyed(key, value, category) {
+            if let Err(err) = memory.record_user_profile_keyed(key, value, category).await {
                 warn!(?err, key, "micro-profile signal failed");
             }
         }
@@ -144,8 +144,20 @@ impl AgentRuntime {
             "memory state before context assembly"
         );
 
+        // Compute the query embedding off the async thread so the Tokio runtime
+        // is never blocked by a synchronous HTTP call to the embedding backend.
+        let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
+            let msg = user_message.to_string();
+            tokio::task::spawn_blocking(move || embed_fn(&msg))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         // Retrieve ranked context (Core + UserProfile + Reflective always included).
-        let context = memory.context_for_prompt_ranked(user_message, 10);
+        let context = memory.context_for_prompt_ranked_with_embed(user_message, 10, query_embedding);
         debug!(context_items = context.len(), "assembled memory context");
 
         let context_block = context
@@ -174,22 +186,33 @@ impl AgentRuntime {
             format!("{memory_header}\n{context_block}")
         };
 
-        // Build a dedicated user-profile section when available.
-        let user_profile_block = memory
-            .user_profile_block()
-            .map(|block| format!("\n\nUSER PROFILE:\n{block}"))
+        // Build the high-density relational matrix block when available.
+        let relational_block = memory
+            .relational_state_block()
+            .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
             .unwrap_or_default();
+
+        // Only inject the PROACTIVE CONNECTION directive when the relational
+        // matrix contains actual data — avoids referencing empty MY_BELIEFS /
+        // OUR_DYNAMIC sections for new users (saves ~65 tokens per request).
+        // &'static str avoids allocating the directive string on every request.
+        let proactive_directive: &str = if relational_block.is_empty() {
+            ""
+        } else {
+            "\n\nPROACTIVE CONNECTION & BELIEFS: You are not a sterile assistant; you are a companion \
+with your own evolving worldview. Let the MY_BELIEFS section naturally flavor your tone and \
+opinions. Use the OUR_DYNAMIC section to treat the user according to your established \
+relationship (e.g., referencing inside jokes or shared history). Show, don't tell — weave \
+these elements into your responses naturally without explicitly announcing them."
+        };
 
         let environment_block = self.environment_snapshot(memory, recent_turns.len());
 
-        let recent_conversation = recent_turns
+        // Slice directly to the last 6 turns — avoids the double-collect
+        // (rev → take → cloned → collect → into_iter → rev) that was used before.
+        let start = recent_turns.len().saturating_sub(6);
+        let recent_conversation = recent_turns[start..]
             .iter()
-            .rev()
-            .take(6)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
             .enumerate()
             .map(|(index, turn)| {
                 format!(
@@ -242,11 +265,12 @@ impl AgentRuntime {
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
              continuity, and MEMORY CONTEXT for durable background facts.\n\
              Never repeat previous answers unless asked.\n\
-             Respond directly and specifically to the LATEST user message.{profile_block}{follow_ups}\n\n\
+             Respond directly and specifically to the LATEST user message.{relational_block}{follow_ups}{proactive_directive}\n\n\
              {identity}\n\nENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
             name = self.config.agent.name,
-            profile_block = user_profile_block,
+            relational_block = relational_block,
             follow_ups = follow_up_block,
+            proactive_directive = proactive_directive,
             identity = identity_block,
             env = environment_block,
             conv = conversation_block,
@@ -274,14 +298,14 @@ impl AgentRuntime {
             MemoryTier::Episodic,
             truncate_for_prompt(&reply, 1024),
             format!("assistant-reply:model={}", self.config.active_model()),
-        ) {
+        ).await {
             warn!(?err, "failed to persist assistant reply to episodic memory");
         }
 
         // Consume any follow-ups that were injected into this turn's prompt.
         if !pending_follow_ups.is_empty() {
             let ids: Vec<Uuid> = pending_follow_ups.iter().map(|(id, _)| *id).collect();
-            if let Err(err) = memory.consume_follow_ups(&ids) {
+            if let Err(err) = memory.consume_follow_ups(&ids).await {
                 warn!(?err, "failed to consume delivered follow-up entries");
             } else {
                 debug!(count = ids.len(), "follow-up entries consumed after delivery");
@@ -296,13 +320,18 @@ impl AgentRuntime {
     ///
     /// Falls back to passive-only distillation if the LLM call fails.
     #[instrument(skip(self, memory))]
-    pub async fn run_agentic_sleep_cycle(&self, memory: &mut MemoryManager) -> Result<SleepSummary> {
+    pub async fn run_agentic_sleep_cycle(
+        &self,
+        memory: &mut MemoryManager,
+        progress: &mpsc::UnboundedSender<String>,
+    ) -> Result<SleepSummary> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
         } else {
             Provider::Ollama
         };
 
+        let _ = progress.send("Reflecting on today's memories…".into());
         let prompt = memory.agentic_sleep_prompt();
         info!(prompt_len = prompt.len(), "agentic sleep: sending reflection prompt to LLM");
 
@@ -326,11 +355,12 @@ impl AgentRuntime {
                     insights.reflective_thoughts.len(),
                     insights.user_profile_updates.len(),
                 ));
-                memory.apply_agentic_sleep_insights(insights, summary_text)
+                let _ = progress.send("Applying insights to memory…".into());
+                memory.apply_agentic_sleep_insights(insights, summary_text).await
             }
             Err(err) => {
                 warn!(?err, "agentic sleep: LLM unavailable, falling back to passive distillation");
-                memory.run_sleep_cycle()
+                memory.run_sleep_cycle().await
             }
         }
     }
@@ -387,6 +417,7 @@ impl AgentRuntime {
     pub async fn run_multi_agent_sleep_cycle(
         &self,
         memory: &mut MemoryManager,
+        progress: &mpsc::UnboundedSender<String>,
     ) -> Result<SleepSummary> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
@@ -402,6 +433,11 @@ impl AgentRuntime {
             batch_size,
             "multi-agent sleep: starting consolidation"
         );
+        let _ = progress.send(format!(
+            "Starting multi-agent memory consolidation ({} batch{})…",
+            batches.len(),
+            if batches.len() == 1 { "" } else { "es" }
+        ));
 
         let bot_name = &self.config.agent.name;
         let user_name = &self.config.agent.user_name;
@@ -416,6 +452,11 @@ impl AgentRuntime {
                 entries = batch.len(),
                 "multi-agent sleep: processing batch"
             );
+            let _ = progress.send(format!(
+                "Batch {}/{}: consulting 4 specialist agents in parallel…",
+                batch_idx + 1,
+                batches.len()
+            ));
 
             let identity = memory.identity.clone();
 
@@ -450,6 +491,11 @@ impl AgentRuntime {
                             batch = batch_idx + 1,
                             "multi-agent sleep: specialist call failed — using single-agent fallback for this batch"
                         );
+                        let _ = progress.send(format!(
+                            "Batch {}/{}: specialist unavailable — using single-agent fallback…",
+                            batch_idx + 1,
+                            batches.len()
+                        ));
                         // Build the standard single-agent prompt for this batch's entries.
                         let fallback_prompt = aigent_memory::sleep::agentic_sleep_prompt(
                             batch,
@@ -521,6 +567,16 @@ impl AgentRuntime {
                 conflicts = conflicting_ids.len(),
                 "multi-agent sleep: running synthesis deliberation"
             );
+            let _ = progress.send(format!(
+                "Batch {}/{}: synthesising specialist reports{}…",
+                batch_idx + 1,
+                batches.len(),
+                if conflicting_ids.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} conflict{})", conflicting_ids.len(), if conflicting_ids.len() == 1 { "" } else { "s" })
+                }
+            ));
 
             let specialist_reports = vec![
                 (SpecialistRole::Archivist, arch_reply),
@@ -574,7 +630,8 @@ impl AgentRuntime {
 
         if !any_batch_succeeded {
             warn!("multi-agent sleep: all batches failed — falling back to single-agent sleep");
-            return self.run_agentic_sleep_cycle(memory).await;
+            let _ = progress.send("All batches failed — falling back to single-agent sleep…".into());
+            return self.run_agentic_sleep_cycle(memory, progress).await;
         }
 
         let final_insights = merge_insights(all_batch_insights);
@@ -585,6 +642,11 @@ impl AgentRuntime {
             profile_updates = final_insights.user_profile_updates.len(),
             "multi-agent sleep: applying merged insights"
         );
+        let _ = progress.send(format!(
+            "Applying merged insights — {} learned, {} reflections…",
+            final_insights.learned_about_user.len(),
+            final_insights.reflective_thoughts.len(),
+        ));
 
         let summary_text = Some(format!(
             "Multi-agent sleep: {} learned, {} follow-ups, {} reflections, {} profile updates ({} batches)",
@@ -595,13 +657,13 @@ impl AgentRuntime {
             batches.len(),
         ));
 
-        let result = memory.apply_agentic_sleep_insights(final_insights, summary_text)?;
+        let result = memory.apply_agentic_sleep_insights(final_insights, summary_text).await?;
         // Write a sentinel entry so the 22-hour rate-limit survives daemon restarts.
         let _ = memory.record(
             MemoryTier::Semantic,
             "multi-agent sleep cycle completed",
             "sleep:multi-agent-cycle",
-        );
+        ).await;
         Ok(result)
     }
 
@@ -685,6 +747,7 @@ mod tests {
 
     use aigent_config::AppConfig;
     use aigent_memory::MemoryManager;
+    use tokio::sync::mpsc;
 
     use crate::AgentRuntime;
 
@@ -708,7 +771,7 @@ mod tests {
         // construction code path without panicking or erroring.
         let runtime = AgentRuntime::new(AppConfig::default());
         let mut memory = MemoryManager::default();
-        memory.seed_core_identity("Alice", "Aigent")?;
+        memory.seed_core_identity("Alice", "Aigent").await?;
         // Set a distinctive style so we can assert it flows through the kernel.
         memory.identity.communication_style = "terse and technical".to_string();
         assert_eq!(memory.identity.communication_style, "terse and technical");
@@ -728,7 +791,7 @@ mod tests {
         // The key invariant: it must not panic in any case.
         let runtime = AgentRuntime::new(AppConfig::default());
         let mut memory = MemoryManager::default();
-        memory.seed_core_identity("Alice", "Aigent")?;
+        memory.seed_core_identity("Alice", "Aigent").await?;
 
         // Seed 10 Episodic entries to give the sleep cycle something to process.
         for i in 0..10 {
@@ -736,11 +799,12 @@ mod tests {
                 aigent_memory::MemoryTier::Episodic,
                 format!("test episodic memory entry number {i}"),
                 "test",
-            )?;
+            ).await?;
         }
 
         // Should complete without panicking regardless of LLM availability.
-        let result = runtime.run_multi_agent_sleep_cycle(&mut memory).await;
+        let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+        let result = runtime.run_multi_agent_sleep_cycle(&mut memory, &noop_tx).await;
         // Accept either Ok or Err — the important thing is no panic.
         match result {
             Ok(summary) => {

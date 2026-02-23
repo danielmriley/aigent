@@ -25,6 +25,7 @@ use crate::{
     widgets::{
         chat::{chat_visual_line_count, draw_chat, message_visual_line_start},
         input::draw_input,
+        markdown::render_markdown_lines,
         sidebar::draw_sidebar,
     },
 };
@@ -46,6 +47,7 @@ pub enum Focus {
 pub struct Message {
     pub role: String,
     pub content: String,
+    pub rendered_md: Option<Vec<ratatui::text::Line<'static>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,9 +77,15 @@ pub struct CommandPalette {
     pub commands: Vec<&'static str>,
 }
 
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 pub struct App {
     pub state: AppState,
     pub textarea: TextArea<'static>,
+    /// True while the daemon is formulating a reply.
+    pub is_thinking: bool,
+    /// True while a manual sleep cycle is running in the background.
+    pub is_sleeping: bool,
     pub backend_rx: mpsc::UnboundedReceiver<BackendEvent>,
     pub focus: Focus,
     pub theme: Theme,
@@ -122,6 +130,8 @@ impl App {
             auto_follow: true,
             show_sidebar: true,
             spinner_tick: 0,
+            is_thinking: false,
+            is_sleeping: false,
             pending_stream: String::new(),
             input_wrap_width: 60,
             workspace_files: collect_workspace_files(Path::new(".")),
@@ -138,6 +148,7 @@ impl App {
                     "/new",
                     "/switch",
                     "/memory",
+                    "/sleep",
                     "/doctor",
                     "/status",
                     "/context",
@@ -162,6 +173,7 @@ impl App {
         self.state.messages.push(Message {
             role: "user".to_string(),
             content: text,
+            rendered_md: None,
         });
     }
 
@@ -169,6 +181,7 @@ impl App {
         self.state.messages.push(Message {
             role: "assistant".to_string(),
             content: text,
+            rendered_md: None,
         });
     }
 
@@ -439,25 +452,39 @@ impl App {
                 self.state.messages.push(Message {
                     role: "assistant".to_string(),
                     content: format!("[stream]{}", self.pending_stream),
+                    rendered_md: None,
                 });
             }
             BackendEvent::Thinking => {
-                self.state.status = "thinking...".to_string();
+                self.is_thinking = true;
+                self.is_sleeping = false;
+                self.state.status = "thinking".to_string();
+            }
+            BackendEvent::SleepCycleRunning => {
+                self.is_sleeping = true;
+                self.is_thinking = false;
+                self.state.status = "sleep cycle running".to_string();
             }
             BackendEvent::Done => {
+                self.is_thinking = false;
+                self.is_sleeping = false;
                 self.state.status = "idle".to_string();
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
                         last.content = self.pending_stream.clone();
+                        last.rendered_md = Some(render_markdown_lines(&last.content));
                     }
                 }
                 self.pending_stream.clear();
             }
             BackendEvent::Error(err) => {
+                self.is_thinking = false;
+                self.is_sleeping = false;
                 self.state.status = format!("error: {err}");
                 self.state.messages.push(Message {
                     role: "assistant".to_string(),
                     content: format!("error: {err}"),
+                    rendered_md: None,
                 });
             }
             BackendEvent::MemoryUpdated => {
@@ -477,6 +504,7 @@ impl App {
                 self.state.messages.push(Message {
                     role: source,
                     content,
+                    rendered_md: None,
                 });
                 self.pending_stream.clear();
                 self.auto_follow = true;
@@ -500,9 +528,15 @@ impl App {
             ])
             .split(frame.area());
 
+        let status_display = if self.is_thinking || self.is_sleeping {
+            let frame = SPINNER_FRAMES[self.spinner_tick / 2 % SPINNER_FRAMES.len()];
+            format!("{} {}", frame, self.state.status)
+        } else {
+            self.state.status.clone()
+        };
         let header = Paragraph::new(Line::from(format!(
             "{} • {} • Ctrl+S sidebar • Esc history",
-            self.state.bot_name, self.state.status
+            self.state.bot_name, status_display
         )));
         frame.render_widget(header, outer[0]);
 

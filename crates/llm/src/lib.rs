@@ -18,10 +18,43 @@ pub trait LlmClient: Send + Sync {
     async fn chat_stream(&self, prompt: &str, tx: mpsc::Sender<String>) -> Result<String>;
 }
 
-#[derive(Debug)]
-pub struct OllamaClient;
-#[derive(Debug)]
-pub struct OpenRouterClient;
+#[derive(Debug, Clone)]
+pub struct OllamaClient {
+    client: reqwest::Client,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenRouterClient {
+    client: reqwest::Client,
+}
+
+impl OllamaClient {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for OllamaClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OpenRouterClient {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
+impl Default for OpenRouterClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Provider {
@@ -29,7 +62,7 @@ pub enum Provider {
     OpenRouter,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LlmRouter {
     ollama: OllamaClient,
     openrouter: OpenRouterClient,
@@ -132,8 +165,8 @@ pub async fn list_openrouter_models() -> Result<Vec<String>> {
 impl Default for LlmRouter {
     fn default() -> Self {
         Self {
-            ollama: OllamaClient,
-            openrouter: OpenRouterClient,
+            ollama: OllamaClient::new(),
+            openrouter: OpenRouterClient::new(),
         }
     }
 }
@@ -213,7 +246,7 @@ impl OllamaClient {
             "stream": false
         });
 
-        let client = reqwest::Client::new();
+        let client = self.client.clone();
         let response = client.post(endpoint).json(&payload).send().await;
 
         match response {
@@ -252,7 +285,7 @@ impl OllamaClient {
             "stream": true
         });
 
-        let client = reqwest::Client::new();
+        let client = self.client.clone();
         let mut response = client.post(endpoint).json(&payload).send().await?;
 
         let status = response.status();
@@ -300,7 +333,7 @@ impl OpenRouterClient {
         let api_key = std::env::var("OPENROUTER_API_KEY").ok();
         if let Some(api_key) = api_key {
             if !api_key.trim().is_empty() {
-                let client = reqwest::Client::new();
+                let client = self.client.clone();
                 let payload = json!({
                     "model": model,
                     "messages": [
@@ -350,7 +383,7 @@ impl OpenRouterClient {
         let api_key = std::env::var("OPENROUTER_API_KEY").ok();
         if let Some(api_key) = api_key {
             if !api_key.trim().is_empty() {
-                let client = reqwest::Client::new();
+                let client = self.client.clone();
                 let payload = json!({
                     "model": model,
                     "messages": [

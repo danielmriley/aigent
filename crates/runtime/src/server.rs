@@ -127,7 +127,7 @@ pub async fn run_unified_daemon(
             let user_name = config.agent.user_name.trim().to_string();
             let bot_name = config.agent.name.trim().to_string();
             if !user_name.is_empty() && !bot_name.is_empty() {
-                if let Err(err) = memory.seed_core_identity(&user_name, &bot_name) {
+                if let Err(err) = memory.seed_core_identity(&user_name, &bot_name).await {
                     warn!(?err, "daemon startup: failed to auto-seed core identity");
                 }
             } else {
@@ -194,7 +194,7 @@ pub async fn run_unified_daemon(
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
                         let mut s = compaction_state.lock().await;
-                        match s.memory.compact_episodic(7) {
+                        match s.memory.compact_episodic(7).await {
                             Ok(removed) if removed > 0 => {
                                 info!(removed, "background episodic compaction complete");
                             }
@@ -252,7 +252,7 @@ pub async fn run_unified_daemon(
                 last_passive_at = std::time::Instant::now();
                 let mut s = sleep_state.lock().await;
                 let mut memory = std::mem::take(&mut s.memory);
-                match memory.run_sleep_cycle() {
+                match memory.run_sleep_cycle().await {
                     Ok(ref summary) if !summary.promoted_ids.is_empty() => {
                         info!(
                             promoted = summary.promoted_ids.len(),
@@ -323,19 +323,30 @@ pub async fn run_unified_daemon(
                 }
 
                 // All guards passed — run the nightly multi-agent cycle.
-                let mut s = sleep_state.lock().await;
-                let mut memory = std::mem::take(&mut s.memory);
-                match s.runtime.run_multi_agent_sleep_cycle(&mut memory).await {
-                    Ok(ref summary) if !summary.distilled.is_empty() => {
-                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
-                        info!(summary = %summary.distilled, "background multi-agent sleep cycle complete");
+                // Clone runtime and take memory, then release lock before the
+                // LLM call so incoming connections are never blocked here.
+                let (rt_clone, mut memory) = {
+                    let mut s = sleep_state.lock().await;
+                    let rt = s.runtime.clone();
+                    let mem = std::mem::take(&mut s.memory);
+                    (rt, mem)
+                };
+                let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+                let result = rt_clone.run_multi_agent_sleep_cycle(&mut memory, &noop_tx).await;
+                {
+                    let mut s = sleep_state.lock().await;
+                    s.memory = memory;
+                    match result {
+                        Ok(ref summary) if !summary.distilled.is_empty() => {
+                            s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                            info!(summary = %summary.distilled, "background multi-agent sleep cycle complete");
+                        }
+                        Ok(_) => {
+                            s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                        }
+                        Err(ref err) => warn!(?err, "background multi-agent sleep cycle failed"),
                     }
-                    Ok(_) => {
-                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
-                    }
-                    Err(ref err) => warn!(?err, "background multi-agent sleep cycle failed"),
                 }
-                s.memory = memory;
             }
         });
     }
@@ -362,15 +373,21 @@ pub async fn run_unified_daemon(
 
     info!("daemon shutting down gracefully");
     {
-        let mut state = state.lock().await;
-        let _ = state.memory.flush_all();
-        // Run agentic sleep on shutdown for a final consolidation pass.
-        // Use std::mem::take to satisfy the borrow checker (runtime + memory
-        // cannot be borrowed simultaneously through the same struct).
-        let mut memory = std::mem::take(&mut state.memory);
-        let _ = state.runtime.run_agentic_sleep_cycle(&mut memory).await;
-        state.memory = memory;
-        let _ = state.memory.flush_all();
+        // Clone runtime and take memory while holding the lock, then release
+        // before the LLM call so incoming connections (e.g. from daemon restart)
+        // are not blocked indefinitely.
+        let (rt_clone, mut memory) = {
+            let mut s = state.lock().await;
+            let _ = s.memory.flush_all();
+            let rt = s.runtime.clone();
+            let mem = std::mem::take(&mut s.memory);
+            (rt, mem)
+        };
+        let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+        let _ = rt_clone.run_agentic_sleep_cycle(&mut memory, &noop_tx).await;
+        let mut s = state.lock().await;
+        s.memory = memory;
+        let _ = s.memory.flush_all();
     }
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
@@ -480,9 +497,10 @@ async fn handle_connection(
                                 == 0
                         {
                             // Use agentic sleep for richer consolidation.
-                            let sleep_result = state
+                            let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+                        let sleep_result = state
                                 .runtime
-                                .run_agentic_sleep_cycle(&mut memory)
+                                .run_agentic_sleep_cycle(&mut memory, &noop_tx)
                                 .await;
                             match sleep_result {
                                 Ok(summary) => extras.push(format!("sleep cycle: {}", summary.distilled)),
@@ -496,6 +514,8 @@ async fn handle_connection(
                 };
 
                 state.memory = memory;
+                // Sync the vault once per turn (deferred from per-record calls).
+                let _ = state.memory.flush_all();
                 outcome
             };
 
@@ -568,7 +588,7 @@ async fn handle_connection(
                         MemoryTier::Procedural,
                         outcome_text,
                         format!("tool-execution:{name}"),
-                    ) {
+                    ).await {
                         warn!(?err, tool = %name, "failed to record tool outcome to procedural memory");
                     }
                     send_event(
@@ -623,30 +643,89 @@ async fn handle_connection(
             send_event(&mut write_half, ServerEvent::Ack("pong".to_string())).await?;
         }
         ClientCommand::RunSleepCycle => {
-            let mut state = state.lock().await;
-            // Use mem::take to satisfy the borrow checker (runtime + memory
-            // cannot be borrowed simultaneously through the same struct).
-            let mut memory = std::mem::take(&mut state.memory);
-            let result = state.runtime.run_agentic_sleep_cycle(&mut memory).await;
-            state.memory = memory;
-            let _ = state.memory.flush_all();
-            let msg = match result {
-                Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
-                Err(err) => format!("sleep cycle failed: {err}"),
+            // Take memory out of state and release the lock before the LLM call.
+            // Spawn the cycle in a separate task so we can stream StatusLine
+            // progress events back to the client while it runs.
+            let (runtime, memory) = {
+                let mut s = state.lock().await;
+                let runtime = s.runtime.clone();
+                let memory = std::mem::take(&mut s.memory);
+                (runtime, memory)
             };
-            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+            let (done_tx, mut done_rx) =
+                tokio::sync::oneshot::channel::<(String, MemoryManager)>();
+            tokio::spawn(async move {
+                let mut mem = memory;
+                let msg = match runtime.run_agentic_sleep_cycle(&mut mem, &progress_tx).await {
+                    Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
+                    Err(err) => format!("sleep cycle failed: {err}"),
+                };
+                let _ = done_tx.send((msg, mem));
+            });
+            loop {
+                tokio::select! {
+                    msg = progress_rx.recv() => {
+                        if let Some(msg) = msg {
+                            send_event(&mut write_half, ServerEvent::StatusLine(msg)).await?;
+                        }
+                    }
+                    result = &mut done_rx => {
+                        let (msg, memory_back) = result.expect("sleep task panicked");
+                        while let Ok(m) = progress_rx.try_recv() {
+                            send_event(&mut write_half, ServerEvent::StatusLine(m)).await?;
+                        }
+                        {
+                            let mut s = state.lock().await;
+                            s.memory = memory_back;
+                            let _ = s.memory.flush_all();
+                        }
+                        send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+                        break;
+                    }
+                }
+            }
         }
         ClientCommand::RunMultiAgentSleepCycle => {
-            let mut state = state.lock().await;
-            let mut memory = std::mem::take(&mut state.memory);
-            let result = state.runtime.run_multi_agent_sleep_cycle(&mut memory).await;
-            state.memory = memory;
-            let _ = state.memory.flush_all();
-            let msg = match result {
-                Ok(summary) => format!("multi-agent sleep cycle complete: {}", summary.distilled),
-                Err(err) => format!("multi-agent sleep cycle failed: {err}"),
+            let (runtime, memory) = {
+                let mut s = state.lock().await;
+                let runtime = s.runtime.clone();
+                let memory = std::mem::take(&mut s.memory);
+                (runtime, memory)
             };
-            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
+            let (done_tx, mut done_rx) =
+                tokio::sync::oneshot::channel::<(String, MemoryManager)>();
+            tokio::spawn(async move {
+                let mut mem = memory;
+                let msg = match runtime.run_multi_agent_sleep_cycle(&mut mem, &progress_tx).await {
+                    Ok(summary) => format!("multi-agent sleep cycle complete: {}", summary.distilled),
+                    Err(err) => format!("multi-agent sleep cycle failed: {err}"),
+                };
+                let _ = done_tx.send((msg, mem));
+            });
+            loop {
+                tokio::select! {
+                    msg = progress_rx.recv() => {
+                        if let Some(msg) = msg {
+                            send_event(&mut write_half, ServerEvent::StatusLine(msg)).await?;
+                        }
+                    }
+                    result = &mut done_rx => {
+                        let (msg, memory_back) = result.expect("sleep task panicked");
+                        while let Ok(m) = progress_rx.try_recv() {
+                            send_event(&mut write_half, ServerEvent::StatusLine(m)).await?;
+                        }
+                        {
+                            let mut s = state.lock().await;
+                            s.memory = memory_back;
+                            let _ = s.memory.flush_all();
+                        }
+                        send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+                        break;
+                    }
+                }
+            }
         }
     }
 

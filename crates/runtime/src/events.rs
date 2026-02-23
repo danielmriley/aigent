@@ -19,6 +19,9 @@ pub enum BackendEvent {
     ToolCallStart(ToolCallInfo),
     ToolCallEnd(ToolResult),
     Thinking,
+    /// Emitted when a manual /sleep command is in progress so the TUI can
+    /// show a dedicated animated indicator without polluting the chat log.
+    SleepCycleRunning,
     Done,
     Error(String),
     MemoryUpdated,
