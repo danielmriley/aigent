@@ -142,7 +142,8 @@ impl LlmRouter {
     pub async fn chat_with_fallback(
         &self,
         primary: Provider,
-        model: &str,
+        ollama_model: &str,
+        openrouter_model: &str,
         prompt: &str,
     ) -> Result<(Provider, String)> {
         let should_force_fallback = prompt.to_lowercase().contains("/fallback");
@@ -150,15 +151,15 @@ impl LlmRouter {
         match primary {
             Provider::Ollama if !should_force_fallback => Ok((
                 Provider::Ollama,
-                self.ollama.chat_model(model, prompt).await?,
+                self.ollama.chat_model(ollama_model, prompt).await?,
             )),
             Provider::Ollama => Ok((
                 Provider::OpenRouter,
-                self.openrouter.chat_model(model, prompt).await?,
+                self.openrouter.chat_model(openrouter_model, prompt).await?,
             )),
             Provider::OpenRouter => Ok((
                 Provider::OpenRouter,
-                self.openrouter.chat_model(model, prompt).await?,
+                self.openrouter.chat_model(openrouter_model, prompt).await?,
             )),
         }
     }
@@ -166,7 +167,8 @@ impl LlmRouter {
     pub async fn chat_stream_with_fallback(
         &self,
         primary: Provider,
-        model: &str,
+        ollama_model: &str,
+        openrouter_model: &str,
         prompt: &str,
         tx: mpsc::Sender<String>,
     ) -> Result<(Provider, String)> {
@@ -175,15 +177,15 @@ impl LlmRouter {
         match primary {
             Provider::Ollama if !should_force_fallback => Ok((
                 Provider::Ollama,
-                self.ollama.chat_model_stream(model, prompt, tx).await?,
+                self.ollama.chat_model_stream(ollama_model, prompt, tx).await?,
             )),
             Provider::Ollama => Ok((
                 Provider::OpenRouter,
-                self.openrouter.chat_model_stream(model, prompt, tx).await?,
+                self.openrouter.chat_model_stream(openrouter_model, prompt, tx).await?,
             )),
             Provider::OpenRouter => Ok((
                 Provider::OpenRouter,
-                self.openrouter.chat_model_stream(model, prompt, tx).await?,
+                self.openrouter.chat_model_stream(openrouter_model, prompt, tx).await?,
             )),
         }
     }

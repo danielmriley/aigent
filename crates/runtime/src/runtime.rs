@@ -54,7 +54,12 @@ impl AgentRuntime {
 
         let (provider_used, reply) = self
             .llm
-            .chat_with_fallback(primary, self.config.active_model(), &prompt)
+            .chat_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+            )
             .await?;
 
         Ok(format!(
@@ -252,7 +257,13 @@ impl AgentRuntime {
         info!(provider = ?primary, model = %self.config.active_model(), "sending prompt to LLM");
         let (provider_used, reply) = self
             .llm
-            .chat_stream_with_fallback(primary, self.config.active_model(), &prompt, tx)
+            .chat_stream_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+                tx,
+            )
             .await?;
 
         info!(provider = ?provider_used, reply_len = reply.len(), "LLM reply received");
@@ -295,7 +306,16 @@ impl AgentRuntime {
         let prompt = memory.agentic_sleep_prompt();
         info!(prompt_len = prompt.len(), "agentic sleep: sending reflection prompt to LLM");
 
-        match self.llm.chat_with_fallback(primary, self.config.active_model(), &prompt).await {
+        match self
+            .llm
+            .chat_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+            )
+            .await
+        {
             Ok((_provider, reply)) => {
                 info!(reply_len = reply.len(), "agentic sleep: LLM reply received");
                 let insights = parse_agentic_insights(&reply);
@@ -325,7 +345,12 @@ impl AgentRuntime {
     ) -> Option<String> {
         match self
             .llm
-            .chat_with_fallback(primary, self.config.active_model(), prompt)
+            .chat_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                prompt,
+            )
             .await
         {
             Ok((_provider, reply)) => {

@@ -46,7 +46,12 @@ impl AgentRuntime {
 
         let (provider_used, reply) = self
             .llm
-            .chat_with_fallback(primary, self.config.active_model(), &prompt)
+            .chat_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+            )
             .await?;
 
         Ok(format!(
@@ -139,7 +144,13 @@ impl AgentRuntime {
 
         let (provider_used, reply) = self
             .llm
-            .chat_stream_with_fallback(primary, self.config.active_model(), &prompt, tx)
+            .chat_stream_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+                tx,
+            )
             .await?;
         memory.record(
             MemoryTier::Semantic,
