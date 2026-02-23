@@ -127,7 +127,7 @@ pub async fn run_unified_daemon(
             let user_name = config.agent.user_name.trim().to_string();
             let bot_name = config.agent.name.trim().to_string();
             if !user_name.is_empty() && !bot_name.is_empty() {
-                if let Err(err) = memory.seed_core_identity(&user_name, &bot_name) {
+                if let Err(err) = memory.seed_core_identity(&user_name, &bot_name).await {
                     warn!(?err, "daemon startup: failed to auto-seed core identity");
                 }
             } else {
@@ -194,7 +194,7 @@ pub async fn run_unified_daemon(
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {
                         let mut s = compaction_state.lock().await;
-                        match s.memory.compact_episodic(7) {
+                        match s.memory.compact_episodic(7).await {
                             Ok(removed) if removed > 0 => {
                                 info!(removed, "background episodic compaction complete");
                             }
@@ -252,7 +252,7 @@ pub async fn run_unified_daemon(
                 last_passive_at = std::time::Instant::now();
                 let mut s = sleep_state.lock().await;
                 let mut memory = std::mem::take(&mut s.memory);
-                match memory.run_sleep_cycle() {
+                match memory.run_sleep_cycle().await {
                     Ok(ref summary) if !summary.promoted_ids.is_empty() => {
                         info!(
                             promoted = summary.promoted_ids.len(),
@@ -323,19 +323,29 @@ pub async fn run_unified_daemon(
                 }
 
                 // All guards passed — run the nightly multi-agent cycle.
-                let mut s = sleep_state.lock().await;
-                let mut memory = std::mem::take(&mut s.memory);
-                match s.runtime.run_multi_agent_sleep_cycle(&mut memory).await {
-                    Ok(ref summary) if !summary.distilled.is_empty() => {
-                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
-                        info!(summary = %summary.distilled, "background multi-agent sleep cycle complete");
+                // Clone runtime and take memory, then release lock before the
+                // LLM call so incoming connections are never blocked here.
+                let (rt_clone, mut memory) = {
+                    let mut s = sleep_state.lock().await;
+                    let rt = s.runtime.clone();
+                    let mem = std::mem::take(&mut s.memory);
+                    (rt, mem)
+                };
+                let result = rt_clone.run_multi_agent_sleep_cycle(&mut memory).await;
+                {
+                    let mut s = sleep_state.lock().await;
+                    s.memory = memory;
+                    match result {
+                        Ok(ref summary) if !summary.distilled.is_empty() => {
+                            s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                            info!(summary = %summary.distilled, "background multi-agent sleep cycle complete");
+                        }
+                        Ok(_) => {
+                            s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                        }
+                        Err(ref err) => warn!(?err, "background multi-agent sleep cycle failed"),
                     }
-                    Ok(_) => {
-                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
-                    }
-                    Err(ref err) => warn!(?err, "background multi-agent sleep cycle failed"),
                 }
-                s.memory = memory;
             }
         });
     }
@@ -362,15 +372,20 @@ pub async fn run_unified_daemon(
 
     info!("daemon shutting down gracefully");
     {
-        let mut state = state.lock().await;
-        let _ = state.memory.flush_all();
-        // Run agentic sleep on shutdown for a final consolidation pass.
-        // Use std::mem::take to satisfy the borrow checker (runtime + memory
-        // cannot be borrowed simultaneously through the same struct).
-        let mut memory = std::mem::take(&mut state.memory);
-        let _ = state.runtime.run_agentic_sleep_cycle(&mut memory).await;
-        state.memory = memory;
-        let _ = state.memory.flush_all();
+        // Clone runtime and take memory while holding the lock, then release
+        // before the LLM call so incoming connections (e.g. from daemon restart)
+        // are not blocked indefinitely.
+        let (rt_clone, mut memory) = {
+            let mut s = state.lock().await;
+            let _ = s.memory.flush_all();
+            let rt = s.runtime.clone();
+            let mem = std::mem::take(&mut s.memory);
+            (rt, mem)
+        };
+        let _ = rt_clone.run_agentic_sleep_cycle(&mut memory).await;
+        let mut s = state.lock().await;
+        s.memory = memory;
+        let _ = s.memory.flush_all();
     }
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
@@ -451,70 +466,78 @@ async fn handle_connection(
                 }
             });
 
-            let outcome = {
-                let mut state = state.lock().await;
-                let recent = state.recent_turns.iter().cloned().collect::<Vec<_>>();
-                let last_turn_at = state.last_turn_at;
-                let mut memory = std::mem::take(&mut state.memory);
-                let reply_result = state
-                    .runtime
-                    .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
-                    .await;
-
-                let outcome = match reply_result {
-                    Ok(reply) => {
-                        state.last_turn_at = Some(Utc::now());
-                        state.recent_turns.push_back(ConversationTurn {
-                            user,
-                            assistant: reply,
-                        });
-                        while state.recent_turns.len() > 8 {
-                            let _ = state.recent_turns.pop_front();
-                        }
-                        state.turn_count += 1;
-
-                        let mut extras = Vec::new();
-                        if state.runtime.config.memory.auto_sleep_turn_interval > 0
-                            && state.turn_count
-                                % state.runtime.config.memory.auto_sleep_turn_interval
-                                == 0
-                        {
-                            // Use agentic sleep for richer consolidation.
-                            let sleep_result = state
-                                .runtime
-                                .run_agentic_sleep_cycle(&mut memory)
-                                .await;
-                            match sleep_result {
-                                Ok(summary) => extras.push(format!("sleep cycle: {}", summary.distilled)),
-                                Err(err) => warn!(?err, "auto agentic sleep cycle failed"),
-                            }
-                        }
-
-                        Ok(extras)
-                    }
-                    Err(err) => Err(err),
-                };
-
-                state.memory = memory;
-                outcome
+            // ── Lock-minimisation: take everything we need, then release
+            //   the lock *before* the LLM call so other commands (status,
+            //   peek, etc.) can be served concurrently.
+            let (runtime_clone, recent, last_turn_at, mut memory) = {
+                let mut s = state.lock().await;
+                let rt = s.runtime.clone();
+                let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
+                let lta = s.last_turn_at;
+                let mem = std::mem::take(&mut s.memory);
+                (rt, recent, lta, mem)
             };
+            // Lock is released here — LLM streaming runs without blocking it.
+
+            let reply_result = runtime_clone
+                .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
+                .await;
+
+            // Re-acquire to commit memory and update conversation state.
+            let auto_sleep_needed = {
+                let mut s = state.lock().await;
+                let should_sleep = match &reply_result {
+                    Ok(reply) => {
+                        s.last_turn_at = Some(Utc::now());
+                        s.recent_turns.push_back(ConversationTurn {
+                            user: user.clone(),
+                            assistant: reply.clone(),
+                        });
+                        while s.recent_turns.len() > 8 {
+                            let _ = s.recent_turns.pop_front();
+                        }
+                        s.turn_count += 1;
+                        s.runtime.config.memory.auto_sleep_turn_interval > 0
+                            && s.turn_count % s.runtime.config.memory.auto_sleep_turn_interval == 0
+                    }
+                    Err(_) => false,
+                };
+                // Per-entry vault note files are written incrementally in
+                // record_inner — no background flush needed here.
+                s.memory = memory;
+                should_sleep
+            };
+            // Lock released again.
+
+            // If auto-sleep is due, run it in a background task so the
+            // response reaches the client immediately.
+            if auto_sleep_needed {
+                let state_for_sleep = state.clone();
+                tokio::spawn(async move {
+                    let (rt, mut mem) = {
+                        let mut s = state_for_sleep.lock().await;
+                        (s.runtime.clone(), std::mem::take(&mut s.memory))
+                    };
+                    let result = rt.run_agentic_sleep_cycle(&mut mem).await;
+                    let mut s = state_for_sleep.lock().await;
+                    s.memory = mem;
+                    let _ = s.memory.flush_all();
+                    match result {
+                        Ok(summary) => info!(summary = %summary.distilled, "auto agentic sleep cycle complete"),
+                        Err(err) => warn!(?err, "auto agentic sleep cycle failed"),
+                    }
+                });
+            }
 
             let _ = streamer.await;
             let mut writer = writer.lock().await;
-            match outcome {
-                Ok(extras) => {
+            match reply_result {
+                Ok(_) => {
                     send_event(
                         &mut writer,
                         ServerEvent::Backend(BackendEvent::MemoryUpdated),
                     )
                     .await?;
-                    for extra in extras {
-                        send_event(
-                            &mut writer,
-                            ServerEvent::Backend(BackendEvent::Token(extra)),
-                        )
-                        .await?;
-                    }
                     send_event(&mut writer, ServerEvent::Backend(BackendEvent::Done)).await?;
                     if is_external {
                         let _ = event_tx.send(BackendEvent::Done);
@@ -568,7 +591,7 @@ async fn handle_connection(
                         MemoryTier::Procedural,
                         outcome_text,
                         format!("tool-execution:{name}"),
-                    ) {
+                    ).await {
                         warn!(?err, tool = %name, "failed to record tool outcome to procedural memory");
                     }
                     send_event(
@@ -619,13 +642,21 @@ async fn handle_connection(
             send_event(&mut write_half, ServerEvent::Ack("pong".to_string())).await?;
         }
         ClientCommand::RunSleepCycle => {
-            let mut state = state.lock().await;
-            // Use mem::take to satisfy the borrow checker (runtime + memory
-            // cannot be borrowed simultaneously through the same struct).
-            let mut memory = std::mem::take(&mut state.memory);
-            let result = state.runtime.run_agentic_sleep_cycle(&mut memory).await;
-            state.memory = memory;
-            let _ = state.memory.flush_all();
+            // Clone the runtime and take memory out while holding the lock,
+            // then *release* the lock before the LLM call so that incoming
+            // chat requests are not blocked for the full sleep duration.
+            let (runtime, mut memory) = {
+                let mut s = state.lock().await;
+                let runtime = s.runtime.clone();
+                let memory = std::mem::take(&mut s.memory);
+                (runtime, memory)
+            };
+            let result = runtime.run_agentic_sleep_cycle(&mut memory).await;
+            {
+                let mut s = state.lock().await;
+                s.memory = memory;
+                let _ = s.memory.flush_all();
+            }
             let msg = match result {
                 Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
                 Err(err) => format!("sleep cycle failed: {err}"),
@@ -633,11 +664,18 @@ async fn handle_connection(
             send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
         }
         ClientCommand::RunMultiAgentSleepCycle => {
-            let mut state = state.lock().await;
-            let mut memory = std::mem::take(&mut state.memory);
-            let result = state.runtime.run_multi_agent_sleep_cycle(&mut memory).await;
-            state.memory = memory;
-            let _ = state.memory.flush_all();
+            let (runtime, mut memory) = {
+                let mut s = state.lock().await;
+                let runtime = s.runtime.clone();
+                let memory = std::mem::take(&mut s.memory);
+                (runtime, memory)
+            };
+            let result = runtime.run_multi_agent_sleep_cycle(&mut memory).await;
+            {
+                let mut s = state.lock().await;
+                s.memory = memory;
+                let _ = s.memory.flush_all();
+            }
             let msg = match result {
                 Ok(summary) => format!("multi-agent sleep cycle complete: {}", summary.distilled),
                 Err(err) => format!("multi-agent sleep cycle failed: {err}"),

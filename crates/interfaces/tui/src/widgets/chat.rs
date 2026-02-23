@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
-use crate::{app::Message, theme::Theme, widgets::markdown::render_markdown_lines};
+use crate::{app::Message, theme::Theme};
 
 pub fn draw_chat(
     frame: &mut Frame<'_>,
@@ -124,7 +124,7 @@ fn build_chat_lines_with_starts(
                 Span::styled(message.content.clone(), body_style),
             ]));
         } else {
-            let rendered = render_markdown_lines(&message.content);
+            let rendered: &[Line<'static>] = message.rendered_md.as_deref().unwrap_or(&[]);
             if let Some(first) = rendered.first() {
                 lines.push(Line::from(vec![
                     Span::styled(format!("{}> ", assistant_label), prefix_style),

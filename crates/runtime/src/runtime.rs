@@ -22,7 +22,7 @@ pub struct ConversationTurn {
     pub assistant: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AgentRuntime {
     pub config: AppConfig,
     llm: LlmRouter,
@@ -90,13 +90,13 @@ impl AgentRuntime {
         };
 
         // Persist the user turn immediately so it survives a restart.
-        memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input")?;
+        memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input").await?;
 
         // Improvement 1: extract structured profile signals from the user message
         // immediately, without waiting for the nightly sleep cycle.
         let profile_signals = crate::micro_profile::extract_inline_profile_signals(user_message);
         for (key, value, category) in &profile_signals {
-            if let Err(err) = memory.record_user_profile_keyed(key, value, category) {
+            if let Err(err) = memory.record_user_profile_keyed(key, value, category).await {
                 warn!(?err, key, "micro-profile signal failed");
             }
         }
@@ -139,8 +139,20 @@ impl AgentRuntime {
             "memory state before context assembly"
         );
 
+        // Compute the query embedding off the async thread so the Tokio runtime
+        // is never blocked by a synchronous HTTP call to the embedding backend.
+        let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
+            let msg = user_message.to_string();
+            tokio::task::spawn_blocking(move || embed_fn(&msg))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         // Retrieve ranked context (Core + UserProfile + Reflective always included).
-        let context = memory.context_for_prompt_ranked(user_message, 10);
+        let context = memory.context_for_prompt_ranked_with_embed(user_message, 10, query_embedding);
         debug!(context_items = context.len(), "assembled memory context");
 
         let context_block = context
@@ -263,14 +275,14 @@ impl AgentRuntime {
             MemoryTier::Episodic,
             truncate_for_prompt(&reply, 1024),
             format!("assistant-reply:model={}", self.config.active_model()),
-        ) {
+        ).await {
             warn!(?err, "failed to persist assistant reply to episodic memory");
         }
 
         // Consume any follow-ups that were injected into this turn's prompt.
         if !pending_follow_ups.is_empty() {
             let ids: Vec<Uuid> = pending_follow_ups.iter().map(|(id, _)| *id).collect();
-            if let Err(err) = memory.consume_follow_ups(&ids) {
+            if let Err(err) = memory.consume_follow_ups(&ids).await {
                 warn!(?err, "failed to consume delivered follow-up entries");
             } else {
                 debug!(count = ids.len(), "follow-up entries consumed after delivery");
@@ -306,11 +318,11 @@ impl AgentRuntime {
                     insights.reflective_thoughts.len(),
                     insights.user_profile_updates.len(),
                 ));
-                memory.apply_agentic_sleep_insights(insights, summary_text)
+                memory.apply_agentic_sleep_insights(insights, summary_text).await
             }
             Err(err) => {
                 warn!(?err, "agentic sleep: LLM unavailable, falling back to passive distillation");
-                memory.run_sleep_cycle()
+                memory.run_sleep_cycle().await
             }
         }
     }
@@ -570,13 +582,13 @@ impl AgentRuntime {
             batches.len(),
         ));
 
-        let result = memory.apply_agentic_sleep_insights(final_insights, summary_text)?;
+        let result = memory.apply_agentic_sleep_insights(final_insights, summary_text).await?;
         // Write a sentinel entry so the 22-hour rate-limit survives daemon restarts.
         let _ = memory.record(
             MemoryTier::Semantic,
             "multi-agent sleep cycle completed",
             "sleep:multi-agent-cycle",
-        );
+        ).await;
         Ok(result)
     }
 
@@ -683,7 +695,7 @@ mod tests {
         // construction code path without panicking or erroring.
         let runtime = AgentRuntime::new(AppConfig::default());
         let mut memory = MemoryManager::default();
-        memory.seed_core_identity("Alice", "Aigent")?;
+        memory.seed_core_identity("Alice", "Aigent").await?;
         // Set a distinctive style so we can assert it flows through the kernel.
         memory.identity.communication_style = "terse and technical".to_string();
         assert_eq!(memory.identity.communication_style, "terse and technical");
@@ -703,7 +715,7 @@ mod tests {
         // The key invariant: it must not panic in any case.
         let runtime = AgentRuntime::new(AppConfig::default());
         let mut memory = MemoryManager::default();
-        memory.seed_core_identity("Alice", "Aigent")?;
+        memory.seed_core_identity("Alice", "Aigent").await?;
 
         // Seed 10 Episodic entries to give the sleep cycle something to process.
         for i in 0..10 {
@@ -711,7 +723,7 @@ mod tests {
                 aigent_memory::MemoryTier::Episodic,
                 format!("test episodic memory entry number {i}"),
                 "test",
-            )?;
+            ).await?;
         }
 
         // Should complete without panicking regardless of LLM availability.

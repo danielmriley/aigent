@@ -147,14 +147,14 @@ async fn main() -> Result<()> {
             let models = fetch_available_models().await;
             run_onboarding(&mut config, models)?;
             config.save_to("config/default.toml")?;
-            seed_identity_from_config(&config, &memory_log_path)?;
+            seed_identity_from_config(&config, &memory_log_path).await?;
             println!("{}", aigent_ui::tui::banner());
         }
         Commands::Configuration => {
             let models = fetch_available_models().await;
             run_configuration(&mut config, models)?;
             config.save_to("config/default.toml")?;
-            seed_identity_from_config(&config, &memory_log_path)?;
+            seed_identity_from_config(&config, &memory_log_path).await?;
             println!("configuration updated");
         }
         Commands::Start | Commands::Run => {
@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
         Commands::Memory { command } => match command {
             MemoryCommands::Wipe { layer, yes } => {
                 let mut memory = MemoryManager::with_event_log(memory_log_path)?;
-                run_memory_wipe(&mut memory, layer, yes)?;
+                run_memory_wipe(&mut memory, layer, yes).await?;
             }
             MemoryCommands::Stats => {
                 let memory = MemoryManager::with_event_log(memory_log_path)?;
@@ -234,13 +234,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn seed_identity_from_config(config: &AppConfig, memory_log_path: &Path) -> Result<()> {
+async fn seed_identity_from_config(config: &AppConfig, memory_log_path: &Path) -> Result<()> {
     if config.agent.user_name.trim().is_empty() || config.agent.name.trim().is_empty() {
         return Ok(());
     }
 
     let mut memory = MemoryManager::with_event_log(memory_log_path)?;
-    memory.seed_core_identity(&config.agent.user_name, &config.agent.name)?;
+    memory.seed_core_identity(&config.agent.user_name, &config.agent.name).await?;
     Ok(())
 }
 
@@ -452,8 +452,15 @@ async fn daemon_stop() -> Result<()> {
     let paths = daemon_paths();
     let client = DaemonClient::new(&config.daemon.socket_path);
 
-    if client.graceful_shutdown().await.is_ok() {
-        println!("daemon stop requested gracefully");
+    // Use a timeout so we don't hang indefinitely if the daemon is blocked
+    // (e.g. a background sleep cycle is holding the state lock).
+    let shutdown_timeout = Duration::from_secs(8);
+    match tokio::time::timeout(shutdown_timeout, client.graceful_shutdown()).await {
+        Ok(Ok(_)) => println!("daemon stop requested gracefully"),
+        Ok(Err(_)) => {} // daemon not reachable — treat as already stopped
+        Err(_) => {
+            println!("daemon did not acknowledge shutdown in time; forcing termination");
+        }
     }
 
     let Some(pid) = read_pid(&paths.pid_file)? else {
@@ -747,15 +754,23 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                     }
 
                     if line == "/sleep" {
-                        match daemon.run_sleep_cycle().await {
-                            Ok(msg) => {
-                                let _ = backend_tx.send(BackendEvent::Token(msg));
-                                let _ = backend_tx.send(BackendEvent::Done);
+                        // Spawn off the event loop so the TUI stays responsive
+                        // while the sleep-cycle LLM call runs (may take ~30 s).
+                        let daemon = daemon.clone();
+                        let backend_tx = backend_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = backend_tx.send(BackendEvent::SleepCycleRunning);
+                            match daemon.run_sleep_cycle().await {
+                                Ok(msg) => {
+                                    let _ = backend_tx.send(BackendEvent::Token(msg));
+                                    let _ = backend_tx.send(BackendEvent::Done);
+                                }
+                                Err(err) => {
+                                    let _ =
+                                        backend_tx.send(BackendEvent::Error(err.to_string()));
+                                }
                             }
-                            Err(err) => {
-                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
-                            }
-                        }
+                        });
                         return Ok(());
                     }
 
@@ -1035,7 +1050,7 @@ async fn collect_model_lines(provider: CliModelProvider) -> Result<Vec<String>> 
     Ok(lines)
 }
 
-fn run_memory_wipe(memory: &mut MemoryManager, layer: CliMemoryLayer, yes: bool) -> Result<()> {
+async fn run_memory_wipe(memory: &mut MemoryManager, layer: CliMemoryLayer, yes: bool) -> Result<()> {
     let targets = layer_to_tiers(layer);
     let total = memory.all().len();
     let target_count = if matches!(layer, CliMemoryLayer::All) {
@@ -1087,9 +1102,9 @@ fn run_memory_wipe(memory: &mut MemoryManager, layer: CliMemoryLayer, yes: bool)
     }
 
     let removed = if matches!(layer, CliMemoryLayer::All) {
-        memory.wipe_all()?
+        memory.wipe_all().await?
     } else {
-        memory.wipe_tiers(&targets)?
+        memory.wipe_tiers(&targets).await?
     };
 
     println!("memory wipe complete: removed {removed} entries");
@@ -1181,7 +1196,7 @@ fn run_phase_review_gate(
         .iter()
         .any(|entry| entry.source.starts_with("sleep:"));
     if !has_sleep_marker && !memory.all().is_empty() {
-        let _ = memory.run_sleep_cycle()?;
+        let _ = memory.run_sleep_cycle().await?;
     }
 
     let event_log = MemoryEventLog::new(memory_log_path);
