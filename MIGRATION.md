@@ -761,3 +761,153 @@ argument for the new data-path tools.  The only call site is in
 - [ ] `cargo test --workspace` — all pass
 - [ ] `aigent tool list` — 7 tools listed
 - [ ] `aigent tool call web_search query="Rust programming"` — returns results
+
+---
+
+## 2026-02-24 — Phase 4: Approval Modes, Git Rollback, Brave Search & WASM Groundwork
+
+### New features
+
+#### 1. Tool approval modes (`[tools] approval_mode`)
+
+A new top-level `[tools]` config section replaces the coarse
+`[safety] approval_required` boolean with a three-way enum:
+
+| Mode | Read-only tools | Write / shell | Notes |
+|------|-----------------|---------------|-------|
+| `safer` | prompt | prompt | max safety |
+| `balanced` | auto-approved | prompt | **new default** |
+| `autonomous` | auto-approved | auto-approved | workspace still sandboxed |
+
+The legacy `approval_required = true` flag still works but is now ignored
+when `approval_mode = "autonomous"`.
+
+**Action required**: add to `config/default.toml`:
+
+```toml
+[tools]
+approval_mode = "balanced"
+brave_api_key = ""
+git_auto_commit = false
+```
+
+Or copy from `config/default.toml.example`.
+
+#### 2. Git auto-commit (`git_auto_commit`)
+
+When `[tools] git_auto_commit = true`:
+
+1. The tool executor runs `git add -A && git commit` after every successful
+   `write_file` or `run_shell` invocation.
+2. Commit messages are `"Aigent tool: <name> — <detail>"`.
+3. The new `git_rollback` tool (8th built-in) calls `git revert HEAD --no-edit`
+   to undo the last automated change.
+
+During onboarding, if the workspace is not a git repository, `git init` is
+run automatically.  Silently skipped when git is not installed.
+
+#### 3. Brave Search API (`brave_api_key`)
+
+`web_search` now uses the [Brave Search API](https://api.search.brave.com/)
+when a key is configured:
+
+```toml
+[tools]
+brave_api_key = "YOUR_KEY_HERE"
+```
+
+Or set the `BRAVE_API_KEY` environment variable (takes precedence over the
+config file).  Falls back to DuckDuckGo Instant Answers when no key is set.
+
+#### 4. `git_rollback` tool
+
+New 8th built-in tool that can be invoked by the LLM or directly from the CLI:
+
+```bash
+aigent tool call git_rollback
+```
+
+Read-only from the approval-mode perspective — `balanced` auto-approves it.
+
+#### 5. WASM guest source templates (`extensions/tools-src/`)
+
+Rust source code for the three core tools compiled to `wasm32-wasip1`:
+
+- `extensions/tools-src/read-file/`
+- `extensions/tools-src/write-file/`
+- `extensions/tools-src/run-shell/`
+
+These are a **separate sub-workspace** (not compiled by `cargo build` at the
+root).  To build them:
+
+```sh
+rustup target add wasm32-wasip1
+cd extensions/tools-src && cargo build --release
+# outputs: target/wasm32-wasip1/release/{read_file,write_file,run_shell}.wasm
+```
+
+The host-side WasmTool loader (upcoming) will pick up `.wasm` files from
+`extensions/` at daemon startup, letting WASM tools coexist with or replace
+native Rust implementations.
+
+#### 6. WIT host API additions
+
+`extensions/wit/host.wit` gains four new host-provided functions:
+
+```wit
+export git-commit:        func(message: string) -> result<string, string>;
+export git-rollback-last: func() -> result<string, string>;
+export git-log-last:      func() -> result<string, string>;
+export secret-get:        func(name: string) -> result<string, string>;
+```
+
+These are available to WASM guest tools once the wasmtime host runtime is wired
+up.
+
+### `ExecutionPolicy` changes
+
+Two new fields added to `ExecutionPolicy` in `aigent-exec`:
+
+```rust
+pub approval_mode: ApprovalMode,  // ← new; replaces approval_required semantics
+pub git_auto_commit: bool,         // ← new
+```
+
+`build_execution_policy` in `server.rs` fills both from `config.tools`.
+
+### `default_registry` signature change
+
+`aigent_exec::default_registry` now takes a third argument:
+
+```rust
+// Before:
+default_registry(workspace_root: PathBuf, agent_data_dir: PathBuf) -> ToolRegistry
+
+// After:
+default_registry(workspace_root: PathBuf, agent_data_dir: PathBuf, brave_api_key: Option<String>) -> ToolRegistry
+```
+
+All call sites (tests and `server.rs`) must pass `None` or the resolved key.
+
+### Migration steps
+
+1. `cargo build --workspace` — 0 errors, 0 warnings.
+2. Add `[tools]` section to `config/default.toml` (see example above).
+3. Run `aigent daemon restart` to apply the new approval mode.
+4. **Optional**: set `brave_api_key` or `BRAVE_API_KEY` to enable richer search.
+5. **Optional**: set `git_auto_commit = true` and run `aigent onboard` (or
+   `git init <workspace>` manually) to enable rollback protection.
+6. Test: `aigent tool list` — should show 8 tools.
+7. Test: `aigent tool call git_rollback` — should report "workspace is not a
+   git repository" or revert the last commit if git is initialised.
+
+### Verification
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all pass
+- [ ] `aigent tool list` — 8 tools listed (includes `git_rollback`)
+- [ ] `aigent tool call web_search query="Rust programming"` — results returned
+- [ ] Set `approval_mode = "autonomous"`, call `aigent tool call write_file path="test.txt" content="hi"` — no prompt
+- [ ] Set `git_auto_commit = true`, call `write_file`, run `git log` — commit visible
+- [ ] Call `git_rollback` — commit reverted
+

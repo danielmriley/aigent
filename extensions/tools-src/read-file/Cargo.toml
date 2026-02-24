@@ -1,0 +1,12 @@
+[package]
+name = "read-file"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "read_file"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = { workspace = true }
+serde_json = { workspace = true }

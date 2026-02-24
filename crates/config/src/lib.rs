@@ -5,6 +5,29 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+// ── Tool approval mode ────────────────────────────────────────────────────────
+
+/// Controls how aggressively the agent asks for permission before running tools.
+///
+/// | Mode       | Behaviour                                                     |
+/// |------------|---------------------------------------------------------------|
+/// | `safer`    | Every tool invocation triggers an interactive approval prompt.|
+/// | `balanced` | Read-only tools run freely; write / shell / HTTP require approval. |
+/// | `autonomous` | No approval prompts (still workspace-sandboxed).           |
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    Safer,
+    Balanced,
+    Autonomous,
+}
+
+impl Default for ApprovalMode {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
@@ -120,6 +143,37 @@ impl Default for MemoryConfig {
     }
 }
 
+// ── Tools config ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolsConfig {
+    /// How aggressively the agent asks for approval before invoking tools.
+    /// See [`ApprovalMode`] for semantics.
+    pub approval_mode: ApprovalMode,
+    /// Brave Search API key.  When non-empty the `web_search` tool uses the
+    /// Brave Search REST API instead of DuckDuckGo Instant Answers.
+    /// Can also be set via `BRAVE_API_KEY` env var (env takes precedence).
+    pub brave_api_key: String,
+    /// Automatically run `git add -A && git commit` after every successful
+    /// `write_file` or `run_shell` tool call.  Requires git to be installed
+    /// and the workspace to be a git repository (or `git init` to have been
+    /// run during onboarding).
+    pub git_auto_commit: bool,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            approval_mode: ApprovalMode::Balanced,
+            brave_api_key: String::new(),
+            git_auto_commit: false,
+        }
+    }
+}
+
+// ── Safety config ─────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SafetyConfig {
@@ -201,6 +255,7 @@ pub struct AppConfig {
     pub llm: LlmConfig,
     pub memory: MemoryConfig,
     pub safety: SafetyConfig,
+    pub tools: ToolsConfig,
     pub telemetry: TelemetryConfig,
     pub onboarding: OnboardingConfig,
     pub integrations: IntegrationsConfig,
@@ -217,6 +272,13 @@ impl AppConfig {
         if let Ok(value) = env::var("OLLAMA_BASE_URL") {
             if !value.is_empty() {
                 config.llm.provider = "ollama".to_string();
+            }
+        }
+
+        // Brave API key env override (takes precedence over config file).
+        if let Ok(key) = env::var("BRAVE_API_KEY") {
+            if !key.is_empty() {
+                config.tools.brave_api_key = key;
             }
         }
 

@@ -1,3 +1,5 @@
+pub mod git;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -6,13 +8,19 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
+use aigent_config::ApprovalMode;
 use aigent_tools::{ToolOutput, ToolRegistry};
 
 // ── Execution Policy ─────────────────────────────────────────────────────────
 
-/// Built from `SafetyConfig` in aigent-config.
+/// Built from `SafetyConfig` + `ToolsConfig` in aigent-config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionPolicy {
+    /// Coarse approval mode — governs the default approval behaviour.
+    /// `approval_required` is retained for backward compatibility but is
+    /// ignored when `approval_mode` is `Autonomous`.
+    pub approval_mode: ApprovalMode,
+    /// Legacy flag — kept for config backward compat.  Prefer `approval_mode`.
     pub approval_required: bool,
     pub allow_shell: bool,
     pub allow_wasm: bool,
@@ -22,13 +30,18 @@ pub struct ExecutionPolicy {
     pub tool_allowlist: Vec<String>,
     /// Explicit deny-list of tool names.  Takes precedence over `tool_allowlist`.
     pub tool_denylist: Vec<String>,
-    /// Tools that bypass interactive approval even when `approval_required = true`.
+    /// Tools that bypass interactive approval regardless of `approval_mode`.
+    /// In `Balanced` mode these are automatically added to the read-only set.
     pub approval_exempt_tools: Vec<String>,
+    /// When `true` the executor calls `git add -A && git commit` after every
+    /// successful `write_file` or `run_shell` invocation.
+    pub git_auto_commit: bool,
 }
 
 impl Default for ExecutionPolicy {
     fn default() -> Self {
         Self {
+            approval_mode: ApprovalMode::Balanced,
             approval_required: true,
             allow_shell: false,
             allow_wasm: false,
@@ -41,6 +54,7 @@ impl Default for ExecutionPolicy {
                 "draft_email".to_string(),
                 "web_search".to_string(),
             ],
+            git_auto_commit: false,
         }
     }
 }
@@ -107,11 +121,11 @@ impl ToolExecutor {
             .get(tool_name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {tool_name}"))?;
 
-        // 2. Enforce capability gates
+        // 2. Enforce capability gates (deny-list / allow-list / shell guard)
         self.check_capability(tool_name)?;
 
-        // 3. Approval flow (if required)
-        if self.policy.approval_required {
+        // 3. Approval flow — governed by ApprovalMode
+        if self.requires_approval(tool_name) {
             let approved = self.request_approval(tool_name, args).await?;
             if !approved {
                 info!(tool = tool_name, "tool execution denied by user");
@@ -124,18 +138,69 @@ impl ToolExecutor {
 
         // 4. Run the tool
         info!(tool = tool_name, "executing tool");
-        tool.run(args).await
+        let result = tool.run(args).await?;
+
+        // 5. Git auto-commit after successful write operations
+        if result.success && self.policy.git_auto_commit {
+            const WRITE_TOOLS: &[&str] = &["write_file", "run_shell"];
+            if WRITE_TOOLS.contains(&tool_name) {
+                let detail = args
+                    .get("path")
+                    .or_else(|| args.get("command"))
+                    .map(|s| s.as_str())
+                    .unwrap_or("(unknown)");
+                if let Err(err) = git::git_auto_commit(
+                    &self.policy.workspace_root,
+                    tool_name,
+                    detail,
+                )
+                .await
+                {
+                    warn!(?err, tool = tool_name, "git auto-commit failed (non-fatal)");
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Returns `true` when this tool invocation needs interactive approval
+    /// based on the configured `ApprovalMode`.
+    ///
+    /// | Mode         | Needs approval                                          |
+    /// |--------------|---------------------------------------------------------|
+    /// | `Autonomous` | Never                                                   |
+    /// | `Balanced`   | Write / shell tools and anything not read-only          |
+    /// | `Safer`      | Every tool (unless explicitly exempt)                   |
+    fn requires_approval(&self, tool_name: &str) -> bool {
+        // Explicit exempt list always short-circuits.
+        if self.policy
+            .approval_exempt_tools
+            .contains(&tool_name.to_string())
+        {
+            return false;
+        }
+        match &self.policy.approval_mode {
+            ApprovalMode::Autonomous => false,
+            ApprovalMode::Balanced => {
+                // Read-only tools don't need approval.
+                const READ_ONLY: &[&str] = &[
+                    "read_file",
+                    "web_search",
+                    "calendar_add_event",
+                    "remind_me",
+                    "git_rollback",
+                ];
+                !READ_ONLY.contains(&tool_name)
+            }
+            ApprovalMode::Safer => true,
+        }
     }
 
     fn check_capability(&self, tool_name: &str) -> Result<()> {
-        match tool_name {
-            "run_shell" if !self.policy.allow_shell => {
-                bail!("shell execution is disabled by safety policy")
-            }
-            "read_file" | "write_file" if !self.policy.allow_shell && !self.policy.allow_wasm => {
-                bail!("file access is disabled by safety policy (requires allow_shell or allow_wasm)")
-            }
-            _ => {}
+        // Shell is only available when explicitly enabled in config.
+        if tool_name == "run_shell" && !self.policy.allow_shell {
+            bail!("shell execution is disabled by safety policy (set allow_shell = true)");
         }
         // Per-tool deny-list (takes precedence over allow-list).
         if self.policy.tool_denylist.contains(&tool_name.to_string()) {
@@ -228,8 +293,15 @@ pub fn ensure_within_workspace(workspace_root: &Path, target: &Path) -> Result<P
 
 // ── Convenience: create a default registry with built-in tools ───────────────
 
-pub fn default_registry(workspace_root: PathBuf, agent_data_dir: PathBuf) -> ToolRegistry {
-    use aigent_tools::builtins::{CalendarAddEventTool, DraftEmailTool, ReadFileTool, RemindMeTool, RunShellTool, WebSearchTool, WriteFileTool};
+pub fn default_registry(
+    workspace_root: PathBuf,
+    agent_data_dir: PathBuf,
+    brave_api_key: Option<String>,
+) -> ToolRegistry {
+    use aigent_tools::builtins::{
+        CalendarAddEventTool, DraftEmailTool, GitRollbackTool, ReadFileTool, RemindMeTool,
+        RunShellTool, WebSearchTool, WriteFileTool,
+    };
 
     let mut registry = ToolRegistry::default();
     registry.register(Box::new(ReadFileTool {
@@ -238,11 +310,24 @@ pub fn default_registry(workspace_root: PathBuf, agent_data_dir: PathBuf) -> Too
     registry.register(Box::new(WriteFileTool {
         workspace_root: workspace_root.clone(),
     }));
-    registry.register(Box::new(RunShellTool { workspace_root }));
-    registry.register(Box::new(CalendarAddEventTool { data_dir: agent_data_dir.clone() }));
-    registry.register(Box::new(WebSearchTool));
-    registry.register(Box::new(DraftEmailTool { data_dir: agent_data_dir.clone() }));
-    registry.register(Box::new(RemindMeTool { data_dir: agent_data_dir }));
+    registry.register(Box::new(RunShellTool {
+        workspace_root: workspace_root.clone(),
+    }));
+    registry.register(Box::new(CalendarAddEventTool {
+        data_dir: agent_data_dir.clone(),
+    }));
+    registry.register(Box::new(WebSearchTool {
+        brave_api_key: brave_api_key.clone(),
+    }));
+    registry.register(Box::new(DraftEmailTool {
+        data_dir: agent_data_dir.clone(),
+    }));
+    registry.register(Box::new(RemindMeTool {
+        data_dir: agent_data_dir,
+    }));
+    registry.register(Box::new(GitRollbackTool {
+        workspace_root,
+    }));
     registry
 }
 
@@ -277,7 +362,8 @@ mod tests {
         };
 
         let executor = ToolExecutor::new(policy);
-        let registry = default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"));
+        let registry =
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None);
 
         let mut args = HashMap::new();
         args.insert("command".to_string(), "echo hi".to_string());
@@ -297,13 +383,15 @@ mod tests {
         let policy = ExecutionPolicy {
             allow_shell: true,
             allow_wasm: true,
+            approval_mode: aigent_config::ApprovalMode::Autonomous,
             approval_required: false,
             workspace_root: workspace.clone(),
             ..ExecutionPolicy::default()
         };
 
         let executor = ToolExecutor::new(policy);
-        let registry = default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"));
+        let registry =
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None);
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), "hello.txt".to_string());

@@ -39,6 +39,22 @@ world host {
   export http-get: func(url: string) -> result<string, string>;
   export http-post: func(url: string, body: string, content-type: string) -> result<string, string>;
 
+  // ── Git integration ─────────────────────────────────────────
+  /// Commit all staged changes in the workspace with a standard message.
+  /// Returns the short SHA of the new commit on success.
+  export git-commit: func(message: string) -> result<string, string>;
+  /// Revert the most recent commit (git revert HEAD --no-edit).
+  /// Returns a human-readable summary on success.
+  export git-rollback-last: func() -> result<string, string>;
+  /// Return the one-line summary of the most recent commit, or an error
+  /// when the workspace has no commits.
+  export git-log-last: func() -> result<string, string>;
+
+  // ── Secrets store ────────────────────────────────────────────
+  /// Read a named secret from the workspace .secrets/ directory.
+  /// The host validates that the name is a safe filename component.
+  export secret-get: func(name: string) -> result<string, string>;
+
   // ── Guest must implement ────────────────────────────────────
   import spec: func() -> tool-spec;
   import run: func(params: list<tool-param>) -> tool-result;

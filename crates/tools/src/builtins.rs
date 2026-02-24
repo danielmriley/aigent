@@ -293,16 +293,24 @@ impl Tool for CalendarAddEventTool {
 
 // ── web_search ───────────────────────────────────────────────────────────────
 
-/// Queries the DuckDuckGo Instant Answer API (no key required) and returns
-/// the abstract text plus the top related topics.
-pub struct WebSearchTool;
+/// Searches the web and returns results.
+///
+/// When `brave_api_key` is set (or the `BRAVE_API_KEY` env var is non-empty)
+/// the [Brave Search API](https://api.search.brave.com/app/documentation/web-search)
+/// is used, providing higher-quality results.  Otherwise the tool falls back
+/// to the DuckDuckGo Instant Answers API (no key required).
+pub struct WebSearchTool {
+    /// Optional Brave Search API key.  Takes precedence over the env var
+    /// when both are set.  Set to `None` to always use DuckDuckGo.
+    pub brave_api_key: Option<String>,
+}
 
 #[async_trait]
 impl Tool for WebSearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_search".to_string(),
-            description: "Search the web using DuckDuckGo Instant Answers (no API key required).".to_string(),
+            description: "Search the web (Brave API when configured, DuckDuckGo otherwise).".to_string(),
             params: vec![
                 ToolParam {
                     name: "query".to_string(),
@@ -327,6 +335,80 @@ impl Tool for WebSearchTool {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
 
+        // Resolve the Brave API key: explicit field > env var > fallback to DDG.
+        let brave_key: Option<String> = self
+            .brave_api_key
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| std::env::var("BRAVE_API_KEY").ok().filter(|k| !k.trim().is_empty()));
+
+        if let Some(ref key) = brave_key {
+            self.search_brave(query, max_results, key).await
+        } else {
+            self.search_duckduckgo(query, max_results).await
+        }
+    }
+}
+
+impl WebSearchTool {
+    async fn search_brave(
+        &self,
+        query: &str,
+        max_results: usize,
+        api_key: &str,
+    ) -> Result<ToolOutput> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("aigent/0.1 (https://github.com/danielmriley/aigent)")
+            .build()?;
+
+        let resp = client
+            .get("https://api.search.brave.com/res/v1/web/search")
+            .query(&[("q", query), ("count", &max_results.to_string())])
+            .header("Accept", "application/json")
+            .header("Accept-Encoding", "gzip")
+            .header("X-Subscription-Token", api_key)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Brave Search API error {}: {}", status, body);
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(results) = json["web"]["results"].as_array() {
+            for item in results.iter().take(max_results) {
+                let title = item["title"].as_str().unwrap_or("").trim();
+                let url = item["url"].as_str().unwrap_or("").trim();
+                let desc = item["description"].as_str().unwrap_or("").trim();
+                if !title.is_empty() {
+                    parts.push(format!("{title}\n  {url}\n  {desc}"));
+                }
+            }
+        }
+
+        if parts.is_empty() {
+            Ok(ToolOutput {
+                success: true,
+                output: format!("No Brave Search results for: {query}"),
+            })
+        } else {
+            Ok(ToolOutput {
+                success: true,
+                output: parts.join("\n\n"),
+            })
+        }
+    }
+
+    async fn search_duckduckgo(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<ToolOutput> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .user_agent("aigent/0.1 (https://github.com/danielmriley/aigent)")
@@ -335,7 +417,7 @@ impl Tool for WebSearchTool {
         let resp = client
             .get("https://api.duckduckgo.com/")
             .query(&[
-                ("q", query.as_str()),
+                ("q", query),
                 ("format", "json"),
                 ("no_html", "1"),
                 ("skip_disambig", "1"),
@@ -515,5 +597,64 @@ impl Tool for RemindMeTool {
             success: true,
             output: format!("reminder added: '{text}'{when_note}"),
         })
+    }
+}
+
+// ── git_rollback ──────────────────────────────────────────────────────────────
+
+/// Reverts the most recent commit in the workspace using `git revert HEAD`.
+///
+/// Safe to call after any `write_file` or `run_shell` auto-commit to undo
+/// an accidental change.  Requires git to be installed and the workspace to
+/// be a git repository.
+pub struct GitRollbackTool {
+    pub workspace_root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for GitRollbackTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_rollback".to_string(),
+            description: "Revert the last automated git commit in the workspace (undo the most recent write_file or run_shell change). Requires git.".to_string(),
+            params: vec![],
+        }
+    }
+
+    async fn run(&self, _args: &HashMap<String, String>) -> Result<ToolOutput> {
+        if !self.workspace_root.join(".git").exists() {
+            return Ok(ToolOutput {
+                success: false,
+                output: "workspace is not a git repository; cannot roll back".to_string(),
+            });
+        }
+
+        let out = tokio::process::Command::new("git")
+            .args(["revert", "HEAD", "--no-edit"])
+            .env("GIT_AUTHOR_NAME", "Aigent")
+            .env("GIT_AUTHOR_EMAIL", "aigent@localhost")
+            .env("GIT_COMMITTER_NAME", "Aigent")
+            .env("GIT_COMMITTER_EMAIL", "aigent@localhost")
+            .current_dir(&self.workspace_root)
+            .output()
+            .await?;
+
+        if out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            Ok(ToolOutput {
+                success: true,
+                output: if msg.is_empty() {
+                    "Last commit reverted successfully.".to_string()
+                } else {
+                    msg
+                },
+            })
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Ok(ToolOutput {
+                success: false,
+                output: format!("git revert failed: {stderr}"),
+            })
+        }
     }
 }

@@ -259,9 +259,12 @@ Guest skills implement `spec()` and `run(params)`.
 | Inline reflection | ✅ Complete | Structured LLM call after every turn extracts beliefs + insights; streamed as events. |
 | Belief injection into prompts | ✅ Complete | Up to 10 active beliefs injected as `MY_BELIEFS:` block on every turn. |
 | Proactive mode (Task C) | ✅ Complete | Background task checks for proactive messages; respects DND window and configurable interval. Cooldown gate and graceful shutdown on daemon exit. |
-| Tool execution system | ✅ Complete | `read_file`, `write_file`, `run_shell`, `calendar_add_event`, `web_search`, `draft_email`, `remind_me`; workspace-sandboxed, per-tool allow/deny, approval-exempt safe tools. |
+| Tool execution system | ✅ Complete | `read_file`, `write_file`, `run_shell`, `calendar_add_event`, `web_search`, `draft_email`, `remind_me`, `git_rollback`; workspace-sandboxed, per-tool allow/deny. |
 | LLM-driven tool calling | ✅ Complete | Pre-turn tool intent check via structured LLM prompt; executes tool, records to Procedural memory, injects result before streaming response. |
-| WASM extension interface | ✅ Complete | WIT host API for guest skills (file I/O, shell, KV, HTTP). |
+| Tool approval modes | ✅ Complete | Three modes: `safer` (always ask), `balanced` (read-only free, default), `autonomous` (no prompts). Configurable via `[tools] approval_mode`. |
+| Git auto-commit | ✅ Complete | Automatic `git add -A && git commit` after every `write_file`/`run_shell`; `git_rollback` tool reverts last commit. |
+| Brave Search integration | ✅ Complete | `web_search` uses Brave API when `brave_api_key` is set; falls back to DuckDuckGo. |
+| WASM extension interface | ✅ Complete | WIT host API for guest skills (file I/O, shell, KV, HTTP, git). WASM guest sources for `read_file`, `write_file`, `run_shell` in `extensions/tools-src/`. |
 | Memory CLI commands | ✅ Complete | `stats` (incl. tool exec counts), `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
 | Tool CLI commands | ✅ Complete | `aigent tool list`, `aigent tool call <name> [key=value ...]`. |
 | Telegram command parity | ✅ Complete | Core commands available; all memory, proactive, and tool events routed correctly. |
@@ -342,6 +345,77 @@ Runtime files:
 - PID: `.aigent/runtime/daemon.pid`
 - Log: `.aigent/runtime/daemon.log`
 - Socket: `/tmp/aigent.sock` (configurable via `daemon.socket_path` in `config/default.toml`)
+
+## Safety & Trust Model
+
+Aigent is designed to run on your main machine with access to real files and
+network.  Three interlocking layers keep it safe:
+
+### 1 — Workspace sandbox
+
+Every file read and write is verified to be within `agent.workspace_path`
+before the syscall executes.  Path traversal (e.g. `../../etc/passwd`) is
+rejected with an error.  Shell commands run with the workspace as the current
+directory.
+
+### 2 — Approval modes
+
+Configured via `[tools] approval_mode` in `config/default.toml`:
+
+| Mode | Read-only tools | Write / shell | Default? |
+|------|-----------------|---------------|----------|
+| `safer` | ❓ Requires approval | ❓ Requires approval | No |
+| `balanced` | ✅ Auto-approved | ❓ Requires approval | **Yes** |
+| `autonomous` | ✅ Auto-approved | ✅ Auto-approved | No |
+
+**Read-only tools** (never affect the filesystem): `read_file`, `web_search`,
+`calendar_add_event`, `remind_me`, `git_rollback`.
+
+**Write / shell tools** (can modify the workspace): `write_file`, `run_shell`,
+`draft_email`.
+
+You can override behaviour per-tool with `tool_allowlist` / `tool_denylist` in
+`[safety]` and `approval_exempt_tools` for tools that should always be
+auto-approved regardless of mode.
+
+### 3 — Git rollback
+
+When `[tools] git_auto_commit = true`, every `write_file` and `run_shell` call
+that succeeds is immediately committed to the workspace git repository with
+the message `Aigent tool: <name> — <detail>`.  If the agent makes a mistake
+you can:
+
+```bash
+# Via CLI:
+aigent tool call git_rollback
+
+# Or directly:
+git -C <workspace> revert HEAD
+```
+
+During onboarding the wizard will `git init` the workspace if it is not already
+a git repository.
+
+### API keys & secrets
+
+External service keys (e.g. the Brave Search API key) live in
+`[tools] brave_api_key` in your config file, **or** in the `BRAVE_API_KEY`
+environmental variable (env takes precedence).  The agent will also look for
+keys in `<workspace>/.secrets/<name>` when the `secret-get` WASM host function
+is called.
+
+Never commit the `.secrets/` directory to version control — add it to
+`.gitignore` if your workspace is a git repository.
+
+### Future: platform sandboxing
+
+The next iteration will add host-side syscall filtering:
+- **Linux** — `seccomp` allow-list around every WASM host function
+- **macOS** — `sandbox` profile restricting filesystem access to the workspace
+  and network access to approved hosts
+
+These are currently stubbed in planning; the workspace and approval-mode
+sandboxing described above is active today.
 
 ## Development
 

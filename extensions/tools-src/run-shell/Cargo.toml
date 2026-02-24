@@ -1,0 +1,12 @@
+[package]
+name = "run-shell"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "run_shell"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = { workspace = true }
+serde_json = { workspace = true }

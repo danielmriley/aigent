@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "read-file",
+    "write-file",
+    "run-shell",
+]
+resolver = "2"
+
+# Build these crates with:
+#   rustup target add wasm32-wasip1
+#   cargo build --target wasm32-wasip1 --release
+#
+# The compiled .wasm files end up at:
+#   target/wasm32-wasip1/release/<tool-name>.wasm
+#
+# Copy them to extensions/ so the aigent runtime can load them:
+#   cp target/wasm32-wasip1/release/read_file.wasm ../../extensions/
+#   cp target/wasm32-wasip1/release/write_file.wasm ../../extensions/
+#   cp target/wasm32-wasip1/release/run_shell.wasm ../../extensions/
+#
+# The host-side WasmTool loader (coming in a future runtime PR) will pick up
+# .wasm files found in the extensions/ directory at daemon startup and register
+# them alongside (or replacing) the native Rust tool implementations.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+wit-bindgen = { version = "0.35", default-features = false, features = ["realloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

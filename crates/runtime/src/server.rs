@@ -83,6 +83,7 @@ impl DaemonState {
 fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
     let workspace_root = PathBuf::from(&config.agent.workspace_path);
     ExecutionPolicy {
+        approval_mode: config.tools.approval_mode.clone(),
         approval_required: config.safety.approval_required,
         allow_shell: config.safety.allow_shell,
         allow_wasm: config.safety.allow_wasm,
@@ -90,6 +91,7 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
         tool_allowlist: config.safety.tool_allowlist.clone(),
         tool_denylist: config.safety.tool_denylist.clone(),
         approval_exempt_tools: config.safety.approval_exempt_tools.clone(),
+        git_auto_commit: config.tools.git_auto_commit,
     }
 }
 
@@ -167,7 +169,11 @@ pub async fn run_unified_daemon(
     let policy = build_execution_policy(&config);
     let workspace_root = policy.workspace_root.clone();
     let agent_data_dir = std::path::Path::new(".aigent").to_path_buf();
-    let tool_registry = aigent_exec::default_registry(workspace_root, agent_data_dir);
+    let brave_api_key = {
+        let key = config.tools.brave_api_key.trim().to_string();
+        if key.is_empty() { None } else { Some(key) }
+    };
+    let tool_registry = aigent_exec::default_registry(workspace_root, agent_data_dir, brave_api_key);
     let tool_executor = ToolExecutor::new(policy);
 
     // Extract sleep scheduling config before `config` is moved into the runtime.

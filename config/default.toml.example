@@ -60,7 +60,32 @@ tool_denylist = []
 # The four safe built-in tools are exempt by default.
 approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search"]
 
-[telemetry]
+# ── Tool trust & action config ───────────────────────────────────────────────
+[tools]
+# How aggressively the agent asks for permission before running tools.
+#
+#   safer      — every tool requires interactive approval (great for first-time
+#                use or when the workspace contains sensitive files)
+#   balanced   — read-only tools (read_file, web_search, remind_me,
+#                calendar_add_event, git_rollback) run freely; write_file,
+#                run_shell, and draft_email require approval  ← DEFAULT
+#   autonomous — no approval prompts (still workspace-sandboxed and deny-listed)
+#
+# The legacy [safety] approval_required flag is ignored when this is not "safer".
+approval_mode = "balanced"
+
+# Brave Search API key.  When non-empty the web_search tool uses the Brave
+# Search REST API instead of DuckDuckGo Instant Answers.
+# Can also be set via the BRAVE_API_KEY environment variable.
+# Get a free key at https://api.search.brave.com/app/
+brave_api_key = ""
+
+# Automatically git-commit workspace changes after every successful write_file
+# or run_shell tool call.  Requires git to be installed.
+# (The workspace will be git-init'd automatically during onboarding if this is true.)
+git_auto_commit = false
+
+
 log_level = "info"
 
 [onboarding]

@@ -1,0 +1,12 @@
+[package]
+name = "write-file"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "write_file"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = { workspace = true }
+serde_json = { workspace = true }
