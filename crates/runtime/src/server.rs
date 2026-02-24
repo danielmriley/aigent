@@ -23,6 +23,19 @@ use crate::{
 /// Broadcast channel capacity. Old events are dropped when subscribers lag.
 const BROADCAST_CAP: usize = 256;
 
+/// Returns `true` when `now` (UTC) falls within the `[start_hour, end_hour)` window
+/// expressed in the given timezone.  Handles midnight-wrap correctly
+/// (e.g. 22 00 06 spans midnight and wraps around 0).
+fn is_in_window(now: DateTime<Utc>, tz: Tz, start_hour: u32, end_hour: u32) -> bool {
+    let hour = now.with_timezone(&tz).hour();
+    if start_hour <= end_hour {
+        hour >= start_hour && hour < end_hour
+    } else {
+        // Window wraps midnight (e.g. 22:00 – 06:00)
+        hour >= start_hour || hour < end_hour
+    }
+}
+
 struct DaemonState {
     runtime: AgentRuntime,
     memory: MemoryManager,
@@ -311,8 +324,13 @@ pub async fn run_unified_daemon(
                 }
 
                 last_passive_at = std::time::Instant::now();
-                let mut s = sleep_state.lock().await;
-                let mut memory = std::mem::take(&mut s.memory);
+                // Take memory out while briefly locked, then release the lock
+                // before the (potentially long) distillation call so incoming
+                // connections are never blocked here.
+                let mut memory = {
+                    let mut s = sleep_state.lock().await;
+                    std::mem::take(&mut s.memory)
+                };
                 match memory.run_sleep_cycle().await {
                     Ok(ref summary) if !summary.promoted_ids.is_empty() => {
                         info!(
@@ -330,7 +348,10 @@ pub async fn run_unified_daemon(
                         info!(pruned, forget_after_days, "lightweight forgetting applied during sleep");
                     }
                 }
-                s.memory = memory;
+                {
+                    let mut s = sleep_state.lock().await;
+                    s.memory = memory;
+                }
             }
         });
     }
@@ -358,13 +379,7 @@ pub async fn run_unified_daemon(
                 }
 
                 // Time-of-day guard: only consolidate in the quiet window.
-                let hour = Utc::now().with_timezone(&sleep_tz).hour();
-                let in_quiet_window = if sleep_quiet_start <= sleep_quiet_end {
-                    hour >= sleep_quiet_start && hour < sleep_quiet_end
-                } else {
-                    hour >= sleep_quiet_start || hour < sleep_quiet_end
-                };
-                if !in_quiet_window {
+                if !is_in_window(Utc::now(), sleep_tz, sleep_quiet_start, sleep_quiet_end) {
                     continue;
                 }
 
@@ -444,14 +459,8 @@ pub async fn run_unified_daemon(
                     continue;
                 }
 
-                // DND window guard.
-                let hour = Utc::now().with_timezone(&sleep_tz).hour();
-                let in_dnd = if proactive_dnd_start <= proactive_dnd_end {
-                    hour >= proactive_dnd_start && hour < proactive_dnd_end
-                } else {
-                    hour >= proactive_dnd_start || hour < proactive_dnd_end
-                };
-                if in_dnd {
+                // DND window guard — uses the same timezone as the sleep window.
+                if is_in_window(Utc::now(), sleep_tz, proactive_dnd_start, proactive_dnd_end) {
                     continue;
                 }
 
@@ -609,79 +618,94 @@ async fn handle_connection(
                 }
             });
 
-            let outcome = {
-                let mut state = state.lock().await;
-                let recent = state.recent_turns.iter().cloned().collect::<Vec<_>>();
-                let last_turn_at = state.last_turn_at;
-                let mut memory = std::mem::take(&mut state.memory);
-                let reply_result = state
-                    .runtime
-                    .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
-                    .await;
-
-                let outcome = match reply_result {
-                    Ok(reply) => {
-                        // Inline reflection: extract beliefs and insights from the exchange.
-                        let reflect_events = state.runtime
-                            .inline_reflect(&mut memory, &user, &reply)
-                            .await
-                            .unwrap_or_default();
-
-                        state.last_turn_at = Some(Utc::now());
-                        state.recent_turns.push_back(ConversationTurn {
-                            user,
-                            assistant: reply,
-                        });
-                        while state.recent_turns.len() > 8 {
-                            let _ = state.recent_turns.pop_front();
-                        }
-                        state.turn_count += 1;
-
-                        let mut extras = Vec::new();
-                        if state.runtime.config.memory.auto_sleep_turn_interval > 0
-                            && state.turn_count
-                                % state.runtime.config.memory.auto_sleep_turn_interval
-                                == 0
-                        {
-                            // Use agentic sleep for richer consolidation.
-                            let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-                            let sleep_result = state
-                                .runtime
-                                .run_agentic_sleep_cycle(&mut memory, &noop_tx)
-                                .await;
-                            match sleep_result {
-                                Ok(summary) => extras.push(format!("sleep cycle: {}", summary.distilled)),
-                                Err(err) => warn!(?err, "auto agentic sleep cycle failed"),
-                            }
-                        }
-
-                        Ok((extras, reflect_events))
-                    }
-                    Err(err) => Err(err),
-                };
-
-                state.memory = memory;
-                // Sync the vault once per turn (deferred from per-record calls).
-                let _ = state.memory.flush_all();
-                outcome
+            // Phase 1: take what we need from state and RELEASE THE LOCK before
+            // any LLM call.  This keeps GetStatus / GetMemoryPeek responsive
+            // while the turn is being processed.
+            let (rt_clone, mut memory, recent, last_turn_at) = {
+                let mut s = state.lock().await;
+                let rt = s.runtime.clone();
+                let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
+                let lta = s.last_turn_at;
+                let mem = std::mem::take(&mut s.memory);
+                (rt, mem, recent, lta)
+                // MutexGuard dropped — lock released here
             };
 
+            // LLM respond + inline reflect, both WITHOUT holding state lock.
+            let reply_result = rt_clone
+                .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
+                .await;
+            let reflect_events: Vec<BackendEvent> = match reply_result {
+                Ok(ref reply) => rt_clone
+                    .inline_reflect(&mut memory, &user, reply)
+                    .await
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            };
+
+            // Wait for the streaming task to finish flushing all tokens.
             let _ = streamer.await;
+
+            // Re-acquire lock to restore state and do bookkeeping.
+            let outcome: Result<Vec<BackendEvent>, anyhow::Error> = {
+                let mut s = state.lock().await;
+                // Always restore memory, even on error.
+                s.memory = memory;
+                let _ = s.memory.flush_all();
+
+                match reply_result {
+                    Ok(reply) => {
+                        s.last_turn_at = Some(Utc::now());
+                        s.recent_turns.push_back(ConversationTurn {
+                            user: user.clone(),
+                            assistant: reply,
+                        });
+                        while s.recent_turns.len() > 8 {
+                            let _ = s.recent_turns.pop_front();
+                        }
+                        s.turn_count += 1;
+
+                        // Spawn auto-sleep as a background task so it doesn't
+                        // add latency to the turn response.  Uses the same
+                        // take-release-restore pattern to avoid holding the lock
+                        // during an LLM call.
+                        if s.runtime.config.memory.auto_sleep_turn_interval > 0
+                            && s.turn_count % s.runtime.config.memory.auto_sleep_turn_interval == 0
+                        {
+                            let state2 = state.clone();
+                            let event_tx2 = s.event_tx.clone();
+                            tokio::spawn(async move {
+                                let (rt, mut mem) = {
+                                    let mut s = state2.lock().await;
+                                    (s.runtime.clone(), std::mem::take(&mut s.memory))
+                                };
+                                let _ = event_tx2.send(BackendEvent::SleepCycleRunning);
+                                let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+                                match rt.run_agentic_sleep_cycle(&mut mem, &noop_tx).await {
+                                    Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
+                                    Err(ref err) => warn!(?err, "auto-turn sleep failed"),
+                                }
+                                let mut s = state2.lock().await;
+                                s.memory = mem;
+                                let _ = s.memory.flush_all();
+                                let _ = event_tx2.send(BackendEvent::MemoryUpdated);
+                            });
+                        }
+
+                        Ok(reflect_events)
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+
             let mut writer = writer.lock().await;
             match outcome {
-                Ok((extras, reflect_events)) => {
+                Ok(reflect_events) => {
                     send_event(
                         &mut writer,
                         ServerEvent::Backend(BackendEvent::MemoryUpdated),
                     )
                     .await?;
-                    for extra in extras {
-                        send_event(
-                            &mut writer,
-                            ServerEvent::Backend(BackendEvent::Token(extra)),
-                        )
-                        .await?;
-                    }
                     // Stream reflection events to the current client and all subscribers.
                     for ev in reflect_events {
                         let _ = send_event(&mut writer, ServerEvent::Backend(ev.clone())).await;
@@ -880,6 +904,8 @@ async fn handle_connection(
             }
         }
         ClientCommand::TriggerProactive => {
+            // Take memory and clone runtime BEFORE releasing the lock, so the
+            // LLM call runs without holding state.
             let (rt_clone, mut memory) = {
                 let mut s = state.lock().await;
                 let rt = s.runtime.clone();

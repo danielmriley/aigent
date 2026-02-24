@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use aigent_runtime::{BackendEvent, DaemonClient};
 use aigent_llm::{list_ollama_models, list_openrouter_models};
@@ -218,7 +219,29 @@ async fn handle_telegram_input(
                 return Ok(format!("error: {err}"));
             }
             BackendEvent::Done => break,
-            _ => {}
+            // Lifecycle / meta events — safe to ignore in a per-request
+            // Telegram response context (not a persistent subscriber).
+            BackendEvent::Thinking
+            | BackendEvent::SleepCycleRunning
+            | BackendEvent::MemoryUpdated
+            | BackendEvent::ToolCallStart(_)
+            | BackendEvent::ToolCallEnd(_)
+            | BackendEvent::ExternalTurn { .. } => {}
+            // Phase-2 events: log at debug level.  These arrive when inline
+            // reflection adds beliefs or insights after the turn.  The Telegram
+            // handler does not render them inline (they reach Telegram users via
+            // the broadcast Subscribe channel).
+            BackendEvent::ReflectionInsight(ref insight) => {
+                debug!(insight, "telegram: reflection insight received");
+            }
+            BackendEvent::BeliefAdded { ref claim, confidence } => {
+                debug!(claim, confidence, "telegram: belief added");
+            }
+            BackendEvent::ProactiveMessage { ref content } => {
+                // Proactive messages on a per-request stream are unexpected;
+                // they normally arrive via the background broadcast channel.
+                debug!(len = content.len(), "telegram: unexpected proactive message on request stream");
+            }
         }
     }
     // Propagate IPC-level errors from stream_submit.

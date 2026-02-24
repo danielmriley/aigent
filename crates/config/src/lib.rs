@@ -86,6 +86,10 @@ pub struct MemoryConfig {
     pub proactive_dnd_start_hour: u8,
     /// Do-not-disturb window end hour in local time.
     pub proactive_dnd_end_hour: u8,
+    /// Maximum number of beliefs to inject into each conversation prompt.
+    /// Beliefs are sorted by confidence (desc) before truncation.
+    /// `0` means unlimited (not recommended for long-running agents).
+    pub max_beliefs_in_prompt: usize,
 }
 
 impl Default for MemoryConfig {
@@ -106,6 +110,7 @@ impl Default for MemoryConfig {
             proactive_interval_minutes: 0,
             proactive_dnd_start_hour: 22,
             proactive_dnd_end_hour: 8,
+            max_beliefs_in_prompt: 5,
         }
     }
 }

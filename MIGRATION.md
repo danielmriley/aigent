@@ -569,3 +569,59 @@ client.get_proactive_stats().await -> Result<ProactiveStatsPayload>
 
 - [ ] `cargo build --workspace` — 0 errors, 0 warnings
 - [ ] `cargo test --workspace` — all pass
+
+---
+
+## 2026-02-23 — Cleanup Round (daemon concurrency, DND timezone, belief cap, exhaustive events)
+
+### Concurrency safety in `SubmitTurn` and background tasks
+
+The `SubmitTurn` IPC handler previously held the `DaemonState` mutex for the
+entire duration of the LLM call (sometimes 30+ seconds).  This blocked
+`GetStatus`, `GetMemoryPeek`, the vault watcher, and any other concurrent
+connection.  Task A (passive distillation) had the same issue.
+
+**Fix applied**: all long-running LLM / distillation operations now follow the
+consistent pattern already established by `RunSleepCycle` and `RunMultiAgentSleepCycle`:
+1. Acquire the lock briefly, clone the runtime, take the `MemoryManager`, release the lock.
+2. Do the LLM work without holding any lock.
+3. Re-acquire the lock to restore `MemoryManager` and update bookkeeping.
+
+The per-turn auto-sleep is now a fire-and-forget `tokio::spawn` so it never
+blocks the response to the client.
+
+No user-visible behavior change; `respond_and_remember_stream`, `inline_reflect`,
+and all public APIs are unchanged.
+
+### DND / quiet-window helper
+
+Extracted a shared `is_in_window(now, tz, start_hour, end_hour) -> bool` helper
+that is used by both Task B (nightly multi-agent quiet window) and Task C
+(proactive DND window).  This eliminates a duplicate midnight-wrap calculation
+and makes both windows respect the same `[memory] timezone` config key.
+
+### Belief injection cap (`max_beliefs_in_prompt`)
+
+A new `[memory]` key controls how many beliefs are injected into each prompt:
+
+```toml
+[memory]
+max_beliefs_in_prompt = 5   # default; 0 = unlimited
+```
+
+Beliefs are sorted by confidence (descending) before the cap is applied so the
+most strongly-held beliefs always survive truncation.  Add this key to your
+`config/default.toml` to keep your prompt size under control as beliefs accumulate.
+
+### Exhaustive `BackendEvent` handling in Telegram
+
+The Telegram response handler's `_ => {}` wildcard was replaced with explicit
+match arms for every `BackendEvent` variant.  The new Phase-2 variants
+(`ReflectionInsight`, `BeliefAdded`, `ProactiveMessage`) are logged at
+`debug` level; all lifecycle/meta events remain no-ops in the per-request
+response path (they are still delivered to persistent `Subscribe` connections).
+
+### Verification
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all pass

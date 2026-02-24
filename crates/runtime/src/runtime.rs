@@ -264,14 +264,19 @@ these elements into your responses naturally without explicitly announcing them.
         };
 
         // Inject current beliefs so the LLM can express a genuine worldview.
+        // Cap to `max_beliefs_in_prompt` (sorted by confidence desc) to prevent
+        // context-window bloat as beliefs accumulate over time.
         let beliefs_block = {
-            let beliefs = memory.all_beliefs();
-            if beliefs.is_empty() {
+            let max_n = self.config.memory.max_beliefs_in_prompt;
+            let mut beliefs = memory.all_beliefs();
+            // Sort by confidence descending (all_beliefs returns references).
+            beliefs.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+            let take_n = if max_n == 0 { beliefs.len() } else { max_n.min(beliefs.len()) };
+            if take_n == 0 {
                 String::new()
             } else {
-                let items = beliefs
+                let items = beliefs[..take_n]
                     .iter()
-                    .take(10)
                     .map(|e| format!("- {}", e.content))
                     .collect::<Vec<_>>()
                     .join("\n");
