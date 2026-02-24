@@ -2,9 +2,21 @@
 
 Aigent is a persistent, self-improving AI agent written in Rust. It runs as a background daemon and connects to any frontend — a local TUI, a Telegram bot, or an external client over a Unix socket. Memory is stored in a 6-tier append-only event log that grows smarter over time through nightly sleep consolidation driven by a pipeline of parallel LLM specialist agents.
 
+## Recent Major Updates (February 2026)
+
+| Change | Details |
+|---|---|
+| **WASM-first tool execution** | Wasmtime host runtime is default-on. WASM guest binaries win over native at registry lookup (first-match). Native Rust builtins fall back only until `aigent tools build` compiles guests. |
+| **Platform sandboxing default-on** | `PR_SET_NO_NEW_PRIVS` + seccomp BPF (Linux x86-64) and `sandbox_init` (macOS) compiled in by default. Disable at runtime via `[tools] sandbox_enabled = false`; no recompile needed. |
+| **Three-level approval modes** | `safer` / `balanced` (default) / `autonomous` — configurable in onboarding wizard and in `[tools] approval_mode`. |
+| **Git auto-commit & rollback** | `git_auto_commit = true` commits every write/shell call; `git_rollback` tool reverts with one call. Wizard will `git init` the workspace automatically. |
+| **Brave Search** | `web_search` tool uses Brave API when `brave_api_key` is set; DuckDuckGo Instant Answer always available as fallback. |
+| **`aigent tools build/status` CLI** | Build WASM guests and inspect per-tool runtime state without starting the daemon. |
+| **Onboarding wizard** | Approval Mode and API Keys (Brave Search key) steps added inside the Safety section. |
+
 ## Status
 
-Phases 0 (Foundation), 1 (Memory), and 2 (Unified Agent Loop) are complete. The daemon-first architecture is fully implemented. An ongoing Phase 3 focuses on extension polish, systemd/launchd integration, and full channel parity.
+Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Active Phase 3 polish covers WASM tool extensions, platform sandboxing, approval modes, and full-channel UX. All features above are live and enabled by default.
 
 ## Building from source
 
@@ -144,12 +156,18 @@ A **cooldown gate** (`proactive_cooldown_minutes`, default 5) prevents message b
 - Fuzzy-search file picker (`@` prefix) and slash-command palette.
 - Clipboard copy, history mode, and keyboard-driven focus switching (sidebar / chat / input).
 - Sleep cycle progress shown with an animated indicator while the nightly consolidation runs.
+- Tool call activity (name, success/failure) surfaces in the status bar and inline transcript during agent turns.
+- `BeliefAdded` and `ReflectionInsight` events shown in the status bar immediately after each turn completes.
+- `ProactiveMessage` events rendered as chat bubbles in the main transcript (Markdown-rendered).
+- External turns from Telegram visible inline in the TUI transcript via `ExternalTurn` events.
 
 #### Telegram bot
 
 - Long-polling bot with per-chat short-term context windows.
 - All messages are routed through daemon IPC — memory and model state are shared with the TUI.
 - 409-conflict backoff for multi-instance safety.
+- **Typing indicator**: `sendChatAction(typing)` fires immediately on every message, then refreshes every 4 s for the entire agent turn (LLM generation, tool calls, inline reflection). Cancelled cleanly via a `oneshot` channel when the reply is ready.
+- **Tool footnote**: when the agent uses one or more tools to answer, a brief `🔧 Tools used: name1, name2` note is appended to the reply.
 - Commands: `/help`, `/status`, `/context`, `/model show|list|set|provider|test`, `/think <level>`, `/memory stats|inspect-core|export-vault`, `/sleep`, `/correct`, `/pin`, `/forget`.
 
 #### CLI subcommands
@@ -170,6 +188,8 @@ A **cooldown gate** (`proactive_cooldown_minutes`, default 5) prevents message b
 | `aigent memory proactive stats` | Show proactive mode activity (total sent, last sent, DND window) |
 | `aigent tool list` | List all tools registered in the running daemon with descriptions |
 | `aigent tool call <name> [key=val ...]` | Execute a named tool directly with key=value arguments |
+| `aigent tools build` | Build WASM guest tools in `extensions/tools-src/` (adds `wasm32-wasip1` target + `cargo build --release`) |
+| `aigent tools status` | Show per-tool runtime mode (WASM binary found vs native fallback) and effective sandbox state |
 | `aigent doctor` | Print current config and memory diagnostics |
 | `aigent doctor --review-gate [--report FILE]` | Run phase review gate with auto-remediation |
 | `aigent doctor --model-catalog [--provider <all\|ollama\|openrouter>]` | List available models |
@@ -185,11 +205,12 @@ Built-in tools registered in the daemon and accessible via `/tools` slash comman
 | `write_file` | Write or overwrite a file within the workspace |
 | `run_shell` | Execute a shell command in the workspace directory (timeout-bounded) |
 | `calendar_add_event` | Append an event to `.aigent/calendar.json` (local calendar store) |
-| `web_search` | DuckDuckGo Instant Answer web search (no API key; timeout-bounded) |
+| `web_search` | Web search via Brave API (key in config) or DuckDuckGo Instant Answer fallback; timeout-bounded |
 | `draft_email` | Save an email draft to `.aigent/drafts/` as a plain-text file |
 | `remind_me` | Add a reminder to `.aigent/reminders.json` for proactive surfacing |
+| `git_rollback` | Revert the last git commit in the workspace (`git revert HEAD`) |
 
-All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
+All 8 tools run in **WASM mode** when a compiled `.wasm` binary is present (see `aigent tools status`); otherwise they run as native Rust code with an identical API. All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
 
 **LLM-driven tool calling**: before each streaming response, the daemon asks the LLM whether the user’s message requires a tool. If yes, the daemon executes the tool, records the result to Procedural memory, emits `ToolCallStart` / `ToolCallEnd` events, and injects the result into the main LLM prompt so the reply is grounded in the actual output.
 
@@ -433,28 +454,40 @@ is called.
 Never commit the `.secrets/` directory to version control — add it to
 `.gitignore` if your workspace is a git repository.
 
-### Future: platform sandboxing (now `sandbox` feature)
+### 4 — Platform sandboxing (default-on)
 
-Enabled by building with `--features sandbox` in the `aigent-exec` crate:
-
-```toml
-# Cargo.toml (aigent-exec)
-[features]
-sandbox = ["dep:libc"]
-```
+The `sandbox` Cargo feature is compiled in by default.  When a `run_shell`
+child process is spawned, a `pre_exec` hook applies the platform sandbox
+before the shell `exec` call:
 
 | Platform | Mechanism | Scope |
 |----------|-----------|-------|
-| Linux x86-64 | `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list | Shell child process (after `fork`, before `exec`) |
-| macOS | `sandbox_init(3)` Scheme profile | Shell child process |
-| Other | No-op (workpace sandbox still active) | — |
+| Linux x86-64 | `PR_SET_NO_NEW_PRIVS` (`prctl`) + seccomp BPF allow-list (~80 syscalls) | Shell child — after `fork`, before `exec` |
+| macOS | `sandbox_init(3)` Scheme profile (filesystem + network) | Shell child — after `fork`, before `exec` |
+| Other | No-op; workspace isolation and approval modes still active | — |
 
-The seccomp filter allows ≈80 syscalls covering file I/O, networking, memory,
-process management, and time.  All other syscalls return `ENOSYS` (graceful
-failure) rather than `SIGSYS` (kill), so the child process degrades cleanly.
+The seccomp filter returns `ENOSYS` for denied syscalls (graceful
+failure rather than `SIGSYS`), so shell commands degrade cleanly when denied.
 
-The workspace isolation and approval-mode layers remain active on all
-platforms regardless of whether the `sandbox` feature is compiled in.
+**Runtime opt-out** — disable without recompiling:
+
+```toml
+# config/default.toml
+[tools]
+sandbox_enabled = false    # default: true
+```
+
+Inspect effective state:
+
+```bash
+aigent tools status
+# compiled-in   : yes
+# config enabled : yes
+# effective      : ACTIVE
+```
+
+The workspace isolation, approval-mode gating, and `tool_allowlist`/`tool_denylist`
+layers remain active on all platforms regardless of `sandbox_enabled`.
 
 ## Development
 

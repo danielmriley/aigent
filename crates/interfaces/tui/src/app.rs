@@ -86,6 +86,8 @@ pub struct App {
     pub is_thinking: bool,
     /// True while a manual sleep cycle is running in the background.
     pub is_sleeping: bool,
+    /// Name of the tool currently executing (shown in the spinner header).
+    pub active_tool: Option<String>,
     pub backend_rx: mpsc::UnboundedReceiver<BackendEvent>,
     pub focus: Focus,
     pub theme: Theme,
@@ -132,6 +134,7 @@ impl App {
             spinner_tick: 0,
             is_thinking: false,
             is_sleeping: false,
+            active_tool: None,
             pending_stream: String::new(),
             input_wrap_width: 60,
             workspace_files: collect_workspace_files(Path::new(".")),
@@ -491,9 +494,32 @@ impl App {
                 self.state.status = "memory updated".to_string();
             }
             BackendEvent::ToolCallStart(info) => {
-                self.state.status = format!("tool: {}", info.name);
+                self.active_tool = Some(info.name.clone());
+                self.state.status = format!("\u{1f527} {}", info.name);
+                // Show as a dimmed inline transcript entry so the user can
+                // see which tool is running without leaving the chat.
+                self.state.messages.push(Message {
+                    role: "⚙".to_string(),
+                    content: format!("calling {}…", info.name),
+                    rendered_md: None,
+                });
+                self.auto_follow = true;
             }
             BackendEvent::ToolCallEnd(result) => {
+                self.active_tool = None;
+                // Update the last ⚙ message to reflect the outcome.
+                if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| m.role == "⚙") {
+                    msg.content = if result.success {
+                        let snip = if result.output.len() > 80 {
+                            format!("{}…", &result.output[..80])
+                        } else {
+                            result.output.clone()
+                        };
+                        format!("✓ {} — {}", result.name, snip)
+                    } else {
+                        format!("✗ {} failed", result.name)
+                    };
+                }
                 self.state.status = if result.success {
                     "tool complete".to_string()
                 } else {
@@ -510,16 +536,29 @@ impl App {
                 self.auto_follow = true;
             }
             BackendEvent::ReflectionInsight(insight) => {
-                self.state.status = format!("insight: {insight}");
+                // Trim to a single line for the status bar; long insights are
+                // truncated with an ellipsis so the header stays compact.
+                let display = if insight.len() > 80 {
+                    format!("{}…", &insight[..80])
+                } else {
+                    insight.clone()
+                };
+                self.state.status = format!("\u{1f4a1} {}", display);
             }
             BackendEvent::BeliefAdded { claim, confidence } => {
-                self.state.status = format!("belief recorded ({confidence:.2}): {claim}");
+                let display = if claim.len() > 70 {
+                    format!("{}…", &claim[..70])
+                } else {
+                    claim.clone()
+                };
+                self.state.status = format!("belief ({:.2}): {}", confidence, display);
             }
             BackendEvent::ProactiveMessage { content } => {
+                let rendered = render_markdown_lines(&content);
                 self.state.messages.push(Message {
                     role: "aigent".to_string(),
                     content,
-                    rendered_md: None,
+                    rendered_md: Some(rendered),
                 });
                 self.pending_stream.clear();
                 self.auto_follow = true;

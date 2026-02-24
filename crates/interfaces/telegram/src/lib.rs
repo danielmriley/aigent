@@ -211,6 +211,7 @@ async fn handle_telegram_input(
     });
 
     let mut out = String::new();
+    let mut tools_used: Vec<String> = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
             BackendEvent::Token(chunk) => out.push_str(&chunk),
@@ -225,8 +226,10 @@ async fn handle_telegram_input(
             | BackendEvent::SleepCycleRunning
             | BackendEvent::MemoryUpdated
             | BackendEvent::ToolCallStart(_)
-            | BackendEvent::ToolCallEnd(_)
             | BackendEvent::ExternalTurn { .. } => {}
+            BackendEvent::ToolCallEnd(result) => {
+                tools_used.push(result.name.clone());
+            }
             // Phase-2 events: log at debug level.  These arrive when inline
             // reflection adds beliefs or insights after the turn.  The Telegram
             // handler does not render them inline (they reach Telegram users via
@@ -249,6 +252,11 @@ async fn handle_telegram_input(
         Ok(Ok(())) => {}
         Ok(Err(err)) => return Ok(format!("error: {err}")),
         Err(err) => return Ok(format!("error: task panicked: {err}")),
+    }
+
+    if !tools_used.is_empty() {
+        let footnote = format!("\n\n_\u{1f527} Tools used: {}_", tools_used.join(", "));
+        out.push_str(&footnote);
     }
 
     if out.trim().is_empty() {

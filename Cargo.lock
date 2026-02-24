@@ -206,6 +206,7 @@ name = "aigent-ui"
 version = "0.1.0"
 dependencies = [
  "aigent-config",
+ "aigent-exec",
  "aigent-runtime",
  "anyhow",
  "arboard",

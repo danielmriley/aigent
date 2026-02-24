@@ -1171,3 +1171,66 @@ daemon to be running.
 - [ ] `sandbox_enabled = false` in config → shell children no longer sandboxed
 - [ ] Linux: sandbox active by default → `strace -e seccomp aigent start` shows seccomp applied
 - [ ] macOS: `sandbox_init` applied without `--features sandbox` build flag
+
+---
+
+## 2026-02-25 — Phase 7: README overhaul + UX polish
+
+### README changes
+
+- **Safety section** rewritten: "Future: platform sandboxing" → "Platform sandboxing
+  (default-on)" with `sandbox_enabled` config key example and `aigent tools status`
+  sample output.
+- **Tool table** now lists all 8 tools including `git_rollback`; footnote added:
+  "All 8 tools run in WASM mode when `.wasm` guests are present."
+- **CLI table** extended with `aigent tools build` and `aigent tools status`.
+- **TUI section** updated to mention tool-call inline transcript messages, belief /
+  insight events, and proactive messages.
+- **Telegram section** updated to mention the typing-indicator persistence and the
+  tool-use footnote appended to responses.
+- **"Recent Major Updates (February 2026)"** summary table added near the top.
+
+### `crates/interfaces/tui/src/onboard.rs` — `prev_step` navigation fix
+
+Pressing **Back** on the `ApprovalMode` or `ApiKeys` steps within the `Safety`
+config section previously fell through to `WizardStep::ConfigMenu` instead of
+returning to the immediately preceding step.  Two missing match arms were added:
+
+```rust
+(ConfigSection::Safety, WizardStep::ApprovalMode) => WizardStep::Safety,
+(ConfigSection::Safety, WizardStep::ApiKeys)      => WizardStep::ApprovalMode,
+```
+
+The Welcome screen description and the Summary screen sandbox-status line were
+also updated (`aigent_exec::sandbox::is_active()` is now displayed).
+
+### `crates/interfaces/tui/src/app.rs` — tool transcript + ProactiveMessage markdown
+
+- `active_tool: Option<String>` field added to `App`.
+- `ToolCallStart` now pushes a `⚙` role message ("calling \<name\>…") into
+  the chat transcript and sets `active_tool`.
+- `ToolCallEnd` finds that last `⚙` message and rewrites it in-place with
+  `✓ name — snippet` (success) or `✗ name failed` (failure), then clears `active_tool`.
+- `ProactiveMessage` now passes through `render_markdown_lines` so rich formatting
+  is preserved when proactive messages appear in chat.
+- `ReflectionInsight` and `BeliefAdded` status-bar messages are now truncated at
+  80/70 characters respectively to keep the header compact.
+
+### `crates/interfaces/telegram/src/lib.rs` — tool footnotes
+
+Tool names are now accumulated during a turn.  After the event loop, if any tools
+were called, the response is extended with an italic footnote:
+
+```
+🔧 Tools used: web_search, shell_exec
+```
+
+### Verification checklist
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] TUI: send a message that triggers a tool → `⚙ calling <name>…` appears, then
+      updates to `✓ name — …` when complete
+- [ ] TUI: Back navigation through Safety / ApprovalMode / ApiKeys steps works correctly
+- [ ] TUI: `Summary` screen shows sandbox active/inactive status
+- [ ] Telegram: response for a tool-using query ends with `_🔧 Tools used: …_`

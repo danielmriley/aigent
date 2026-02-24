@@ -17,6 +17,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph, Wrap};
 
 use aigent_config::{AppConfig, ApprovalMode};
+use aigent_exec;
 use aigent_runtime::AgentRuntime;
 
 use crate::theme::Theme;
@@ -788,6 +789,8 @@ fn prev_step(current: WizardStep, draft: &OnboardingDraft, mode: SetupMode) -> W
             }
 
             (ConfigSection::Safety, WizardStep::Safety) => WizardStep::ConfigMenu,
+            (ConfigSection::Safety, WizardStep::ApprovalMode) => WizardStep::Safety,
+            (ConfigSection::Safety, WizardStep::ApiKeys) => WizardStep::ApprovalMode,
             _ => WizardStep::ConfigMenu,
         };
     }
@@ -1231,7 +1234,7 @@ fn step_content<'a>(
         }
         WizardStep::Welcome => (
             "Welcome to Aigent",
-            "This wizard configures identity, memory policy, and safety.\n\nPress Enter to begin.".to_string(),
+            "This wizard configures identity, memory policy, and safety.\n\nTools run in WASM isolation by default (seccomp/sandbox active on Linux & macOS). You\'ll choose an approval mode to control how much autonomy the agent has.\n\nPress Enter to begin.".to_string(),
             ratatui::text::Text::from(""),
         ),
         WizardStep::BotName => (
@@ -1326,11 +1329,12 @@ fn step_content<'a>(
             let memory_path = PathBuf::from(&draft.workspace_path)
                 .join(".aigent")
                 .join("memory");
+            let sandbox_status = if aigent_exec::sandbox::is_active() { "active (platform sandbox compiled in)" } else { "inactive (rebuild with sandbox feature)" };
             (
                 "Setup Summary",
                 String::new(),
                 ratatui::text::Text::from(format!(
-                    "User: {}\nBot: {}\nProvider: {}\nModel: {}\nThinking: {}\nData directory: {}\nSleep mode: nightly ({}:00-{}:00 local)\nSafety: {}\nApproval mode: {}\nBrave Search key: {}\nTelegram: {}\nDocker available: {}\nMemory path: {}\n\nMemory contract:\n- Event-log memory is canonical\n- Nightly sleep distills and promotes important memories\n- Core memories shape personality over time\n\nPress Enter to finalize setup.",
+                    "User: {}\nBot: {}\nProvider: {}\nModel: {}\nThinking: {}\nData directory: {}\nSleep mode: nightly ({}:00-{}:00 local)\nSafety: {}\nApproval mode: {}\nBrave Search key: {}\nTelegram: {}\nSandbox: {}\nDocker available: {}\nMemory path: {}\n\nMemory contract:\n- Event-log memory is canonical\n- Nightly sleep distills and promotes important memories\n- Core memories shape personality over time\n\nPress Enter to finalize setup.",
                     draft.user_name,
                     draft.bot_name,
                     draft.provider,
@@ -1351,6 +1355,7 @@ fn step_content<'a>(
                     } else {
                         "disabled"
                     },
+                    sandbox_status,
                     if docker_ok { "yes" } else { "no" },
                     memory_path.display()
                 )),
