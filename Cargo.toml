@@ -44,3 +44,7 @@ redb = "2"
 bincode = "2"
 lru = "0.12"
 chrono-tz = "0.10"
+bytes = "1"
+libc = "0.2"
+wasmtime = { version = "25", default-features = false, features = ["cranelift", "runtime", "component-model"] }
+wasmtime-wasi = { version = "25", default-features = false, features = ["preview1"] }

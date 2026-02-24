@@ -911,3 +911,136 @@ All call sites (tests and `server.rs`) must pass `None` or the resolved key.
 - [ ] Set `git_auto_commit = true`, call `write_file`, run `git log` — commit visible
 - [ ] Call `git_rollback` — commit reverted
 
+
+---
+
+## 2026-02-24 — Phase 5: Full WASM Host Runtime, Platform Sandboxing & Onboarding Wizard Completion
+
+### What changed
+
+#### Phase 1 — Wasmtime host runtime (`wasm` feature, enabled by default)
+
+New file `crates/exec/src/wasm.rs` implements:
+- `WasmTool` — a `Tool` implementation backed by a compiled `.wasm` binary.
+  Uses Wasmtime + WASIP1 with in-memory stdin/stdout pipes for the JSON
+  protocol.  Module compilation happens once at load; instantiation is
+  per-call (stateless, fully isolated linear memory).
+- `load_wasm_tools_from_dir(extensions_dir)` — scans two layouts:
+  - Direct: `<extensions_dir>/<name>.wasm`
+  - Sub-workspace: `<extensions_dir>/tools-src/<crate>/target/wasm32-wasip1/release/<name>.wasm`
+- `default_registry()` in `exec/src/lib.rs` now calls `load_wasm_tools_from_dir`
+  after registering native tools.  WASM tools shadow native tools by name.
+
+**Building guest tools:**
+
+```bash
+rustup target add wasm32-wasip1
+cd extensions/tools-src
+cargo build --release
+# Daemon picks up *.wasm on next start — no daemon source change needed
+```
+
+**Native tools remain as fallback** when no `.wasm` files are present.  This
+ensures all existing tests and deployments continue to work unchanged.
+
+New workspace dependencies added:
+```toml
+wasmtime        = { version = "25", default-features = false, features = ["cranelift", "runtime", "component-model"] }
+wasmtime-wasi   = { version = "25", default-features = false, features = ["preview1"] }
+bytes           = "1"
+libc            = "0.2"
+```
+
+New exec crate features:
+```toml
+wasm    = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:bytes"]
+sandbox = ["dep:libc"]
+```
+
+#### Phase 2 — Platform sandboxing (`sandbox` feature)
+
+New file `crates/exec/src/sandbox.rs` implements:
+- `apply_to_child(workspace_root: &str)` — unsafe function called in a `pre_exec`
+  hook between `fork` and `exec` when spawning shell children.
+- **Linux x86-64**: `PR_SET_NO_NEW_PRIVS` (no privilege escalation via setuid)
+  followed by a seccomp BPF ALLOW-list covering ~80 syscalls; unrecognised
+  syscalls return `ENOSYS` rather than `SIGSYS`.
+- **macOS**: `sandbox_init(3)` with an inline Scheme profile allowing
+  workspace file R/W, `/tmp`, standard libs, outbound TCP 80/443, and
+  process management.  All other operations denied by default.
+- `is_active() -> bool` — useful for daemon status reporting.
+
+`exec/src/lib.rs` gains `ToolExecutor::run_shell_sandboxed()` which is
+invoked automatically in `execute()` when `tool_name == "run_shell"` and the
+`sandbox` feature is active.
+
+**To enable sandboxing** (not the default — requires explicit opt-in):
+```toml
+# .cargo/config.toml or Cargo.toml
+[features]
+default = ["sandbox"]
+```
+Or build with `cargo build --workspace --features aigent-exec/sandbox`.
+
+#### Phase 3 — Onboarding wizard completion
+
+`crates/interfaces/tui/src/onboard.rs` gains two new wizard steps:
+- `WizardStep::ApprovalMode` — choice carousel: `safer` / `balanced` / `autonomous`
+- `WizardStep::ApiKeys` — masked text input for the Brave Search API key
+  (skippable; falls back to DuckDuckGo when blank)
+
+Position in the onboarding flow:
+```
+… → Safety → ApprovalMode → ApiKeys → Messaging → …
+```
+
+In the configuration menu the `Safety` section now covers all three steps
+(`Safety` → `ApprovalMode` → `ApiKeys` → menu).
+
+New `OnboardingDraft` fields: `approval_mode: String`, `brave_api_key: String`.
+Both are persisted to `config.tools` in `apply()` and `apply_partial()`.
+
+`prompt_safety_settings()` (prompt fallback path) now also asks for
+`approval_mode` and Brave key.
+
+#### Phase 4 — Docs
+
+- `README.md`: Updated capabilities matrix (WASM runtime live, platform
+  sandboxing live); updated `### WASM extension interface` section with build
+  instructions; replaced "Future: platform sandboxing" with `sandbox` feature
+  table; updated onboarding wizard entry.
+- `config/default.toml.example`: unchanged (already has `[tools]` from Phase 4).
+- `MIGRATION.md`: this entry.
+
+### Migration steps
+
+1. `cargo build --workspace` — still 0 errors, 0 warnings.
+2. `cargo test --workspace` — 57/57 pass.
+3. **Optional — activate WASM tools**:
+   ```bash
+   rustup target add wasm32-wasip1
+   cd extensions/tools-src && cargo build --release
+   aigent daemon restart
+   aigent tool list   # read_file etc. now say "(WASM guest)" in their descriptions
+   ```
+4. **Optional — enable sandbox**:
+   ```bash
+   cargo build --workspace --features aigent-exec/sandbox
+   # Rebuild the binary and install; shell children will have seccomp/macOS sandbox
+   ```
+5. Run `aigent onboard` or `aigent configuration` — new **Approval Mode** and
+   **API Keys** wizard steps appear in the Safety section.
+
+### Verification checklist
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all pass (57 tests)
+- [ ] `aigent tool list` — 8 tools (native baseline, no WASM binaries built yet)
+- [ ] Build guest tools → `aigent daemon restart` → `aigent tool list` shows
+      "(WASM guest)" description suffix for `read_file`, `write_file`, `run_shell`
+- [ ] `aigent onboard` → wizard shows `Approval Mode` and `API Keys` steps after `Safety`
+- [ ] `approval_mode = "autonomous"` in config → `write_file` call requires no prompt
+- [ ] `approval_mode = "safer"` → every tool call prompts for approval
+- [ ] Build with `--features aigent-exec/sandbox` → `run_shell` child has seccomp
+      filter active (use `strace -e seccomp` or `ausearch` to verify)
+- [ ] macOS: build with sandbox feature → `sandbox_init` applied (check Console.app)

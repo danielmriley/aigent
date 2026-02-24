@@ -16,7 +16,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Gauge, Paragraph, Wrap};
 
-use aigent_config::AppConfig;
+use aigent_config::{AppConfig, ApprovalMode};
 use aigent_runtime::AgentRuntime;
 
 use crate::theme::Theme;
@@ -322,6 +322,10 @@ enum WizardStep {
     NightSleepStart,
     NightSleepEnd,
     Safety,
+    /// Choose approval mode: safer / balanced / autonomous
+    ApprovalMode,
+    /// Enter optional API keys (Brave Search, etc.)
+    ApiKeys,
     Messaging,
     TelegramToken,
     Summary,
@@ -335,6 +339,7 @@ impl WizardStep {
                 | WizardStep::UserName
                 | WizardStep::DataDirectory
                 | WizardStep::OpenRouterKey
+                | WizardStep::ApiKeys
                 | WizardStep::NightSleepStart
                 | WizardStep::NightSleepEnd
                 | WizardStep::TelegramToken
@@ -356,6 +361,10 @@ struct OnboardingDraft {
     night_sleep_start_hour: u8,
     night_sleep_end_hour: u8,
     safety_profile: String,
+    /// Tool approval mode: "safer" | "balanced" | "autonomous"
+    approval_mode: String,
+    /// Optional Brave Search API key (masked in UI; stored to config / .env)
+    brave_api_key: String,
     telegram_enabled: bool,
     telegram_token: String,
     available_models: AvailableModels,
@@ -380,6 +389,12 @@ impl OnboardingDraft {
             } else {
                 "strict".to_string()
             },
+            approval_mode: match &config.tools.approval_mode {
+                ApprovalMode::Safer => "safer".to_string(),
+                ApprovalMode::Balanced => "balanced".to_string(),
+                ApprovalMode::Autonomous => "autonomous".to_string(),
+            },
+            brave_api_key: config.tools.brave_api_key.clone(),
             telegram_enabled: config.integrations.telegram_enabled,
             telegram_token: String::new(),
             available_models: models,
@@ -406,6 +421,8 @@ impl OnboardingDraft {
             WizardStep::NightSleepStart => self.night_sleep_start_hour.to_string(),
             WizardStep::NightSleepEnd => self.night_sleep_end_hour.to_string(),
             WizardStep::Safety => self.safety_profile.clone(),
+            WizardStep::ApprovalMode => self.approval_mode.clone(),
+            WizardStep::ApiKeys => self.brave_api_key.clone(),
             WizardStep::Messaging => {
                 if self.telegram_enabled {
                     "enabled".to_string()
@@ -470,6 +487,16 @@ impl OnboardingDraft {
             }
             WizardStep::TelegramToken => {
                 self.telegram_token = value.to_string();
+            }
+            WizardStep::ApprovalMode => {
+                self.approval_mode = normalize_approval_mode(value)
+                    .unwrap_or_else(|_| "balanced".to_string());
+            }
+            WizardStep::ApiKeys => {
+                // Blank input = keep existing value; non-blank = set new value.
+                if !value.is_empty() {
+                    self.brave_api_key = value.to_string();
+                }
             }
             _ => {}
         }
@@ -536,6 +563,13 @@ impl OnboardingDraft {
                     "power-user".to_string()
                 }
             }
+            WizardStep::ApprovalMode => {
+                self.approval_mode = match self.approval_mode.to_lowercase().as_str() {
+                    "safer" => "balanced".to_string(),
+                    "balanced" => "autonomous".to_string(),
+                    _ => "safer".to_string(),
+                }
+            }
             WizardStep::Messaging => {
                 self.telegram_enabled = !self.telegram_enabled;
             }
@@ -589,6 +623,13 @@ impl OnboardingDraft {
                     _ => "balanced".to_string(),
                 }
             }
+            WizardStep::ApprovalMode => {
+                self.approval_mode = match self.approval_mode.to_lowercase().as_str() {
+                    "safer" => "autonomous".to_string(),
+                    "balanced" => "safer".to_string(),
+                    _ => "balanced".to_string(),
+                }
+            }
             _ => self.choice_next(step),
         }
     }
@@ -605,6 +646,10 @@ impl OnboardingDraft {
         config.memory.night_sleep_end_hour = self.night_sleep_end_hour;
         let safety_profile = normalize_safety_profile(&self.safety_profile)?;
         apply_safety_profile(config, &safety_profile);
+        apply_approval_mode(config, &self.approval_mode);
+        if !self.brave_api_key.trim().is_empty() {
+            config.tools.brave_api_key = self.brave_api_key.trim().to_string();
+        }
         config.integrations.telegram_enabled = self.telegram_enabled;
 
         let workspace = resolve_data_directory(
@@ -637,6 +682,10 @@ impl OnboardingDraft {
         config.memory.night_sleep_end_hour = self.night_sleep_end_hour;
         if let Ok(profile) = normalize_safety_profile(&self.safety_profile) {
             apply_safety_profile(config, &profile);
+        }
+        apply_approval_mode(config, &self.approval_mode);
+        if !self.brave_api_key.trim().is_empty() {
+            config.tools.brave_api_key = self.brave_api_key.trim().to_string();
         }
         config.integrations.telegram_enabled = self.telegram_enabled;
         Ok(())
@@ -677,7 +726,9 @@ fn next_step(current: WizardStep, draft: &OnboardingDraft, mode: SetupMode) -> W
             (ConfigSection::DataMemory, WizardStep::NightSleepEnd) => WizardStep::ConfigMenu,
 
             (ConfigSection::Safety, WizardStep::ConfigMenu) => WizardStep::Safety,
-            (ConfigSection::Safety, WizardStep::Safety) => WizardStep::ConfigMenu,
+            (ConfigSection::Safety, WizardStep::Safety) => WizardStep::ApprovalMode,
+            (ConfigSection::Safety, WizardStep::ApprovalMode) => WizardStep::ApiKeys,
+            (ConfigSection::Safety, WizardStep::ApiKeys) => WizardStep::ConfigMenu,
 
             _ => WizardStep::ConfigMenu,
         };
@@ -701,7 +752,9 @@ fn next_step(current: WizardStep, draft: &OnboardingDraft, mode: SetupMode) -> W
         WizardStep::Thinking => WizardStep::NightSleepStart,
         WizardStep::NightSleepStart => WizardStep::NightSleepEnd,
         WizardStep::NightSleepEnd => WizardStep::Safety,
-        WizardStep::Safety => WizardStep::Messaging,
+        WizardStep::Safety => WizardStep::ApprovalMode,
+        WizardStep::ApprovalMode => WizardStep::ApiKeys,
+        WizardStep::ApiKeys => WizardStep::Messaging,
         WizardStep::Messaging => {
             if draft.telegram_enabled {
                 WizardStep::TelegramToken
@@ -758,7 +811,9 @@ fn prev_step(current: WizardStep, draft: &OnboardingDraft, mode: SetupMode) -> W
         WizardStep::NightSleepStart => WizardStep::Thinking,
         WizardStep::NightSleepEnd => WizardStep::NightSleepStart,
         WizardStep::Safety => WizardStep::NightSleepEnd,
-        WizardStep::Messaging => WizardStep::Safety,
+        WizardStep::ApprovalMode => WizardStep::Safety,
+        WizardStep::ApiKeys => WizardStep::ApprovalMode,
+        WizardStep::Messaging => WizardStep::ApiKeys,
         WizardStep::TelegramToken => WizardStep::Messaging,
         WizardStep::Summary => {
             if draft.telegram_enabled {
@@ -796,7 +851,12 @@ fn active_steps(mode: SetupMode, draft: &OnboardingDraft) -> Vec<WizardStep> {
                 WizardStep::NightSleepStart,
                 WizardStep::NightSleepEnd,
             ],
-            ConfigSection::Safety => vec![WizardStep::ConfigMenu, WizardStep::Safety],
+            ConfigSection::Safety => vec![
+                WizardStep::ConfigMenu,
+                WizardStep::Safety,
+                WizardStep::ApprovalMode,
+                WizardStep::ApiKeys,
+            ],
             ConfigSection::FullWizard => {
                 let mut steps = vec![WizardStep::ConfigMenu];
                 steps.extend(active_steps(SetupMode::Onboarding, draft));
@@ -821,6 +881,8 @@ fn active_steps(mode: SetupMode, draft: &OnboardingDraft) -> Vec<WizardStep> {
         WizardStep::NightSleepStart,
         WizardStep::NightSleepEnd,
         WizardStep::Safety,
+        WizardStep::ApprovalMode,
+        WizardStep::ApiKeys,
         WizardStep::Messaging,
     ]);
     if draft.telegram_enabled {
@@ -927,6 +989,8 @@ fn draw_onboarding(
                     WizardStep::NightSleepStart => "Sleep Start",
                     WizardStep::NightSleepEnd => "Sleep End",
                     WizardStep::Safety => "Safety",
+                    WizardStep::ApprovalMode => "Approval Mode",
+                    WizardStep::ApiKeys => "API Keys",
                     WizardStep::Messaging => "Messaging",
                     WizardStep::TelegramToken => "Telegram Token",
                     WizardStep::Summary => "Summary",
@@ -1234,6 +1298,19 @@ fn step_content<'a>(
             "Choose safety profile (Up/Down/Tab to cycle):\n\nstrict: deny shell/wasm by default\npower-user: allow shell/wasm with approvals".to_string(),
             format_choice_list(&["strict", "power-user"], &draft.safety_profile),
         ),
+        WizardStep::ApprovalMode => (
+            "Tool Approval Mode",
+            "How should the agent ask for approval before running tools?\n\nsafer     — ask for every tool call\nbalanced  — read-only tools free; writes/shell require approval (default)\nautonomous — never ask; all gated tools auto-approved within workspace".to_string(),
+            format_choice_list(
+                &["safer", "balanced", "autonomous"],
+                &draft.approval_mode,
+            ),
+        ),
+        WizardStep::ApiKeys => (
+            "API Keys (optional)",
+            "Brave Search API key for high-quality web search results.\nLeave blank to use the free DuckDuckGo fallback instead.\nKey is saved to config (never logged).".to_string(),
+            ratatui::text::Text::from(format!("\n{}\n", mask_secret(input))),
+        ),
         WizardStep::Messaging => (
             "Messaging Integration",
             "Toggle Telegram integration (Up/Down/Tab to cycle):".to_string(),
@@ -1253,7 +1330,7 @@ fn step_content<'a>(
                 "Setup Summary",
                 String::new(),
                 ratatui::text::Text::from(format!(
-                    "User: {}\nBot: {}\nProvider: {}\nModel: {}\nThinking: {}\nData directory: {}\nSleep mode: nightly ({}:00-{}:00 local)\nSafety: {}\nTelegram: {}\nDocker available: {}\nMemory path: {}\n\nMemory contract:\n- Event-log memory is canonical\n- Nightly sleep distills and promotes important memories\n- Core memories shape personality over time\n\nPress Enter to finalize setup.",
+                    "User: {}\nBot: {}\nProvider: {}\nModel: {}\nThinking: {}\nData directory: {}\nSleep mode: nightly ({}:00-{}:00 local)\nSafety: {}\nApproval mode: {}\nBrave Search key: {}\nTelegram: {}\nDocker available: {}\nMemory path: {}\n\nMemory contract:\n- Event-log memory is canonical\n- Nightly sleep distills and promotes important memories\n- Core memories shape personality over time\n\nPress Enter to finalize setup.",
                     draft.user_name,
                     draft.bot_name,
                     draft.provider,
@@ -1267,6 +1344,8 @@ fn step_content<'a>(
                     draft.night_sleep_start_hour,
                     draft.night_sleep_end_hour,
                     draft.safety_profile,
+                    draft.approval_mode,
+                    if draft.brave_api_key.trim().is_empty() { "not set (DuckDuckGo fallback)" } else { "configured" },
                     if draft.telegram_enabled {
                         "enabled"
                     } else {
@@ -1385,6 +1464,23 @@ fn normalize_safety_profile(raw: &str) -> Result<String> {
     } else {
         bail!("safety profile must be one of: strict, power-user");
     }
+}
+
+fn normalize_approval_mode(raw: &str) -> Result<String> {
+    match raw.trim().to_lowercase().as_str() {
+        "safer" => Ok("safer".to_string()),
+        "balanced" => Ok("balanced".to_string()),
+        "autonomous" => Ok("autonomous".to_string()),
+        _ => bail!("approval mode must be one of: safer, balanced, autonomous"),
+    }
+}
+
+fn apply_approval_mode(config: &mut AppConfig, approval_mode: &str) {
+    config.tools.approval_mode = match approval_mode.to_lowercase().as_str() {
+        "safer" => ApprovalMode::Safer,
+        "autonomous" => ApprovalMode::Autonomous,
+        _ => ApprovalMode::Balanced,
+    };
 }
 
 fn detect_project_root() -> Option<PathBuf> {
@@ -1587,6 +1683,19 @@ fn prompt_safety_settings(config: &mut AppConfig) -> Result<()> {
     let safety_profile = prompt("Safety profile (strict/power-user)", "strict")?;
     let safety_profile = normalize_safety_profile(&safety_profile)?;
     apply_safety_profile(config, &safety_profile);
+
+    let approval_mode = prompt(
+        "Tool approval mode (safer/balanced/autonomous)",
+        "balanced",
+    )?;
+    let approval_mode = normalize_approval_mode(&approval_mode)?;
+    apply_approval_mode(config, &approval_mode);
+
+    let brave_key = prompt_optional("Brave Search API key (leave blank to use DuckDuckGo)")?;
+    if let Some(key) = brave_key {
+        config.tools.brave_api_key = key;
+    }
+
     Ok(())
 }
 

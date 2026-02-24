@@ -1,4 +1,8 @@
 pub mod git;
+pub mod sandbox;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -138,6 +142,30 @@ impl ToolExecutor {
 
         // 4. Run the tool
         info!(tool = tool_name, "executing tool");
+
+        // For run_shell with the `sandbox` feature active we spawn the child
+        // with a pre-exec sandbox hook instead of delegating to the tool impl.
+        #[cfg(all(feature = "sandbox", unix))]
+        if tool_name == "run_shell" {
+            let result = self.run_shell_sandboxed(args).await?;
+            if result.success && self.policy.git_auto_commit {
+                let detail = args
+                    .get("command")
+                    .map(|s| s.as_str())
+                    .unwrap_or("(unknown)");
+                if let Err(err) = git::git_auto_commit(
+                    &self.policy.workspace_root,
+                    tool_name,
+                    detail,
+                )
+                .await
+                {
+                    warn!(?err, tool = tool_name, "git auto-commit failed (non-fatal)");
+                }
+            }
+            return Ok(result);
+        }
+
         let result = tool.run(args).await?;
 
         // 5. Git auto-commit after successful write operations
@@ -215,8 +243,73 @@ impl ToolExecutor {
         Ok(())
     }
 
-    async fn request_approval(
+    /// Run `run_shell` with a sandbox pre-exec hook on supported platforms.
+    ///
+    /// Mirrors the logic in `RunShellTool::run()` but inserts
+    /// `sandbox::apply_to_child` into the child process before the shell
+    /// binary executes.  Only compiled when the `sandbox` feature is active.
+    #[cfg(all(feature = "sandbox", unix))]
+    async fn run_shell_sandboxed(
         &self,
+        args: &HashMap<String, String>,
+    ) -> Result<aigent_tools::ToolOutput> {
+        use std::os::unix::process::CommandExt as _;
+
+        let command = args
+            .get("command")
+            .ok_or_else(|| anyhow::anyhow!("missing required param: command"))?
+            .clone();
+        let timeout_secs: u64 = args
+            .get("timeout_secs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+
+        let workspace_root = self.policy.workspace_root.clone();
+        let workspace_str = workspace_root.display().to_string();
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(&command)
+            .current_dir(&workspace_root);
+
+        // SAFETY: `apply_to_child` is designed to be called between fork and
+        // exec and only makes async-signal-safe syscalls (prctl, seccomp,
+        // sandbox_init).
+        unsafe {
+            let ws = workspace_str.clone();
+            cmd.as_std_mut().pre_exec(move || {
+                sandbox::apply_to_child(&ws)
+            });
+        }
+
+        let output_result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            cmd.output(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("command timed out after {}s", timeout_secs))??;
+
+        let stdout = String::from_utf8_lossy(&output_result.stdout);
+        let stderr = String::from_utf8_lossy(&output_result.stderr);
+        let combined = if stderr.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("{stdout}\n[stderr] {stderr}")
+        };
+        let max_output = 32768;
+        let result = if combined.len() > max_output {
+            format!("{}…[truncated]", &combined[..max_output])
+        } else {
+            combined
+        };
+
+        Ok(aigent_tools::ToolOutput {
+            success: output_result.status.success(),
+            output: result,
+        })
+    }
+
+    async fn request_approval(        &self,
         tool_name: &str,
         args: &HashMap<String, String>,
     ) -> Result<bool> {
@@ -326,8 +419,23 @@ pub fn default_registry(
         data_dir: agent_data_dir,
     }));
     registry.register(Box::new(GitRollbackTool {
-        workspace_root,
+        workspace_root: workspace_root.clone(),
     }));
+
+    // ── WASM tool overlay ──────────────────────────────────────────────────
+    // Discover compiled `.wasm` guest binaries and register them under the
+    // same tool names.  WASM tools shadow the native baseline above; if no
+    // `.wasm` files are present the native tools continue to serve all calls.
+    #[cfg(feature = "wasm")]
+    {
+        // Look for guests in `<workspace_root>/extensions/` and in the
+        // sub-workspace layout produced by `extensions/tools-src/`.
+        let extensions_dir = workspace_root.join("extensions");
+        for tool in wasm::load_wasm_tools_from_dir(&extensions_dir) {
+            registry.register(tool);
+        }
+    }
+
     registry
 }
 

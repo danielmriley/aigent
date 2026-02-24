@@ -229,14 +229,30 @@ A WIT host interface is defined in `extensions/wit/host.wit` for guest WASM skil
 - Shell execution: `run-shell` (with timeout)
 - Persistent key-value store: `kv-get`, `kv-set`
 - HTTP: `http-get`, `http-post`
+- Git: `git-commit`, `git-rollback-last`, `git-log-last`
+- Secrets: `secret-get`
 
-Guest skills implement `spec()` and `run(params)`.
+Guest skills implement `spec()` and `run(params)` using the stdin/stdout JSON protocol.
+
+The **Wasmtime host runtime** (Cargo feature `wasm`, enabled by default) discovers compiled
+`.wasm` binaries at daemon start and registers them as live tools:
+
+```bash
+# Build the guest sub-workspace
+rustup target add wasm32-wasip1
+cd extensions/tools-src && cargo build --release
+# -> creates extensions/tools-src/<crate>/target/wasm32-wasip1/release/*.wasm
+# The daemon picks them up automatically on next start
+```
+
+WASM tools **shadow** the native Rust baseline by name (`read_file`, `write_file`, etc.).
+If no `.wasm` files are present, the native implementations remain active.
 
 ## Capabilities matrix
 
 | Capability area | Status | Notes |
 | --- | --- | --- |
-| Onboarding wizard (TUI + prompt fallback) | ✅ Complete | Configures identity, model/provider, thinking level, workspace, sleep window, safety profile. |
+| Onboarding wizard (TUI + prompt fallback) | ✅ Complete | Configures identity, model/provider, thinking level, workspace, sleep window, safety profile, **approval mode**, **Brave API key**. |
 | Persistent memory (6 tiers) | ✅ Complete | Core, UserProfile, Reflective, Semantic, Procedural, Episodic — append-only event log. |
 | Crash-safe JSONL (flush + fsync) | ✅ Complete | `append()` fsyncs every write; `overwrite()` uses tmp+rename+fsync; corrupt lines skipped on load. |
 | Hybrid retrieval (lexical + embedding) | ✅ Complete | Ollama embeddings + cosine similarity; graceful fallback to lexical-only. |
@@ -264,7 +280,8 @@ Guest skills implement `spec()` and `run(params)`.
 | Tool approval modes | ✅ Complete | Three modes: `safer` (always ask), `balanced` (read-only free, default), `autonomous` (no prompts). Configurable via `[tools] approval_mode`. |
 | Git auto-commit | ✅ Complete | Automatic `git add -A && git commit` after every `write_file`/`run_shell`; `git_rollback` tool reverts last commit. |
 | Brave Search integration | ✅ Complete | `web_search` uses Brave API when `brave_api_key` is set; falls back to DuckDuckGo. |
-| WASM extension interface | ✅ Complete | WIT host API for guest skills (file I/O, shell, KV, HTTP, git). WASM guest sources for `read_file`, `write_file`, `run_shell` in `extensions/tools-src/`. |
+| WASM extension interface | ✅ Complete | WIT host API + Wasmtime host runtime (`wasm` feature). Guest `.wasm` binaries shadow native tools; built-in tools remain as fallback when no guests are compiled. |
+| Platform sandboxing | ✅ Complete | `sandbox` feature: `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list (x86-64 Linux); `sandbox_init` profile (macOS). Applied in child process before shell `exec`. |
 | Memory CLI commands | ✅ Complete | `stats` (incl. tool exec counts), `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
 | Tool CLI commands | ✅ Complete | `aigent tool list`, `aigent tool call <name> [key=value ...]`. |
 | Telegram command parity | ✅ Complete | Core commands available; all memory, proactive, and tool events routed correctly. |
@@ -407,15 +424,28 @@ is called.
 Never commit the `.secrets/` directory to version control — add it to
 `.gitignore` if your workspace is a git repository.
 
-### Future: platform sandboxing
+### Future: platform sandboxing (now `sandbox` feature)
 
-The next iteration will add host-side syscall filtering:
-- **Linux** — `seccomp` allow-list around every WASM host function
-- **macOS** — `sandbox` profile restricting filesystem access to the workspace
-  and network access to approved hosts
+Enabled by building with `--features sandbox` in the `aigent-exec` crate:
 
-These are currently stubbed in planning; the workspace and approval-mode
-sandboxing described above is active today.
+```toml
+# Cargo.toml (aigent-exec)
+[features]
+sandbox = ["dep:libc"]
+```
+
+| Platform | Mechanism | Scope |
+|----------|-----------|-------|
+| Linux x86-64 | `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list | Shell child process (after `fork`, before `exec`) |
+| macOS | `sandbox_init(3)` Scheme profile | Shell child process |
+| Other | No-op (workpace sandbox still active) | — |
+
+The seccomp filter allows ≈80 syscalls covering file I/O, networking, memory,
+process management, and time.  All other syscalls return `ENOSYS` (graceful
+failure) rather than `SIGSYS` (kill), so the child process degrades cleanly.
+
+The workspace isolation and approval-mode layers remain active on all
+platforms regardless of whether the `sandbox` feature is compiled in.
 
 ## Development
 

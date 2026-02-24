@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+## Enable platform sandboxing (no-new-privs on Linux, sandbox_init on macOS).
+sandbox = ["dep:libc"]
+## Enable wasmtime WASM tool loading.  Active by default so the registry
+## discovers guest .wasm binaries at runtime without a separate flag.
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
@@ -14,4 +21,12 @@ tracing.workspace = true
 aigent-config = { path = "../config" }
 aigent-core = { path = "../core" }
 aigent-tools = { path = "../tools" }
+
+# WASM runtime (optional – loaded at runtime when .wasm guests are present)
+wasmtime        = { workspace = true, optional = true }
+wasmtime-wasi   = { workspace = true, optional = true }
+bytes           = { workspace = true, optional = true }
+
+# Platform sandboxing (optional – enabled via `sandbox` feature)
+libc = { workspace = true, optional = true }
 

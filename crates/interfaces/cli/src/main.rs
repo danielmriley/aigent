@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use chrono::{Local, Utc};
+use chrono::Local;
 use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use tracing_subscriber::EnvFilter;

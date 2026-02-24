@@ -684,7 +684,7 @@ async fn handle_connection(
 
                 // Execute — holds lock only for the duration of the tool run.
                 let exec_result = {
-                    let mut s = state.lock().await;
+                    let s = state.lock().await;
                     s.tool_executor
                         .execute(&s.tool_registry, &call.tool, &call.args)
                         .await
