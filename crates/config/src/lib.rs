@@ -62,6 +62,30 @@ pub struct MemoryConfig {
     /// Number of non-anchor entries per multi-agent sleep batch.
     /// Core and UserProfile entries are always replicated into every batch.
     pub multi_agent_sleep_batch_size: usize,
+    /// Maximum entries per tier written into the YAML KV vault summaries.
+    /// Lower values reduce vault file size; higher values expose more detail.
+    pub kv_tier_limit: usize,
+    /// IANA timezone name (e.g. `"America/New_York"`, `"Europe/London"`).
+    /// Used to determine the local time when evaluating the nightly sleep window.
+    /// Falls back to UTC when the name is unrecognised.
+    pub timezone: String,
+    /// Episodic entries older than this many days whose confidence is below
+    /// `forget_min_confidence` are pruned during the sleep cycle.
+    /// Set to `0` (the default) to disable.
+    pub forget_episodic_after_days: u64,
+    /// Confidence ceiling for lightweight forgetting.  Only entries *below* this
+    /// threshold are eligible for pruning.  Has no effect when
+    /// `forget_episodic_after_days` is `0`.
+    pub forget_min_confidence: f32,
+    /// How often (in minutes) the daemon runs a proactive check to see if it
+    /// should send an unprompted message.  `0` (the default) disables proactive
+    /// mode entirely.
+    pub proactive_interval_minutes: u64,
+    /// Do-not-disturb window start hour in local time.  Proactive messages are
+    /// suppressed between `proactive_dnd_start_hour` and `proactive_dnd_end_hour`.
+    pub proactive_dnd_start_hour: u8,
+    /// Do-not-disturb window end hour in local time.
+    pub proactive_dnd_end_hour: u8,
 }
 
 impl Default for MemoryConfig {
@@ -75,6 +99,13 @@ impl Default for MemoryConfig {
             night_sleep_end_hour: 6,
             core_rewrite_requires_approval: true,
             multi_agent_sleep_batch_size: 60,
+            kv_tier_limit: 15,
+            timezone: "UTC".to_string(),
+            forget_episodic_after_days: 0,
+            forget_min_confidence: 0.3,
+            proactive_interval_minutes: 0,
+            proactive_dnd_start_hour: 22,
+            proactive_dnd_end_hour: 8,
         }
     }
 }

@@ -37,6 +37,20 @@ pub enum ClientCommand {
     /// Manually trigger the full nightly multi-agent sleep cycle.
     /// Falls back to single-agent if the LLM is unavailable.
     RunMultiAgentSleepCycle,
+    /// Immediately run the proactive check irrespective of the configured
+    /// interval and DND window.
+    TriggerProactive,
+    /// Return statistics about proactive mode activity.
+    GetProactiveStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProactiveStatsPayload {
+    pub total_sent: u64,
+    pub last_proactive_at: Option<String>,
+    pub interval_minutes: u64,
+    pub dnd_start_hour: u8,
+    pub dnd_end_hour: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,4 +65,6 @@ pub enum ServerEvent {
     /// This is NOT a terminal event — the client continues reading until
     /// `Ack` arrives.
     StatusLine(String),
+    /// Response to `GetProactiveStats`.
+    ProactiveStats(ProactiveStatsPayload),
 }

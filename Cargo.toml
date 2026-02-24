@@ -38,3 +38,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 async-trait = "0.1"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+sha2 = "0.10"
+notify = "6"
+redb = "2"
+bincode = "2"
+lru = "0.12"
+chrono-tz = "0.10"

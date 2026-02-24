@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,11 +13,13 @@ pub type EmbedFn = Arc<dyn Fn(&str) -> Option<Vec<f32>> + Send + Sync>;
 use crate::consistency::{ConsistencyDecision, evaluate_core_update};
 use crate::event_log::{MemoryEventLog, MemoryRecordEvent};
 use crate::identity::IdentityKernel;
+use crate::index::{IndexCacheStats, MemoryIndex};
 use crate::retrieval::{RankedMemoryContext, assemble_context_with_provenance};
 use crate::schema::{MemoryEntry, MemoryTier};
 use crate::sleep::{AgenticSleepInsights, SleepSummary, distill};
 use crate::store::MemoryStore;
-use crate::vault::{VaultExportSummary, export_obsidian_vault};
+use crate::vault::{KV_TIER_LIMIT, VaultExportSummary, VaultFileStatus, check_vault_checksums,
+    export_obsidian_vault, read_kv_for_injection, sync_kv_summaries};
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStats {
@@ -28,9 +30,18 @@ pub struct MemoryStats {
     pub semantic: usize,
     pub procedural: usize,
     pub episodic: usize,
+    /// Number of entries currently in the redb index (if enabled).
+    pub index_size: Option<usize>,
+    /// LRU cache statistics for the redb index (if enabled).
+    pub index_cache: Option<IndexCacheStats>,
+    /// Vault YAML summary checksum status (filename → valid).
+    pub vault_files: Vec<VaultFileStatus>,
 }
 
-#[derive(Default)]
+/// Maximum entries per tier written to YAML KV vault summaries when no config
+/// override is provided.  Matches [`KV_TIER_LIMIT`] in the vault module.
+const DEFAULT_KV_TIER_LIMIT: usize = KV_TIER_LIMIT;
+
 pub struct MemoryManager {
     pub identity: IdentityKernel,
     pub store: MemoryStore,
@@ -39,6 +50,25 @@ pub struct MemoryManager {
     /// Optional embedding backend.  When set, every new `MemoryEntry` has its
     /// `embedding` field populated at record time for hybrid retrieval.
     embed_fn: Option<EmbedFn>,
+    /// Optional redb-backed secondary index for O(1) tier lookups.
+    index: Option<MemoryIndex>,
+    /// Maximum entries per tier written into the YAML KV vault summaries.
+    /// Defaults to [`KV_TIER_LIMIT`].  Overridden via [`set_kv_tier_limit`].
+    kv_tier_limit: usize,
+}
+
+impl Default for MemoryManager {
+    fn default() -> Self {
+        Self {
+            identity: IdentityKernel::default(),
+            store: MemoryStore::default(),
+            event_log: None,
+            vault_path: None,
+            embed_fn: None,
+            index: None,
+            kv_tier_limit: DEFAULT_KV_TIER_LIMIT,
+        }
+    }
 }
 
 impl MemoryManager {
@@ -51,6 +81,8 @@ impl MemoryManager {
             event_log: Some(MemoryEventLog::new(path.to_path_buf())),
             vault_path: derive_default_vault_path(path),
             embed_fn: None,
+            index: None,
+            kv_tier_limit: KV_TIER_LIMIT,
         };
 
         let events = manager
@@ -84,10 +116,27 @@ impl MemoryManager {
         self.vault_path = Some(path.as_ref().to_path_buf());
     }
 
+    /// Return the configured vault directory path, if any.
+    pub fn vault_path(&self) -> Option<&Path> {
+        self.vault_path.as_deref()
+    }
+
     /// Configure a synchronous embedding backend.  All new entries recorded
     /// after this call will have their `embedding` field populated.
     pub fn set_embed_fn(&mut self, f: EmbedFn) {
         self.embed_fn = Some(f);
+    }
+
+    /// Override the maximum entries per tier written into the YAML KV vault
+    /// summaries.  The daemon reads this from `config.memory.kv_tier_limit`.
+    pub fn set_kv_tier_limit(&mut self, limit: usize) {
+        self.kv_tier_limit = limit;
+    }
+
+    /// Attach a redb-backed `MemoryIndex` for O(1) tier lookups.  Once set,
+    /// every new entry is also inserted into the index at record time.
+    pub fn set_index(&mut self, idx: MemoryIndex) {
+        self.index = Some(idx);
     }
 
     pub fn entries_by_tier(&self, tier: MemoryTier) -> Vec<&MemoryEntry> {
@@ -133,7 +182,11 @@ impl MemoryManager {
             .cloned()
             .collect::<Vec<_>>();
 
-        assemble_context_with_provenance(non_core, core_entries, query, limit, None)
+        let mut ranked = assemble_context_with_provenance(&non_core, &core_entries, query, limit, None);
+        // Prepend the YAML KV identity block as a pinned high-priority entry so
+        // the agent always knows who it is regardless of retrieval ranking.
+        self.prepend_kv_identity_block(&mut ranked);
+        ranked
     }
 
     pub fn stats(&self) -> MemoryStats {
@@ -147,6 +200,16 @@ impl MemoryManager {
                 MemoryTier::Procedural  => s.procedural    += 1,
                 MemoryTier::Episodic    => s.episodic      += 1,
             }
+        }
+        // Index stats (immutable borrow of LRU cache — hits/misses are stable
+        // between calls so we can report them without a mutable reference).
+        if let Some(idx) = &self.index {
+            s.index_size = idx.len().ok();
+            s.index_cache = Some(idx.cache_stats());
+        }
+        // Vault YAML checksum verification.
+        if let Some(vault_path) = &self.vault_path {
+            s.vault_files = check_vault_checksums(vault_path);
         }
         s
     }
@@ -202,7 +265,12 @@ impl MemoryManager {
     fn apply_replayed_entry(&mut self, entry: MemoryEntry) -> Result<()> {
         match evaluate_core_update(&self.identity, &entry) {
             ConsistencyDecision::Accept => {
-                let _ = self.store.insert(entry);
+                let _ = self.store.insert(entry.clone());
+                if let Some(idx) = &mut self.index {
+                    if let Err(e) = idx.insert(&entry) {
+                        warn!(error = ?e, id = %entry.id, "memory index insert failed during replay — index may be stale");
+                    }
+                }
                 Ok(())
             }
             ConsistencyDecision::Quarantine(reason) => {
@@ -245,6 +313,11 @@ impl MemoryManager {
                 let inserted = self.store.insert(entry.clone());
                 if inserted {
                     debug!(tier = ?entry.tier, source = %entry.source, id = %entry.id, content_len = entry.content.len(), "memory entry recorded");
+                    if let Some(idx) = &mut self.index {
+                        if let Err(e) = idx.insert(&entry) {
+                            warn!(error = ?e, id = %entry.id, "memory index insert failed — index may be stale");
+                        }
+                    }
                     if let Some(event_log) = &self.event_log {
                         let event = MemoryRecordEvent {
                             event_id: Uuid::new_v4(),
@@ -316,6 +389,123 @@ impl MemoryManager {
         Ok(summary)
     }
 
+    // ── Lightweight forgetting ─────────────────────────────────────────────
+
+    /// Remove Episodic entries that are older than `forget_after_days` days
+    /// **and** have confidence below `min_confidence`.
+    ///
+    /// Call this after [`run_sleep_cycle`] when
+    /// `config.memory.forget_episodic_after_days > 0`.
+    ///
+    /// Returns the number of entries removed.
+    pub fn run_forgetting_pass(&mut self, forget_after_days: u64, min_confidence: f32) -> usize {
+        if forget_after_days == 0 {
+            return 0;
+        }
+        let cutoff = Utc::now() - Duration::days(forget_after_days as i64);
+        let before = self.store.len();
+        self.store.retain(|e| {
+            // Keep if wrong tier, too recent, or confidence is high enough.
+            e.tier != MemoryTier::Episodic
+                || e.created_at > cutoff
+                || e.confidence >= min_confidence
+        });
+        let removed = before.saturating_sub(self.store.len());
+        if removed > 0 {
+            info!(
+                removed,
+                forget_after_days,
+                min_confidence,
+                "lightweight forgetting: pruned stale episodic entries"
+            );
+        }
+        removed
+    }
+
+    // ── Belief API ─────────────────────────────────────────────────────────
+
+    /// Record a belief as a Core entry with `source = "belief"` and
+    /// `tags = ["belief"]`.  Stored in the event log so it survives restarts
+    /// and is excluded from sleep-cycle pruning.
+    pub async fn record_belief(
+        &mut self,
+        claim: impl Into<String>,
+        confidence: f32,
+    ) -> Result<MemoryEntry> {
+        let claim: String = claim.into();
+        let embedding = self.embed_fn.as_ref().and_then(|f| f(&claim));
+        let entry = MemoryEntry {
+            id: Uuid::new_v4(),
+            tier: MemoryTier::Core,
+            content: claim.clone(),
+            source: "belief".to_string(),
+            confidence: confidence.clamp(0.0, 1.0),
+            valence: 0.0,
+            created_at: Utc::now(),
+            provenance_hash: "local-dev-placeholder".to_string(),
+            tags: vec!["belief".to_string()],
+            embedding,
+        };
+        let _ = self.store.insert(entry.clone());
+        if let Some(idx) = &mut self.index {
+            if let Err(e) = idx.insert(&entry) {
+                warn!(error = ?e, "belief index insert failed");
+            }
+        }
+        if let Some(event_log) = &self.event_log {
+            let event = MemoryRecordEvent {
+                event_id: Uuid::new_v4(),
+                occurred_at: Utc::now(),
+                entry: entry.clone(),
+            };
+            event_log.append(&event).await?;
+        }
+        info!(claim = %entry.content, confidence, "belief recorded");
+        Ok(entry)
+    }
+
+    /// Retract a belief by ID: records a new Semantic entry with
+    /// `source = "belief:retracted:{id}"`.  The original entry is *not*
+    /// deleted (append-only log), but [`all_beliefs`] will exclude it.
+    pub async fn retract_belief(&mut self, belief_id: Uuid) -> Result<()> {
+        let claim = self
+            .store
+            .get(belief_id)
+            .map(|e| e.content.clone())
+            .unwrap_or_else(|| belief_id.to_string());
+        self.record_inner(
+            MemoryTier::Semantic,
+            format!("Retracted belief: {claim}"),
+            format!("belief:retracted:{belief_id}"),
+        )
+        .await?;
+        info!(%belief_id, "belief retracted");
+        Ok(())
+    }
+
+    /// Return all currently-held (non-retracted) beliefs.
+    ///
+    /// Beliefs are Core entries with `source == "belief"`.  Any whose ID
+    /// appears in a `source = "belief:retracted:{id}"` entry is excluded.
+    pub fn all_beliefs(&self) -> Vec<&MemoryEntry> {
+        let retracted_ids: std::collections::HashSet<Uuid> = self
+            .store
+            .all()
+            .iter()
+            .filter(|e| e.source.starts_with("belief:retracted:"))
+            .filter_map(|e| {
+                e.source
+                    .strip_prefix("belief:retracted:")
+                    .and_then(|s| s.parse::<Uuid>().ok())
+            })
+            .collect();
+        self.store
+            .all()
+            .iter()
+            .filter(|e| e.source == "belief" && !retracted_ids.contains(&e.id))
+            .collect()
+    }
+
     pub fn flush_all(&mut self) -> Result<()> {
         self.sync_vault_projection()
     }
@@ -354,7 +544,36 @@ impl MemoryManager {
             })
             .cloned()
             .collect::<Vec<_>>();
-        assemble_context_with_provenance(non_core, core_entries, query, limit, query_embedding)
+        let mut ranked = assemble_context_with_provenance(&non_core, &core_entries, query, limit, query_embedding);
+        self.prepend_kv_identity_block(&mut ranked);
+        ranked
+    }
+
+    /// Prepend a pinned KV identity block as score=2.0 entry when the vault
+    /// summaries are available.  This guarantees the agent always knows who it
+    /// is even when retrieval ranking would otherwise miss Core entries.
+    fn prepend_kv_identity_block(&self, ranked: &mut Vec<RankedMemoryContext>) {
+        let Some(vault_path) = &self.vault_path else { return };
+        let Some(kv_block) = read_kv_for_injection(vault_path) else { return };
+        ranked.insert(
+            0,
+            RankedMemoryContext {
+                entry: MemoryEntry {
+                    id: Uuid::nil(),
+                    tier: MemoryTier::Core,
+                    content: kv_block,
+                    source: "kv_summary:auto_injected".to_string(),
+                    confidence: 1.0,
+                    valence: 0.0,
+                    created_at: Utc::now(),
+                    provenance_hash: "kv_summary".to_string(),
+                    tags: vec!["identity".to_string(), "auto_injected".to_string()],
+                    embedding: None,
+                },
+                score: 2.0,
+                rationale: "pinned: KV identity summary auto-injected from vault".to_string(),
+            },
+        );
     }
 
     // ── User profile ───────────────────────────────────────────────────────
@@ -708,7 +927,14 @@ impl MemoryManager {
 
     fn sync_vault_projection(&self) -> Result<()> {
         if let Some(path) = &self.vault_path {
+            // Full Obsidian note/index rebuild (incremental: only sub-dirs rebuilt).
             export_obsidian_vault(self.all(), path)?;
+            // Write / update the three YAML KV summary files + MEMORY.md.
+            // Uses SHA-256 checksums — unchanged files are not touched.
+            let written = sync_kv_summaries(self.all(), path, self.kv_tier_limit)?;
+            if written > 0 {
+                debug!(files_written = written, path = %path.display(), "vault KV summaries updated");
+            }
         }
         Ok(())
     }
@@ -923,7 +1149,7 @@ mod tests {
             MemoryTier::Episodic,
             "user asked for weekly planning",
             "user-chat",
-        ).await?;;
+        ).await?;
 
         let context = manager.context_for_prompt(8);
         assert!(context.iter().any(|entry| entry.tier == MemoryTier::Core));

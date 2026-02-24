@@ -107,6 +107,19 @@ enum MemoryCommands {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Proactive mode commands (trigger a check or view statistics).
+    Proactive {
+        #[command(subcommand)]
+        command: ProactiveCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProactiveCommands {
+    /// Immediately run a proactive check (bypasses DND and the configured interval).
+    Check,
+    /// Display proactive mode statistics.
+    Stats,
 }
 
 async fn fetch_available_models() -> aigent_ui::onboard::AvailableModels {
@@ -226,6 +239,29 @@ async fn main() -> Result<()> {
                 let memory = MemoryManager::with_event_log(memory_log_path)?;
                 let target = path.unwrap_or_else(|| ".aigent/vault".to_string());
                 run_memory_export_vault(&memory, &target)?;
+            }
+            MemoryCommands::Proactive { command } => {
+                let client = DaemonClient::new(&config.daemon.socket_path);
+                match command {
+                    ProactiveCommands::Check => {
+                        match client.trigger_proactive().await {
+                            Ok(msg) => println!("{msg}"),
+                            Err(err) => eprintln!("proactive check failed: {err}"),
+                        }
+                    }
+                    ProactiveCommands::Stats => {
+                        match client.get_proactive_stats().await {
+                            Ok(stats) => {
+                                println!("── proactive stats ──────────────────────────────────");
+                                println!("  interval_minutes : {}", stats.interval_minutes);
+                                println!("  dnd window       : {:02}:00 – {:02}:00", stats.dnd_start_hour, stats.dnd_end_hour);
+                                println!("  total_sent       : {}", stats.total_sent);
+                                println!("  last_sent_at     : {}", stats.last_proactive_at.as_deref().unwrap_or("(never)"));
+                            }
+                            Err(err) => eprintln!("failed to fetch stats: {err}"),
+                        }
+                    }
+                }
             }
         },
         Commands::Reset { hard, yes } => {
@@ -1246,12 +1282,43 @@ async fn run_memory_wipe(memory: &mut MemoryManager, layer: CliMemoryLayer, yes:
 
 fn run_memory_stats(memory: &MemoryManager) {
     let stats = memory.stats();
-    println!("memory stats");
-    println!("- total: {}", stats.total);
-    println!("- core: {}", stats.core);
-    println!("- semantic: {}", stats.semantic);
-    println!("- episodic: {}", stats.episodic);
-    println!("- procedural: {}", stats.procedural);
+    println!("── memory stats ─────────────────────────────────────");
+    println!("  total:        {}", stats.total);
+    println!("  core:         {}", stats.core);
+    println!("  user_profile: {}", stats.user_profile);
+    println!("  reflective:   {}", stats.reflective);
+    println!("  semantic:     {}", stats.semantic);
+    println!("  procedural:   {}", stats.procedural);
+    println!("  episodic:     {}", stats.episodic);
+
+    println!();
+    println!("── redb index ───────────────────────────────────────");
+    match (stats.index_size, stats.index_cache) {
+        (Some(size), Some(cache)) => {
+            println!("  entries:    {size}");
+            println!("  cache cap:  {}", cache.capacity);
+            println!("  cache len:  {}", cache.len);
+            println!("  hits:       {}", cache.hits);
+            println!("  misses:     {}", cache.misses);
+            println!("  hit rate:   {:.1}%", cache.hit_rate_pct);
+        }
+        _ => println!("  (index not enabled — run with daemon to activate)"),
+    }
+
+    println!();
+    println!("── vault checksums ──────────────────────────────────");
+    if stats.vault_files.is_empty() {
+        println!("  (vault not configured)");
+    } else {
+        for f in &stats.vault_files {
+            let status = match (f.exists, f.checksum_valid) {
+                (false, _) => "MISSING",
+                (true, true) => "OK",
+                (true, false) => "MODIFIED (human edit detected)",
+            };
+            println!("  {:<28}  {status}", f.filename);
+        }
+    }
 }
 
 fn run_memory_inspect_core(memory: &MemoryManager, limit: usize) {

@@ -509,6 +509,21 @@ impl App {
                 self.pending_stream.clear();
                 self.auto_follow = true;
             }
+            BackendEvent::ReflectionInsight(insight) => {
+                self.state.status = format!("insight: {insight}");
+            }
+            BackendEvent::BeliefAdded { claim, confidence } => {
+                self.state.status = format!("belief recorded ({confidence:.2}): {claim}");
+            }
+            BackendEvent::ProactiveMessage { content } => {
+                self.state.messages.push(Message {
+                    role: "aigent".to_string(),
+                    content,
+                    rendered_md: None,
+                });
+                self.pending_stream.clear();
+                self.auto_follow = true;
+            }
         }
     }
 

@@ -4,7 +4,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use aigent_config::AppConfig;
-use aigent_llm::{LlmRouter, Provider};
+use aigent_llm::{LlmRouter, Provider, extract_json_output};
 use aigent_memory::{
     MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights,
     multi_sleep::{
@@ -14,7 +14,10 @@ use aigent_memory::{
 };
 use tokio::sync::mpsc;
 
-use crate::BackendEvent;
+use crate::{
+    BackendEvent,
+    agent_loop::{ProactiveOutput, ReflectionOutput},
+};
 
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {
@@ -260,6 +263,22 @@ these elements into your responses naturally without explicitly announcing them.
             )
         };
 
+        // Inject current beliefs so the LLM can express a genuine worldview.
+        let beliefs_block = {
+            let beliefs = memory.all_beliefs();
+            if beliefs.is_empty() {
+                String::new()
+            } else {
+                let items = beliefs
+                    .iter()
+                    .take(10)
+                    .map(|e| format!("- {}", e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("\n\nMY_BELIEFS:\n{items}")
+            }
+        };
+
         let prompt = format!(
             "You are {name}. Thinking depth: {thought_style}.\n\
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
@@ -271,7 +290,7 @@ these elements into your responses naturally without explicitly announcing them.
             relational_block = relational_block,
             follow_ups = follow_up_block,
             proactive_directive = proactive_directive,
-            identity = identity_block,
+            identity = format!("{}{}", identity_block, beliefs_block),
             env = environment_block,
             conv = conversation_block,
             mem = context_block,
@@ -665,6 +684,187 @@ these elements into your responses naturally without explicitly announcing them.
             "sleep:multi-agent-cycle",
         ).await;
         Ok(result)
+    }
+
+    /// Inline reflection pass run after every turn.
+    ///
+    /// Sends a compact prompt to the LLM asking it to extract up to 3 new
+    /// beliefs and free-form insights from the exchange that just completed.
+    /// Any extracted beliefs are persisted via `memory.record_belief()`.
+    /// Reflective observations are persisted via `memory.record(Reflective, …)`.
+    ///
+    /// Returns the [`BackendEvent`] variants (`ReflectionInsight` /
+    /// `BeliefAdded`) that the caller should broadcast to subscribers.
+    pub async fn inline_reflect(
+        &self,
+        memory: &mut MemoryManager,
+        user_message: &str,
+        assistant_reply: &str,
+    ) -> Result<Vec<BackendEvent>> {
+        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
+            Provider::OpenRouter
+        } else {
+            Provider::Ollama
+        };
+
+        let prompt = format!(
+            "You are a silent memory analyst.  Given the exchange below, extract up to 3 \
+             *new* lasting beliefs or observations ({name} has about the user or the world) \
+             that are worth remembering.  \
+             Also list up to 2 short free-form reflective insights.\n\
+             Respond only with valid JSON matching this schema:\n\
+             {{\"beliefs\":[{{\"claim\":\"...\",\"confidence\":0.7}},...],\"reflections\":[\"...\",...]}}\n\
+             If there is nothing worth remembering, return {{\"beliefs\":[],\"reflections\":[]}}.\n\n\
+             EXCHANGE:\nUser: {user}\nAssistant: {asst}",
+            name = self.config.agent.name,
+            user = truncate_for_prompt(user_message, 400),
+            asst = truncate_for_prompt(assistant_reply, 400),
+        );
+
+        let Ok((_provider, raw)) = self
+            .llm
+            .chat_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+            )
+            .await
+        else {
+            debug!("inline_reflect: LLM unavailable — skipping");
+            return Ok(Vec::new());
+        };
+
+        let output: ReflectionOutput = match extract_json_output(&raw) {
+            Some(v) => v,
+            None => {
+                debug!("inline_reflect: could not parse JSON — skipping");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut events = Vec::new();
+
+        for belief in &output.beliefs {
+            if let Err(err) = memory.record_belief(&belief.claim, belief.confidence).await {
+                warn!(?err, claim = %belief.claim, "inline_reflect: failed to record belief");
+            } else {
+                events.push(BackendEvent::BeliefAdded {
+                    claim: belief.claim.clone(),
+                    confidence: belief.confidence,
+                });
+            }
+        }
+
+        for insight in &output.reflections {
+            if let Err(err) = memory
+                .record(MemoryTier::Reflective, insight.clone(), "inline-reflect")
+                .await
+            {
+                warn!(?err, "inline_reflect: failed to record reflective insight");
+            } else {
+                events.push(BackendEvent::ReflectionInsight(insight.clone()));
+            }
+        }
+
+        debug!(
+            beliefs = output.beliefs.len(),
+            reflections = output.reflections.len(),
+            "inline_reflect: complete"
+        );
+
+        Ok(events)
+    }
+
+    /// Proactive check run on a background timer.
+    ///
+    /// Looks at the agent's current beliefs, recent reflections, and current
+    /// context to decide whether there is something worth proactively sharing
+    /// with the user.  Returns `None` when the agent decides to stay silent,
+    /// or `Some(ProactiveOutput)` with the message to deliver.
+    pub async fn run_proactive_check(
+        &self,
+        memory: &mut MemoryManager,
+    ) -> Option<ProactiveOutput> {
+        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
+            Provider::OpenRouter
+        } else {
+            Provider::Ollama
+        };
+
+        // Build a brief summary of current beliefs and recent reflections.
+        let beliefs_summary = {
+            let beliefs = memory.all_beliefs();
+            if beliefs.is_empty() {
+                "(none yet)".to_string()
+            } else {
+                beliefs
+                    .iter()
+                    .take(8)
+                    .map(|e| format!("- {}", e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        };
+
+        let recent_reflections = {
+            let ctx = memory.context_for_prompt_ranked_with_embed("recent", 5, None);
+            let reflections: Vec<String> = ctx
+                .iter()
+                .filter(|item| item.entry.tier == MemoryTier::Reflective)
+                .map(|item| format!("- {}", truncate_for_prompt(&item.entry.content, 200)))
+                .collect();
+            if reflections.is_empty() {
+                "(none yet)".to_string()
+            } else {
+                reflections.join("\n")
+            }
+        };
+
+        let prompt = format!(
+            "You are {name}, an AI companion.  Based on your current beliefs and recent \
+             reflections, decide whether there is something genuinely useful, timely, or \
+             caring you could proactively share with the user right now \
+             — a check-in, a reminder, an insight, or a follow-up concern.\n\
+             Only return an action if it adds real value; default to silence.\n\
+             Respond only with valid JSON:\n\
+             {{\"action\":\"follow_up\"|\"reminder\"|\"insight\"|null,\
+              \"message\":\"...\",\
+              \"urgency\":0.5}}\n\
+             Set action to null and omit message when staying silent.\n\n\
+             CURRENT_BELIEFS:\n{beliefs}\n\nRECENT_REFLECTIONS:\n{reflections}",
+            name = self.config.agent.name,
+            beliefs = beliefs_summary,
+            reflections = recent_reflections,
+        );
+
+        let Ok((_provider, raw)) = self
+            .llm
+            .chat_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+            )
+            .await
+        else {
+            debug!("run_proactive_check: LLM unavailable");
+            return None;
+        };
+
+        let output: ProactiveOutput = extract_json_output(&raw)?;
+
+        if output.action.is_none() || output.message.as_deref().map(|m| m.is_empty()).unwrap_or(true) {
+            debug!("run_proactive_check: decided to stay silent");
+            return None;
+        }
+
+        info!(
+            action = ?output.action,
+            urgency = ?output.urgency,
+            "run_proactive_check: proactive message will be sent"
+        );
+        Some(output)
     }
 
     /// Legacy single-shot turn helper. Callers should use the server path

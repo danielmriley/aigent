@@ -209,6 +209,29 @@ impl DaemonClient {
         }
     }
 
+    /// Immediately run a proactive check (ignores DND and interval).
+    /// Returns the daemon Ack message string.
+    pub async fn trigger_proactive(&self) -> Result<String> {
+        let events = self.request_events(ClientCommand::TriggerProactive).await?;
+        for event in events {
+            if let ServerEvent::Ack(msg) = event {
+                return Ok(msg);
+            }
+        }
+        bail!("daemon did not return an Ack for TriggerProactive")
+    }
+
+    /// Retrieve proactive mode statistics.
+    pub async fn get_proactive_stats(&self) -> Result<crate::commands::ProactiveStatsPayload> {
+        let events = self.request_events(ClientCommand::GetProactiveStats).await?;
+        for event in events {
+            if let ServerEvent::ProactiveStats(payload) = event {
+                return Ok(payload);
+            }
+        }
+        bail!("daemon did not return ProactiveStats")
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<aigent_tools::ToolSpec>> {
         let events = self.request_events(ClientCommand::ListTools).await?;
         for event in events {

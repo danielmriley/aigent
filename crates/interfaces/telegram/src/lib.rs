@@ -52,6 +52,32 @@ pub async fn start_bot(client_ipc: DaemonClient) -> Result<()> {
             };
 
             let chat_id = message.chat.id;
+
+            // ── Typing indicator ────────────────────────────────────────────────────
+            // Fire a background task that periodically sends "typing" until
+            // the response is ready.  Telegram shows the indicator for ~5 s
+            // after each sendChatAction call, so we refresh every 4 s.
+            let (cancel_typing_tx, cancel_typing_rx) = tokio::sync::oneshot::channel::<()>();
+            {
+                let typing_client = client.clone();
+                let typing_url = base_url.clone();
+                tokio::spawn(async move {
+                    // Immediate first ping.
+                    let _ = send_chat_action(&typing_client, &typing_url, chat_id, "typing").await;
+                    let mut interval = tokio::time::interval(Duration::from_secs(4));
+                    interval.tick().await; // consume tick that fires immediately
+                    let mut cancel = cancel_typing_rx;
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let _ = send_chat_action(&typing_client, &typing_url, chat_id, "typing").await;
+                            }
+                            _ = &mut cancel => break,
+                        }
+                    }
+                });
+            }
+
             let response = match handle_telegram_input(
                 &client_ipc,
                 chat_id,
@@ -66,6 +92,9 @@ pub async fn start_bot(client_ipc: DaemonClient) -> Result<()> {
                     format!("⚠️ error: {err}")
                 }
             };
+
+            // Cancel the typing indicator before sending the reply.
+            let _ = cancel_typing_tx.send(());
 
             for chunk in chunk_message(&response, 3500) {
                 if let Err(err) = send_message(&client, &base_url, chat_id, &chunk).await {
@@ -253,6 +282,20 @@ async fn send_message(client: &Client, base_url: &str, chat_id: i64, text: &str)
         bail!(description);
     }
 
+    Ok(())
+}
+
+/// Send a `sendChatAction` request to Telegram (best-effort; errors are silently ignored).
+async fn send_chat_action(
+    client: &Client,
+    base_url: &str,
+    chat_id: i64,
+    action: &str,
+) -> Result<()> {
+    let url = format!("{base_url}/sendChatAction");
+    let body = serde_json::json!({ "chat_id": chat_id, "action": action });
+    // Fire and forget — a failed typing indicator must never surface to the user.
+    let _ = client.post(url).json(&body).send().await;
     Ok(())
 }
 

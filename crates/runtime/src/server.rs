@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 use chrono::{DateTime, Timelike, Utc};
+use chrono_tz::Tz;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
@@ -12,7 +13,7 @@ use tracing::{error, info, warn};
 
 use aigent_config::AppConfig;
 use aigent_exec::{ExecutionPolicy, ToolExecutor};
-use aigent_memory::{EmbedFn, MemoryManager, MemoryTier};
+use aigent_memory::{EmbedFn, MemoryManager, MemoryTier, VaultEditEvent, spawn_vault_watcher};
 use aigent_tools::ToolRegistry;
 
 use crate::{
@@ -36,6 +37,10 @@ struct DaemonState {
     event_tx: broadcast::Sender<BackendEvent>,
     /// Instant of the last successful multi-agent sleep cycle run.
     last_multi_agent_sleep_at: Option<std::time::Instant>,
+    /// Total proactive messages sent since daemon start.
+    proactive_total_sent: u64,
+    /// Timestamp of the last proactive message sent.
+    last_proactive_at: Option<DateTime<Utc>>,
 }
 
 impl DaemonState {
@@ -115,6 +120,9 @@ pub async fn run_unified_daemon(
         info!(model = %embed_model, "embedding backend configured");
     }
 
+    // Apply config-driven memory tuning.
+    memory.set_kv_tier_limit(config.memory.kv_tier_limit);
+
     // Auto-seed Core identity if it's missing (safety net for upgrades or
     // first-run cases where onboarding seeded the config but not the event log).
     {
@@ -148,6 +156,18 @@ pub async fn run_unified_daemon(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
+    // IANA timezone for the nightly quiet window (default UTC).
+    let sleep_tz: Tz = config.memory.timezone.parse().unwrap_or_else(|_| {
+        tracing::warn!(tz = %config.memory.timezone, "unrecognised timezone — falling back to UTC");
+        chrono_tz::UTC
+    });
+    // Lightweight forgetting parameters.
+    let forget_after_days = config.memory.forget_episodic_after_days;
+    let forget_min_confidence = config.memory.forget_min_confidence;
+    // Proactive mode parameters.
+    let proactive_interval_minutes = config.memory.proactive_interval_minutes;
+    let proactive_dnd_start = config.memory.proactive_dnd_start_hour as u32;
+    let proactive_dnd_end = config.memory.proactive_dnd_end_hour as u32;
 
     let runtime = AgentRuntime::new(config);
     runtime.run().await?;
@@ -166,6 +186,11 @@ pub async fn run_unified_daemon(
             Instant::now().checked_sub(age)
         });
 
+    // Extract vault path before memory is moved into DaemonState so the
+    // bidirectional watcher can be started with an owned PathBuf.
+    let vault_path_for_watcher: Option<std::path::PathBuf> =
+        memory.vault_path().map(|p| p.to_path_buf());
+
     let state = Arc::new(Mutex::new(DaemonState {
         runtime,
         memory,
@@ -176,8 +201,44 @@ pub async fn run_unified_daemon(
         started_at: Instant::now(),
         last_turn_at: None,
         event_tx,
-        last_multi_agent_sleep_at,
-    }));
+        last_multi_agent_sleep_at,        proactive_total_sent: 0,
+        last_proactive_at: None,    }));
+
+    // ── Bidirectional vault watcher ─────────────────────────────────────────────────
+    // Watch the four summary files in the vault for human edits and ingest
+    // any changes as high-confidence memories with source="human-edit".
+    if let Some(vault_path) = vault_path_for_watcher {
+        let (vault_edit_tx, mut vault_edit_rx) =
+            tokio::sync::mpsc::unbounded_channel::<VaultEditEvent>();
+        let _watcher_handle = spawn_vault_watcher(vault_path, vault_edit_tx);
+
+        let watcher_state = state.clone();
+        tokio::spawn(async move {
+            while let Some(ev) = vault_edit_rx.recv().await {
+                let mut s = watcher_state.lock().await;
+                // Route to the appropriate tier based on the filename.
+                let tier = if ev.filename == aigent_memory::KV_CORE {
+                    MemoryTier::Core
+                } else if ev.filename == aigent_memory::KV_USER_PROFILE {
+                    MemoryTier::UserProfile
+                } else {
+                    MemoryTier::Reflective
+                };
+                // Record the raw edit so the next sleep cycle can reconcile it.
+                // Truncate to 800 chars to avoid enormous prompt tokens.
+                let note = format!(
+                    "[human-edit] {} was updated in the vault:\n{}",
+                    ev.filename,
+                    &ev.content[..ev.content.len().min(800)]
+                );
+                if let Err(err) = s.memory.record(tier, note, "human-edit").await {
+                    warn!(?err, file = %ev.filename, "vault watcher: failed to record human edit");
+                } else {
+                    info!(file = %ev.filename, tier = ?tier, "vault watcher: human edit ingested");
+                }
+            }
+        });
+    }
 
     let listener = UnixListener::bind(&socket_path)?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
@@ -262,6 +323,13 @@ pub async fn run_unified_daemon(
                     Ok(_) => {}
                     Err(ref err) => warn!(?err, "background passive distillation failed"),
                 }
+                // Lightweight forgetting: prune old low-confidence episodic entries.
+                if forget_after_days > 0 {
+                    let pruned = memory.run_forgetting_pass(forget_after_days, forget_min_confidence);
+                    if pruned > 0 {
+                        info!(pruned, forget_after_days, "lightweight forgetting applied during sleep");
+                    }
+                }
                 s.memory = memory;
             }
         });
@@ -290,7 +358,7 @@ pub async fn run_unified_daemon(
                 }
 
                 // Time-of-day guard: only consolidate in the quiet window.
-                let hour = Utc::now().hour();
+                let hour = Utc::now().with_timezone(&sleep_tz).hour();
                 let in_quiet_window = if sleep_quiet_start <= sleep_quiet_end {
                     hour >= sleep_quiet_start && hour < sleep_quiet_end
                 } else {
@@ -345,6 +413,79 @@ pub async fn run_unified_daemon(
                             s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
                         }
                         Err(ref err) => warn!(?err, "background multi-agent sleep cycle failed"),
+                    }
+                }
+            }
+        });
+    }
+
+    // Task C — Proactive mode: fire periodically and optionally send an
+    // unprompted message.  Disabled when proactive_interval_minutes == 0.
+    if proactive_interval_minutes > 0 {
+        let proactive_state = state.clone();
+        let mut proactive_shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(proactive_interval_minutes * 60);
+            let poll = std::time::Duration::from_secs(60);
+            let mut last_check = std::time::Instant::now()
+                .checked_sub(interval / 2)
+                .unwrap_or_else(std::time::Instant::now);
+
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(poll) => {}
+                    changed = proactive_shutdown_rx.changed() => {
+                        if changed.is_ok() && *proactive_shutdown_rx.borrow() { break; }
+                        continue;
+                    }
+                }
+
+                if last_check.elapsed() < interval {
+                    continue;
+                }
+
+                // DND window guard.
+                let hour = Utc::now().with_timezone(&sleep_tz).hour();
+                let in_dnd = if proactive_dnd_start <= proactive_dnd_end {
+                    hour >= proactive_dnd_start && hour < proactive_dnd_end
+                } else {
+                    hour >= proactive_dnd_start || hour < proactive_dnd_end
+                };
+                if in_dnd {
+                    continue;
+                }
+
+                last_check = std::time::Instant::now();
+
+                let (rt_clone, mut memory) = {
+                    let mut s = proactive_state.lock().await;
+                    let rt = s.runtime.clone();
+                    let mem = std::mem::take(&mut s.memory);
+                    (rt, mem)
+                };
+
+                let outcome = rt_clone.run_proactive_check(&mut memory).await;
+
+                {
+                    let mut s = proactive_state.lock().await;
+                    s.memory = memory;
+                    let _ = s.memory.flush_all();
+                    if let Some(out) = outcome {
+                        if let Some(ref msg) = out.message {
+                            let event = BackendEvent::ProactiveMessage { content: msg.clone() };
+                            let _ = s.event_tx.send(event);
+                            let _ = s
+                                .memory
+                                .record(
+                                    MemoryTier::Episodic,
+                                    format!("[proactive] {msg}"),
+                                    "proactive",
+                                )
+                                .await;
+                            s.proactive_total_sent += 1;
+                            s.last_proactive_at = Some(Utc::now());
+                            info!(message_len = msg.len(), "Task C: proactive message sent");
+                        }
                     }
                 }
             }
@@ -480,6 +621,12 @@ async fn handle_connection(
 
                 let outcome = match reply_result {
                     Ok(reply) => {
+                        // Inline reflection: extract beliefs and insights from the exchange.
+                        let reflect_events = state.runtime
+                            .inline_reflect(&mut memory, &user, &reply)
+                            .await
+                            .unwrap_or_default();
+
                         state.last_turn_at = Some(Utc::now());
                         state.recent_turns.push_back(ConversationTurn {
                             user,
@@ -498,7 +645,7 @@ async fn handle_connection(
                         {
                             // Use agentic sleep for richer consolidation.
                             let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-                        let sleep_result = state
+                            let sleep_result = state
                                 .runtime
                                 .run_agentic_sleep_cycle(&mut memory, &noop_tx)
                                 .await;
@@ -508,7 +655,7 @@ async fn handle_connection(
                             }
                         }
 
-                        Ok(extras)
+                        Ok((extras, reflect_events))
                     }
                     Err(err) => Err(err),
                 };
@@ -522,7 +669,7 @@ async fn handle_connection(
             let _ = streamer.await;
             let mut writer = writer.lock().await;
             match outcome {
-                Ok(extras) => {
+                Ok((extras, reflect_events)) => {
                     send_event(
                         &mut writer,
                         ServerEvent::Backend(BackendEvent::MemoryUpdated),
@@ -534,6 +681,11 @@ async fn handle_connection(
                             ServerEvent::Backend(BackendEvent::Token(extra)),
                         )
                         .await?;
+                    }
+                    // Stream reflection events to the current client and all subscribers.
+                    for ev in reflect_events {
+                        let _ = send_event(&mut writer, ServerEvent::Backend(ev.clone())).await;
+                        let _ = event_tx.send(ev);
                     }
                     send_event(&mut writer, ServerEvent::Backend(BackendEvent::Done)).await?;
                     if is_external {
@@ -726,6 +878,55 @@ async fn handle_connection(
                     }
                 }
             }
+        }
+        ClientCommand::TriggerProactive => {
+            let (rt_clone, mut memory) = {
+                let mut s = state.lock().await;
+                let rt = s.runtime.clone();
+                let mem = std::mem::take(&mut s.memory);
+                (rt, mem)
+            };
+            let event_tx_clone = event_tx.clone();
+            let outcome = rt_clone.run_proactive_check(&mut memory).await;
+            let msg = {
+                let mut s = state.lock().await;
+                s.memory = memory;
+                let _ = s.memory.flush_all();
+                if let Some(out) = outcome {
+                    if let Some(ref m) = out.message {
+                        let ev = BackendEvent::ProactiveMessage { content: m.clone() };
+                        let _ = event_tx_clone.send(ev);
+                        let _ = s
+                            .memory
+                            .record(
+                                MemoryTier::Episodic,
+                                format!("[proactive] {m}"),
+                                "proactive",
+                            )
+                            .await;
+                        s.proactive_total_sent += 1;
+                        s.last_proactive_at = Some(Utc::now());
+                        format!("proactive message sent: {m}")
+                    } else {
+                        "proactive check ran — no message to send".to_string()
+                    }
+                } else {
+                    "proactive check ran — decided to stay silent".to_string()
+                }
+            };
+            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+        }
+        ClientCommand::GetProactiveStats => {
+            use crate::commands::ProactiveStatsPayload;
+            let s = state.lock().await;
+            let payload = ProactiveStatsPayload {
+                total_sent: s.proactive_total_sent,
+                last_proactive_at: s.last_proactive_at.map(|t| t.to_rfc3339()),
+                interval_minutes: s.runtime.config.memory.proactive_interval_minutes,
+                dnd_start_hour: s.runtime.config.memory.proactive_dnd_start_hour,
+                dnd_end_hour: s.runtime.config.memory.proactive_dnd_end_hour,
+            };
+            send_event(&mut write_half, ServerEvent::ProactiveStats(payload)).await?;
         }
     }
 

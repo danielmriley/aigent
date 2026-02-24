@@ -72,6 +72,52 @@ A **high-density relational matrix** is injected into every prompt — a compact
 
 An **Obsidian-compatible vault** is auto-projected under `.aigent/vault/` with per-tier indexes, daily memory notes, topic backlinks, and wiki-style links. New entries are written incrementally so the vault stays in sync after every turn without a full rebuild.
 
+### Storage & Performance
+
+**Crash-safe append**: Every write to `events.jsonl` is followed by `flush()` + `sync_all()` so the entry survives a process crash or power loss immediately after `record()`. The `overwrite` path (used by `wipe`, `compact`, and Core retirements) writes to a `.tmp` sibling, fsyncs, then renames atomically — a crash at any point leaves either the old or the new file fully intact.
+
+**Resilient JSONL loading**: Corrupt lines in `events.jsonl` are skipped with a `warn!` trace that includes the line number and error. The bad line is appended to a `events.jsonl.corrupt` sidecar file for forensic inspection. The remaining events load normally — a single bad line never takes down the daemon.
+
+**Redb secondary index** (`aigent_memory::MemoryIndex`): An optional `redb`-backed secondary index lives alongside the JSONL log at `~/.aigent/memory/index.redb`. It stores compact entry metadata (confidence, tier, timestamp, source, content-hash) keyed by UUID and a tier lookup table. An LRU cache (256 entries) sits in front for hot-path reads. If the index file is absent or corrupt it is rebuilt transparently from the event log — zero data loss. The index is opt-in and non-critical: when unavailable, all operations fall back to the in-memory store.
+
+### Vault Projection & Human Co-Authoring
+
+Every sleep cycle writes four auto-generated summary artefacts to the vault root in addition to the Obsidian note/index files:
+
+| File | Content | Tier |
+|---|---|---|
+| `core_summary.yaml` | Top-15 Core entries by confidence | Identity & constitution |
+| `user_profile.yaml` | Top-15 UserProfile entries | User facts & preferences |
+| `reflective_opinions.yaml` | Top-15 Reflective entries | Agent thoughts & opinions |
+| `MEMORY.md` | Human-friendly prose consolidation linking all three | All three tiers |
+
+**YAML format**: Each file has a `checksum: sha256:…` field and a `last_updated` timestamp so you (and the daemon) can detect real changes at a glance. Files are written incrementally — unchanged files are not touched across sleep cycles.
+
+**Truncation policy**: Each file contains at most `KV_TIER_LIMIT` (default: 15) items, sorted by `confidence DESC → recency DESC → valence DESC`. This keeps each file well under 200 lines and prevents context-window bloat.
+
+**Auto-injection**: On every LLM turn, the daemon reads `core_summary.yaml` and `user_profile.yaml` and prepends them as a pinned `AGENT IDENTITY` block at the very top of the prompt context (score 2.0 — always first). This guarantees the agent never forgets who it is even if retrieval ranking would otherwise demote Core entries.
+
+**Bidirectional edits**: A background `notify`-based file watcher monitors the four summary files. When a human edits any of them directly in Obsidian (or any editor), the daemon detects the change and ingests it as a high-confidence `MemoryEntry` with `source = "human-edit"`. The appropriate tier is inferred from the filename (`core_summary.yaml` → Core, `user_profile.yaml` → UserProfile, `reflective_opinions.yaml` → Reflective). The next sleep cycle reconciles the edit with existing memory. This gives you direct, persistent control over the agent's identity — edit the YAML, shape the soul.
+
+### Beliefs & inline reflection
+
+Every completed conversation turn now triggers a short structured LLM call (`inline_reflect`) that extracts up to three new **beliefs** and two free-form **reflective insights** from the exchange. Beliefs are stored in Core memory with a `belief` tag and a confidence score; reflective insights are stored in the Reflective tier. Both are streamed to all subscribers as `BackendEvent::BeliefAdded` and `BackendEvent::ReflectionInsight` events in real time.
+
+All current beliefs (up to 10, sorted by confidence) are automatically injected into every LLM prompt as a `MY_BELIEFS:` block alongside the `IDENTITY:` header. This gives the agent a genuine, evolving worldview that colours every response without the user having to mention it.
+
+### Proactive mode
+
+An optional background task (**Task C** inside the daemon) fires every `proactive_interval_minutes` minutes and asks the LLM whether it has something genuinely worth sharing unprompted — a follow-up question, a reminder, or an insight. Enable it in `config/default.toml`:
+
+```toml
+[memory]
+proactive_interval_minutes = 60   # 0 = disabled (default)
+proactive_dnd_start_hour   = 22   # local time — end of active hours
+proactive_dnd_end_hour     = 8    # local time — start of active hours
+```
+
+During the Do-Not-Disturb window the task runs silently and produces no output. When the agent decides it has something to say, it broadcasts a `BackendEvent::ProactiveMessage` that the TUI renders as a chat bubble and Telegram delivers as a normal message. The message is also persisted as an Episodic entry with `source = "proactive"` so future sleep cycles can reason about it.
+
 **Sleep distillation** runs on a nightly schedule (configurable; default 22:00–06:00) and supports three modes:
 
 - *Passive* — heuristic-only promotion of high-confidence episodic entries; no LLM required.
@@ -113,11 +159,13 @@ An **Obsidian-compatible vault** is auto-projected under `.aigent/vault/` with p
 | `aigent configuration` / `aigent config` | Re-open wizard to update identity, model, Telegram, memory, or safety settings |
 | `aigent telegram` | Run Telegram bot standalone (no TUI) |
 | `aigent daemon start\|stop\|restart\|status` | Manage the background daemon process |
-| `aigent memory stats` | Print memory tier counts |
+| `aigent memory stats` | Print memory tier counts and index/vault health |
 | `aigent memory inspect-core [--limit N]` | Show top core memories |
 | `aigent memory promotions [--limit N]` | Show recent sleep promotions |
 | `aigent memory export-vault [--path DIR]` | Write Obsidian vault to disk |
 | `aigent memory wipe [--layer <all\|core\|episodic\|...>] --yes` | Wipe one or all memory tiers |
+| `aigent memory proactive check` | Force a proactive check right now (bypasses DND and interval) |
+| `aigent memory proactive stats` | Show proactive mode activity (total sent, last sent, DND window) |
 | `aigent doctor` | Print current config and memory diagnostics |
 | `aigent doctor --review-gate [--report FILE]` | Run phase review gate with auto-remediation |
 | `aigent doctor --model-catalog [--provider <all\|ollama\|openrouter>]` | List available models |
@@ -147,9 +195,22 @@ The daemon exposes a Unix socket (`/tmp/aigent.sock` by default) and handles:
 | `ExecuteTool` / `ListTools` | Tool invocation with safety gating |
 | `RunSleepCycle` | Trigger single-agent agentic sleep on demand; streams progress |
 | `RunMultiAgentSleepCycle` | Trigger the full 4-specialist sleep pipeline; streams progress |
+| `TriggerProactive` | Force an immediate proactive check regardless of DND and interval |
+| `GetProactiveStats` | Return proactive mode statistics (`ProactiveStatsPayload`) |
 | `Subscribe` | Persistent broadcast connection for TUI and Telegram relay |
 | `ReloadConfig` | Hot-reload `config/default.toml` and `.env` without restart |
 | `Shutdown` / `Ping` | Graceful shutdown (flushes memory + final sleep pass) / health check |
+
+**Broadcast events** emitted to all `Subscribe` connections:
+
+| Event | Description |
+| --- | --- |
+| `Token` | Streamed LLM output chunk |
+| `ReflectionInsight` | Free-form insight extracted by inline reflection after each turn |
+| `BeliefAdded { claim, confidence }` | New belief persisted from inline reflection |
+| `ProactiveMessage { content }` | Unprompted message from the proactive background task |
+| `ExternalTurn { source, content }` | User message received from a non-TUI channel (e.g. Telegram) |
+| `MemoryUpdated` / `Done` / `Error` | Turn lifecycle signals |
 
 ### WASM extension interface
 
@@ -167,19 +228,30 @@ Guest skills implement `spec()` and `run(params)`.
 | --- | --- | --- |
 | Onboarding wizard (TUI + prompt fallback) | ✅ Complete | Configures identity, model/provider, thinking level, workspace, sleep window, safety profile. |
 | Persistent memory (6 tiers) | ✅ Complete | Core, UserProfile, Reflective, Semantic, Procedural, Episodic — append-only event log. |
+| Crash-safe JSONL (flush + fsync) | ✅ Complete | `append()` fsyncs every write; `overwrite()` uses tmp+rename+fsync; corrupt lines skipped on load. |
 | Hybrid retrieval (lexical + embedding) | ✅ Complete | Ollama embeddings + cosine similarity; graceful fallback to lexical-only. |
 | High-density relational matrix | ✅ Complete | Cross-tier association table injected into every prompt. |
 | Obsidian vault projection | ✅ Complete | Incremental writes; per-tier indexes, daily notes, topic backlinks. |
+| YAML KV summary files (3-tier) | ✅ Complete | `core_summary.yaml`, `user_profile.yaml`, `reflective_opinions.yaml`; checksum-based incremental. |
+| MEMORY.md narrative | ✅ Complete | Human-friendly prose consolidation cross-referencing KV files. |
+| KV auto-injection into every prompt | ✅ Complete | Core + UserProfile pinned at score 2.0 — agent always knows who it is. |
+| Bidirectional vault watcher | ✅ Complete | `notify`-based watcher ingests human edits as `source="human-edit"` memories. |
+| Redb secondary index + LRU cache | ✅ Complete | Opt-in fast tier/confidence lookup; transparent fallback to full scan. |
 | Sleep distillation — passive | ✅ Complete | Heuristic promotion of high-confidence episodic entries; no LLM required. |
 | Sleep distillation — agentic | ✅ Complete | Single-agent LLM reflection; learns about user, resolves contradictions. |
 | Sleep distillation — multi-agent | ✅ Complete | 4 parallel specialists + deliberation/synthesis; 22h rate-limit; progress streaming. |
 | Interactive TUI chat | ✅ Complete | Streaming, syntect markdown rendering, file picker, command palette. |
 | Telegram bot runtime | ✅ Complete | Long-polling, per-chat context, shared daemon state. |
+| Telegram typing indicator | ✅ Complete | `sendChatAction` refreshed every 4 s while the daemon processes a turn. |
 | Daemon IPC server | ✅ Complete | Unix socket; streaming turns, broadcast events, memory peek, tool execution. |
 | Daemon-first architecture | ✅ Complete | Daemon owns all state; TUI and Telegram are thin reconnectable clients. |
+| Belief API | ✅ Complete | `record_belief` / `retract_belief` / `all_beliefs`; stored as tagged Core entries. |
+| Inline reflection | ✅ Complete | Structured LLM call after every turn extracts beliefs + insights; streamed as events. |
+| Belief injection into prompts | ✅ Complete | Up to 10 active beliefs injected as `MY_BELIEFS:` block on every turn. |
+| Proactive mode (Task C) | ✅ Complete | Background task checks for proactive messages; respects DND window and configurable interval. |
 | Tool execution system | ✅ Complete | `read_file`, `write_file`, `run_shell`; workspace-sandboxed, approval-gated. |
 | WASM extension interface | ✅ Complete | WIT host API for guest skills (file I/O, shell, KV, HTTP). |
-| Memory CLI commands | ✅ Complete | `stats`, `inspect-core`, `promotions`, `export-vault`, `wipe`. |
+| Memory CLI commands | ✅ Complete | `stats`, `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
 | Telegram command parity | 🟨 In progress | Core commands available; advanced memory and tool actions pending. |
 | Phase review gate | 🟨 In progress | `doctor --review-gate` implemented; some checks in progress. |
 | Systemd/launchd unit | ⏳ Planned | Daemon auto-start on system boot. |
@@ -231,6 +303,10 @@ aigent memory stats
 aigent memory inspect-core --limit 30
 aigent memory promotions --limit 20
 aigent memory export-vault --path ~/Documents/aigent-vault
+
+# Proactive mode
+aigent memory proactive stats    # show activity (total sent, last sent, DND window)
+aigent memory proactive check    # force a check right now (bypasses DND and interval)
 ```
 
 ### Configuration

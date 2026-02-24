@@ -23,6 +23,23 @@ night_sleep_start_hour = 22
 night_sleep_end_hour = 6
 core_rewrite_requires_approval = true
 multi_agent_sleep_batch_size = 60
+# Maximum entries per tier in the YAML vault KV summaries (core, user-profile, reflective).
+kv_tier_limit = 15
+# IANA timezone for the nightly sleep window. Examples: "America/New_York", "Europe/Berlin".
+timezone = "UTC"
+# Remove low-confidence Episodic entries older than N days during the sleep cycle.
+# Set to 0 to disable lightweight forgetting.
+forget_episodic_after_days = 0
+forget_min_confidence = 0.30
+
+# Proactive mode: set proactive_interval_minutes > 0 to enable.
+# The daemon will periodically check whether it has something worth proactively
+# sharing with the user (a follow-up, reminder, or insight).
+proactive_interval_minutes = 0
+# Do-not-disturb window in local time.  Proactive messages are suppressed
+# between dnd_start and dnd_end (inclusive of both sides of midnight wrap).
+proactive_dnd_start_hour = 22
+proactive_dnd_end_hour = 8
 
 [safety]
 approval_required = true

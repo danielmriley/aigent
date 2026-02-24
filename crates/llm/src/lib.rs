@@ -445,3 +445,58 @@ impl OpenRouterClient {
         )
     }
 }
+
+// ── Structured output extraction ──────────────────────────────────────────────
+
+/// Structured fields that an LLM may embed in a fenced `json` code block
+/// inside its reply.
+///
+/// The agent can instruct the model to wrap structured actions in:
+/// ` ```json\n{ "action": "...", "params": {...}, "reply": "..." }\n` ``` `
+///
+/// The runtime extracts this via [`extract_json_output`] and acts on
+/// `action`/`params` while displaying only `reply` to the user.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StructuredOutput {
+    /// Logical action name (e.g. `"record_memory"`, `"tool_call"`).
+    #[serde(default)]
+    pub action: Option<String>,
+    /// Free-form parameters associated with the action.
+    #[serde(default)]
+    pub params: serde_json::Value,
+    /// Human-readable rationale for the action.
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// The user-facing portion of the reply.  When present, callers should
+    /// display this instead of the raw LLM text.
+    #[serde(default)]
+    pub reply: Option<String>,
+}
+
+/// Extract the first valid JSON fenced code block from an LLM response.
+///
+/// Looks for ` ```json\n...\n` ``` ` delimiters.  Returns `None` when the
+/// response contains no such block or the block is not valid JSON.
+///
+/// # Usage
+///
+/// ```rust
+/// use aigent_llm::{extract_json_output, StructuredOutput};
+///
+/// let raw = "Sure!\n```json\n{\"action\":\"record_belief\",\"reply\":\"Got it\"}\n```";
+/// if let Some(out) = extract_json_output::<StructuredOutput>(raw) {
+///     println!("action: {:?}", out.action);
+/// }
+/// ```
+pub fn extract_json_output<T: serde::de::DeserializeOwned>(response: &str) -> Option<T> {
+    // Find the opening fence.
+    let fence_start = response.find("```json")?;
+    let after_fence = &response[fence_start + "```json".len()..];
+    // Skip any whitespace/newlines immediately after the opening fence.
+    let json_start = after_fence.find(|c: char| !c.is_whitespace())?;
+    let json_body = &after_fence[json_start..];
+    // Find the closing fence.
+    let fence_end = json_body.find("```")?;
+    let json_str = json_body[..fence_end].trim();
+    serde_json::from_str(json_str).ok()
+}

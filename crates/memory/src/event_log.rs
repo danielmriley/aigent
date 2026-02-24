@@ -44,6 +44,10 @@ impl MemoryEventLog {
         let line = serde_json::to_string(event)?;
         file.write_all(line.as_bytes()).await?;
         file.write_all(b"\n").await?;
+        // Flush userspace buffers and fsync to disk so the entry survives a
+        // process crash or power loss immediately after append.
+        file.flush().await?;
+        file.sync_all().await?;
         Ok(())
     }
 
@@ -135,14 +139,47 @@ impl MemoryEventLog {
         let file = OpenOptions::new().read(true).open(&self.path)?;
         let reader = BufReader::new(file);
         let mut events = Vec::new();
+        let mut corrupt_count = 0usize;
 
-        for line in reader.lines() {
-            let line = line?;
+        for (line_idx, line_result) in reader.lines().enumerate() {
+            let line = line_result?;
             if line.trim().is_empty() {
                 continue;
             }
 
-            events.push(serde_json::from_str::<MemoryRecordEvent>(&line)?);
+            match serde_json::from_str::<MemoryRecordEvent>(&line) {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    corrupt_count += 1;
+                    tracing::warn!(
+                        line = line_idx + 1,
+                        error = %err,
+                        path = %self.path.display(),
+                        "corrupt JSONL record — skipping line (original preserved in .corrupt file)"
+                    );
+                    // Append the bad line to a sidecar file for forensics.
+                    let corrupt_path = self.path.with_extension("jsonl.corrupt");
+                    let mut bad = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&corrupt_path)
+                        .unwrap_or_else(|_| {
+                            // If we can't open the sidecar, just continue.
+                            // The warning above is the only signal the user gets.
+                            std::fs::File::open("/dev/null").expect("/dev/null always exists")
+                        });
+                    use std::io::Write as _;
+                    let _ = writeln!(bad, "{line}");
+                }
+            }
+        }
+
+        if corrupt_count > 0 {
+            tracing::warn!(
+                corrupt_lines = corrupt_count,
+                path = %self.path.display(),
+                "event log loaded with skipped corrupt lines — inspect .corrupt sidecar"
+            );
         }
 
         Ok(events)

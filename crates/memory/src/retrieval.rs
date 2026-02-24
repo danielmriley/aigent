@@ -33,59 +33,89 @@ pub struct RankedMemoryContext {
 ///
 /// Core and UserProfile entries are given strong tier boosts so they tend to
 /// appear first even with modest lexical overlap.
-pub fn assemble_context_with_provenance(
-    matches: Vec<MemoryEntry>,
-    core_entries: Vec<MemoryEntry>,
+///
+/// Accepts **slices** to avoid cloning the caller's full memory store before
+/// ranking.  Only the winning `limit` entries are cloned into the output.
+pub fn assemble_context_with_provenance<'a>(
+    matches: &'a [MemoryEntry],
+    core_entries: &'a [MemoryEntry],
     query: &str,
     limit: usize,
     query_embedding: Option<Vec<f32>>,
 ) -> Vec<RankedMemoryContext> {
-    let mut combined = core_entries;
-    combined.extend(matches);
-
-    // Deduplicate by ID.
+    // Build a reference iterator: Core first, then non-Core candidates.
+    // Deduplicate by ID without allocating a second Vec.
     let mut seen_ids = HashSet::new();
-    combined.retain(|entry| seen_ids.insert(entry.id));
+    let combined: Vec<&MemoryEntry> = core_entries
+        .iter()
+        .chain(matches.iter())
+        .filter(|e| seen_ids.insert(e.id))
+        .collect();
 
     let query_terms = tokenize(query);
     let query_emb_slice: &[f32] = query_embedding.as_deref().unwrap_or(&[]);
     let now = Utc::now();
 
-    let mut ranked: Vec<RankedMemoryContext> = combined
+    // Score every candidate by reference — no clones yet.
+    let mut ranked: Vec<(&MemoryEntry, f32, String)> = combined
         .into_iter()
         .map(|entry| {
-            let embedding_sim = cosine_similarity_if_available(&entry, query_emb_slice);
-            score_entry(&entry, &query_terms, now, embedding_sim)
+            let embedding_sim = cosine_similarity_if_available(entry, query_emb_slice);
+            let ctx = score_entry_ref(entry, &query_terms, now, embedding_sim);
+            (entry, ctx.score, ctx.rationale)
         })
         .collect();
 
-    ranked.sort_by(|left, right| {
-        right
-            .score
-            .total_cmp(&left.score)
-            .then_with(|| right.entry.created_at.cmp(&left.entry.created_at))
+    ranked.sort_by(|(_, ls, _), (_, rs, _)| {
+        rs.total_cmp(ls)
     });
 
-    ranked.into_iter().take(limit).collect()
+    // Clone only the top-`limit` entries (winners).
+    ranked
+        .into_iter()
+        .take(limit)
+        .map(|(entry, score, rationale)| RankedMemoryContext {
+            entry: entry.clone(),
+            score,
+            rationale,
+        })
+        .collect()
 }
 
 /// Score a single entry given the current query terms and optional embedding similarity.
+/// Returns a `RankedMemoryContext` with the entry **cloned** — use `score_entry_ref`
+/// when you want to defer cloning.
 pub fn score_entry(
     entry: &MemoryEntry,
     query_terms: &BTreeSet<String>,
     now: chrono::DateTime<Utc>,
     embedding_cos_sim: Option<f32>,
 ) -> RankedMemoryContext {
+    let ctx = score_entry_ref(entry, query_terms, now, embedding_cos_sim);
+    RankedMemoryContext {
+        entry: entry.clone(),
+        score: ctx.score,
+        rationale: ctx.rationale,
+    }
+}
+
+/// Score-only helper: computes score and rationale without cloning the entry.
+/// Used by `assemble_context_with_provenance` to rank by reference before
+/// deciding which entries to clone into the final output.
+pub(crate) fn score_entry_ref(
+    entry: &MemoryEntry,
+    query_terms: &BTreeSet<String>,
+    now: chrono::DateTime<Utc>,
+    embedding_cos_sim: Option<f32>,
+) -> ScoreOnly {
     let tier_score = tier_priority(entry.tier);
     let recency = recency_score(now, entry.created_at);
     let lexical = lexical_relevance_score(&entry.content, query_terms);
     let confidence = entry.confidence.clamp(0.0, 1.0);
 
     let score = if let Some(emb) = embedding_cos_sim {
-        // Hybrid: tier + recency + lexical + embedding + confidence
         (tier_score * 0.35) + (recency * 0.20) + (lexical * 0.25) + (emb * 0.15) + (confidence * 0.05)
     } else {
-        // Lexical-only fallback: redistribute embedding weight to lexical/recency
         (tier_score * 0.35) + (recency * 0.25) + (lexical * 0.35) + (confidence * 0.05)
     };
 
@@ -98,25 +128,20 @@ pub fn score_entry(
         ),
     };
 
-    trace!(
-        id = %entry.id,
-        tier = ?entry.tier,
-        score,
-        %rationale,
-        "scored memory entry"
-    );
+    trace!(id = %entry.id, tier = ?entry.tier, score, %rationale, "scored memory entry");
+    ScoreOnly { score, rationale }
+}
 
-    RankedMemoryContext {
-        entry: entry.clone(),
-        score,
-        rationale,
-    }
+/// Lightweight score result used during the reference-only ranking pass.
+pub(crate) struct ScoreOnly {
+    pub score: f32,
+    pub rationale: String,
 }
 
 /// Legacy helper: assemble without provenance metadata.
 pub fn assemble_context(
-    matches: Vec<MemoryEntry>,
-    core_entries: Vec<MemoryEntry>,
+    matches: &[MemoryEntry],
+    core_entries: &[MemoryEntry],
 ) -> Vec<MemoryEntry> {
     assemble_context_with_provenance(matches, core_entries, "", 12, None)
         .into_iter()
@@ -234,8 +259,8 @@ mod tests {
         let semantic = sample_entry(MemoryTier::Semantic, "my name is aigent", 2);
 
         let ranked = assemble_context_with_provenance(
-            vec![semantic],
-            vec![core.clone()],
+            &[semantic],
+            &[core.clone()],
             "what is your name",
             2,
             None,
@@ -255,7 +280,7 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "some other fact", 1);
 
         let ranked =
-            assemble_context_with_provenance(vec![episodic, profile.clone()], vec![], "", 2, None);
+            assemble_context_with_provenance(&[episodic, profile.clone()], &[], "", 2, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(profile.id));
         Ok(())
@@ -271,8 +296,8 @@ mod tests {
         );
 
         let ranked = assemble_context_with_provenance(
-            vec![unrelated, relevant.clone()],
-            vec![],
+            &[unrelated, relevant.clone()],
+            &[],
             "create milestone project plan",
             2,
             None,
@@ -292,7 +317,7 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "user mentioned project X briefly", 1);
 
         let ranked =
-            assemble_context_with_provenance(vec![reflective.clone(), episodic], vec![], "", 2, None);
+            assemble_context_with_provenance(&[reflective.clone(), episodic], &[], "", 2, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(reflective.id));
         Ok(())
@@ -313,8 +338,8 @@ mod tests {
         let query_embedding = Some(vec![1.0_f32, 0.0, 0.0]);
 
         let ranked = assemble_context_with_provenance(
-            vec![close.clone(), far],
-            vec![],
+            &[close.clone(), far],
+            &[],
             "rust async",
             2,
             query_embedding,
