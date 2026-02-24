@@ -625,3 +625,139 @@ response path (they are still delivered to persistent `Subscribe` connections).
 
 - [ ] `cargo build --workspace` — 0 errors, 0 warnings
 - [ ] `cargo test --workspace` — all pass
+
+---
+
+## 2026-02-24 — Phase 3: Tool Use + Cleanup Round 2
+
+### Cleanup items
+
+#### 1. Proactive shutdown safety (`DaemonState::proactive_handle`)
+
+Task C (proactive mode) now stores its `AbortHandle` in `DaemonState`.
+On daemon shutdown the handle is aborted before the final flush-and-sleep so
+Task C can never fire mid-exit.
+
+```rust
+// DaemonState gains:
+proactive_handle: Option<tokio::task::AbortHandle>,
+
+// Shutdown (run_unified_daemon):
+let handle = state.lock().await.proactive_handle.take();
+if let Some(h) = handle { h.abort(); info!("proactive task stopped"); }
+```
+
+#### 2. Proactive cooldown (`proactive_cooldown_minutes`)
+
+New `[memory]` config key (default `5`).  Skips a proactive check if a message
+was sent within the last N minutes, preventing bursts when the daemon becomes
+very active.
+
+```toml
+[memory]
+proactive_cooldown_minutes = 5   # 0 = no cooldown
+```
+
+#### 3. Richer belief injection sorting
+
+Beliefs are now sorted by a composite score before the `max_beliefs_in_prompt`
+cap is applied:
+
+```
+score = confidence × 0.6  +  recency_factor × 0.25  +  valence × 0.15
+recency_factor = 1 / (1 + days_since_created)
+```
+
+The most relevant, recent, and positive beliefs always surface first regardless
+of raw confidence.
+
+#### 4. README / capabilities matrix updated
+
+- Telegram command parity: `✅ Complete`
+- Proactive mode entry: cooldown and graceful shutdown noted
+- `Belief injection into prompts`: updated to reflect composite scoring
+
+---
+
+### Phase 3: Full Tool Use & Action Capabilities
+
+#### New tools (aigent-tools, src/builtins.rs)
+
+| Tool | Description | Data path |
+|---|---|---|
+| `calendar_add_event` | Append event to JSON calendar store | `.aigent/calendar.json` |
+| `web_search` | DuckDuckGo Instant Answer API | live HTTP |
+| `draft_email` | Save draft as plain-text file | `.aigent/drafts/` |
+| `remind_me` | Append reminder for proactive surfacing | `.aigent/reminders.json` |
+
+All four are **approval-exempt** by default (`approval_exempt_tools` in config).
+
+#### ExecutionPolicy: per-tool allow/deny lists
+
+```toml
+[safety]
+tool_allowlist = []                    # empty = all tools permitted
+tool_denylist  = []                    # explicit block list
+approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search"]
+```
+
+These map to three new fields on `ExecutionPolicy`:
+
+```rust
+pub tool_allowlist: Vec<String>,
+pub tool_denylist: Vec<String>,
+pub approval_exempt_tools: Vec<String>,
+```
+
+#### LLM-driven tool calling in `SubmitTurn`
+
+Before each streaming response the daemon executes a brief non-streaming LLM
+call (`AgentRuntime::maybe_tool_call`) that returns either a tool invocation
+JSON or `{"no_action":true}`.  On zero overhead for conversational messages.
+
+Flow:
+1. `maybe_tool_call(user_message, tool_specs) → Option<LlmToolCall>`
+2. If `Some`: execute → record to `Procedural` with `source="tool-use:{name}"` → emit `ToolCallStart` / `ToolCallEnd`
+3. Inject `[TOOL_RESULT: …]` block into the effective user message for the main LLM call
+4. `inline_reflect` receives the original user ↔ assistant exchange (not the tool-augmented prompt)
+
+#### New CLI subcommand: `aigent tool`
+
+```bash
+aigent tool list                             # list registered tools
+aigent tool call web_search query="Rust"     # call a tool directly
+aigent tool call calendar_add_event title="Meeting" date="tomorrow"
+```
+
+#### `aigent memory stats` — tool execution section
+
+```
+── tool executions ──────────────────────────────────
+  today (24h): 3
+  all time:    17
+    web_search: 10
+    calendar_add_event: 5
+    remind_me: 2
+```
+
+#### `default_registry` signature change
+
+`aigent_exec::default_registry` now takes a second `agent_data_dir: PathBuf`
+argument for the new data-path tools.  The only call site is in
+`crates/runtime/src/server.rs` (auto-passes `.aigent/`).
+
+#### Migration steps
+
+1. `cargo build --workspace` — should produce 0 errors, 0 warnings.
+2. Run `aigent daemon restart` to pick up the new tools and policy fields.
+3. Add the new optional keys to your `config/default.toml` if desired
+   (or leave them out — serde defaults apply).
+4. Test: `aigent tool list` should show 7 tools.
+5. Test: `aigent tool call web_search query="hello world"`.
+
+### Verification
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all pass
+- [ ] `aigent tool list` — 7 tools listed
+- [ ] `aigent tool call web_search query="Rust programming"` — returns results

@@ -6,7 +6,7 @@ pub mod micro_profile;
 mod runtime;
 mod server;
 
-pub use agent_loop::{ProactiveOutput, ReflectionBelief, ReflectionOutput, TurnSource};
+pub use agent_loop::{LlmToolCall, ProactiveOutput, ReflectionBelief, ReflectionOutput, TurnSource};
 pub use client::DaemonClient;
 pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, ServerEvent};
 pub use events::{BackendEvent, ToolCallInfo, ToolResult};

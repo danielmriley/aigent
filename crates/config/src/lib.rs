@@ -87,9 +87,13 @@ pub struct MemoryConfig {
     /// Do-not-disturb window end hour in local time.
     pub proactive_dnd_end_hour: u8,
     /// Maximum number of beliefs to inject into each conversation prompt.
-    /// Beliefs are sorted by confidence (desc) before truncation.
+    /// Beliefs are sorted by composite score (confidence × recency × valence) before truncation.
     /// `0` means unlimited (not recommended for long-running agents).
     pub max_beliefs_in_prompt: usize,
+    /// Minimum gap in minutes between proactive messages actually sent.
+    /// Prevents rapid-fire messages when the agent becomes very active.
+    /// Only checked after a message has been sent; a first message is never blocked.
+    pub proactive_cooldown_minutes: u64,
 }
 
 impl Default for MemoryConfig {
@@ -111,6 +115,7 @@ impl Default for MemoryConfig {
             proactive_dnd_start_hour: 22,
             proactive_dnd_end_hour: 8,
             max_beliefs_in_prompt: 5,
+            proactive_cooldown_minutes: 5,
         }
     }
 }
@@ -121,6 +126,14 @@ pub struct SafetyConfig {
     pub approval_required: bool,
     pub allow_shell: bool,
     pub allow_wasm: bool,
+    /// Explicit allow-list of tool names.  Empty (the default) means all tools
+    /// are allowed, subject to `allow_shell` / `allow_wasm` capability gates.
+    pub tool_allowlist: Vec<String>,
+    /// Explicit deny-list of tool names.  Takes precedence over `tool_allowlist`.
+    pub tool_denylist: Vec<String>,
+    /// Tools that bypass the interactive approval flow even when
+    /// `approval_required = true`.  Defaults to the four safe built-in tools.
+    pub approval_exempt_tools: Vec<String>,
 }
 
 impl Default for SafetyConfig {
@@ -129,6 +142,14 @@ impl Default for SafetyConfig {
             approval_required: true,
             allow_shell: false,
             allow_wasm: false,
+            tool_allowlist: vec![],
+            tool_denylist: vec![],
+            approval_exempt_tools: vec![
+                "calendar_add_event".to_string(),
+                "remind_me".to_string(),
+                "draft_email".to_string(),
+                "web_search".to_string(),
+            ],
         }
     }
 }

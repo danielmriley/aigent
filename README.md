@@ -103,7 +103,7 @@ Every sleep cycle writes four auto-generated summary artefacts to the vault root
 
 Every completed conversation turn now triggers a short structured LLM call (`inline_reflect`) that extracts up to three new **beliefs** and two free-form **reflective insights** from the exchange. Beliefs are stored in Core memory with a `belief` tag and a confidence score; reflective insights are stored in the Reflective tier. Both are streamed to all subscribers as `BackendEvent::BeliefAdded` and `BackendEvent::ReflectionInsight` events in real time.
 
-All current beliefs (up to 10, sorted by confidence) are automatically injected into every LLM prompt as a `MY_BELIEFS:` block alongside the `IDENTITY:` header. This gives the agent a genuine, evolving worldview that colours every response without the user having to mention it.
+All current beliefs (up to `max_beliefs_in_prompt`, default 5, sorted by composite score: confidence × 0.6 + recency × 0.25 + valence × 0.15) are automatically injected into every LLM prompt as a `MY_BELIEFS:` block alongside the `IDENTITY:` header. This gives the agent a genuine, evolving worldview that colours every response without the user having to mention it.
 
 ### Proactive mode
 
@@ -123,6 +123,8 @@ During the Do-Not-Disturb window the task runs silently and produces no output. 
 - *Passive* — heuristic-only promotion of high-confidence episodic entries; no LLM required.
 - *Agentic* — single-agent LLM reflection that learns about the user, reinforces personality, captures follow-ups, and resolves contradictions.
 - *Multi-agent* — nightly pipeline of 4 parallel specialist LLM agents (Identity, Relationships, Knowledge, Reflections) followed by a deliberation/synthesis agent. Runs at most once per 22 hours. Falls back to single-agent agentic mode if the LLM is unavailable. Streaming progress events are relayed to the client while the cycle runs.
+
+A **cooldown gate** (`proactive_cooldown_minutes`, default 5) prevents message bursts even when the check interval is short. Task C is aborted gracefully on daemon shutdown so it never fires mid-exit.
 
 ### LLM routing
 
@@ -166,6 +168,8 @@ During the Do-Not-Disturb window the task runs silently and produces no output. 
 | `aigent memory wipe [--layer <all\|core\|episodic\|...>] --yes` | Wipe one or all memory tiers |
 | `aigent memory proactive check` | Force a proactive check right now (bypasses DND and interval) |
 | `aigent memory proactive stats` | Show proactive mode activity (total sent, last sent, DND window) |
+| `aigent tool list` | List all tools registered in the running daemon with descriptions |
+| `aigent tool call <name> [key=val ...]` | Execute a named tool directly with key=value arguments |
 | `aigent doctor` | Print current config and memory diagnostics |
 | `aigent doctor --review-gate [--report FILE]` | Run phase review gate with auto-remediation |
 | `aigent doctor --model-catalog [--provider <all\|ollama\|openrouter>]` | List available models |
@@ -173,15 +177,21 @@ During the Do-Not-Disturb window the task runs silently and produces no output. 
 
 ### Tool execution
 
-Built-in tools registered in the daemon and accessible via `/tools` slash commands:
+Built-in tools registered in the daemon and accessible via `/tools` slash commands and `aigent tool` CLI:
 
 | Tool | Description |
 | --- | --- |
 | `read_file` | Read a file within the workspace (path-sandboxed, max-bytes limited) |
 | `write_file` | Write or overwrite a file within the workspace |
 | `run_shell` | Execute a shell command in the workspace directory (timeout-bounded) |
+| `calendar_add_event` | Append an event to `.aigent/calendar.json` (local calendar store) |
+| `web_search` | DuckDuckGo Instant Answer web search (no API key; timeout-bounded) |
+| `draft_email` | Save an email draft to `.aigent/drafts/` as a plain-text file |
+| `remind_me` | Add a reminder to `.aigent/reminders.json` for proactive surfacing |
 
-All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`). An interactive approval channel gates dangerous actions before execution.
+All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
+
+**LLM-driven tool calling**: before each streaming response, the daemon asks the LLM whether the user’s message requires a tool. If yes, the daemon executes the tool, records the result to Procedural memory, emits `ToolCallStart` / `ToolCallEnd` events, and injects the result into the main LLM prompt so the reply is grounded in the actual output.
 
 ### Daemon / IPC
 
@@ -248,11 +258,13 @@ Guest skills implement `spec()` and `run(params)`.
 | Belief API | ✅ Complete | `record_belief` / `retract_belief` / `all_beliefs`; stored as tagged Core entries. |
 | Inline reflection | ✅ Complete | Structured LLM call after every turn extracts beliefs + insights; streamed as events. |
 | Belief injection into prompts | ✅ Complete | Up to 10 active beliefs injected as `MY_BELIEFS:` block on every turn. |
-| Proactive mode (Task C) | ✅ Complete | Background task checks for proactive messages; respects DND window and configurable interval. |
-| Tool execution system | ✅ Complete | `read_file`, `write_file`, `run_shell`; workspace-sandboxed, approval-gated. |
+| Proactive mode (Task C) | ✅ Complete | Background task checks for proactive messages; respects DND window and configurable interval. Cooldown gate and graceful shutdown on daemon exit. |
+| Tool execution system | ✅ Complete | `read_file`, `write_file`, `run_shell`, `calendar_add_event`, `web_search`, `draft_email`, `remind_me`; workspace-sandboxed, per-tool allow/deny, approval-exempt safe tools. |
+| LLM-driven tool calling | ✅ Complete | Pre-turn tool intent check via structured LLM prompt; executes tool, records to Procedural memory, injects result before streaming response. |
 | WASM extension interface | ✅ Complete | WIT host API for guest skills (file I/O, shell, KV, HTTP). |
-| Memory CLI commands | ✅ Complete | `stats`, `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
-| Telegram command parity | 🟨 In progress | Core commands available; advanced memory and tool actions pending. |
+| Memory CLI commands | ✅ Complete | `stats` (incl. tool exec counts), `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
+| Tool CLI commands | ✅ Complete | `aigent tool list`, `aigent tool call <name> [key=value ...]`. |
+| Telegram command parity | ✅ Complete | Core commands available; all memory, proactive, and tool events routed correctly. |
 | Phase review gate | 🟨 In progress | `doctor --review-gate` implemented; some checks in progress. |
 | Systemd/launchd unit | ⏳ Planned | Daemon auto-start on system boot. |
 | Full channel parity smoke coverage | ⏳ Planned | Behaviour and memory consistency verified across TUI and Telegram. |

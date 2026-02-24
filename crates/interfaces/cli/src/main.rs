@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use chrono::Local;
+use chrono::{Local, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use fs2::FileExt;
 use tracing_subscriber::EnvFilter;
@@ -61,6 +61,11 @@ enum Commands {
     Memory {
         #[command(subcommand)]
         command: MemoryCommands,
+    },
+    /// Manage and invoke tools registered in the daemon.
+    Tool {
+        #[command(subcommand)]
+        command: ToolCommands,
     },
     Reset {
         #[arg(long)]
@@ -120,6 +125,21 @@ enum ProactiveCommands {
     Check,
     /// Display proactive mode statistics.
     Stats,
+}
+
+#[derive(Debug, Subcommand)]
+enum ToolCommands {
+    /// List all tools registered in the running daemon.
+    List,
+    /// Execute a tool directly (key=value arguments).
+    /// Example: aigent tool call web_search query="Rust programming"
+    Call {
+        /// Tool name to invoke
+        name: String,
+        /// Arguments as key=value pairs (e.g. path=README.md max_bytes=1024)
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
 }
 
 async fn fetch_available_models() -> aigent_ui::onboard::AvailableModels {
@@ -260,6 +280,51 @@ async fn main() -> Result<()> {
                             }
                             Err(err) => eprintln!("failed to fetch stats: {err}"),
                         }
+                    }
+                }
+            }
+        },
+        Commands::Tool { command } => {
+            let client = DaemonClient::new(&config.daemon.socket_path);
+            match command {
+                ToolCommands::List => {
+                    match client.list_tools().await {
+                        Ok(specs) => {
+                            println!("── registered tools ─────────────────────────────────");
+                            for spec in &specs {
+                                println!("  {} — {}", spec.name, spec.description);
+                                for p in &spec.params {
+                                    println!(
+                                        "      {} [{}] — {}",
+                                        p.name,
+                                        if p.required { "required" } else { "optional" },
+                                        p.description
+                                    );
+                                }
+                            }
+                            println!("  ({} tools total)", specs.len());
+                        }
+                        Err(err) => eprintln!("error listing tools: {err}"),
+                    }
+                }
+                ToolCommands::Call { name, args } => {
+                    // Parse "key=value" arguments.
+                    let mut parsed: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    for item in &args {
+                        if let Some((k, v)) = item.split_once('=') {
+                            parsed.insert(k.to_string(), v.to_string());
+                        } else {
+                            eprintln!("warning: skipping malformed arg '{}' (expected key=value)", item);
+                        }
+                    }
+                    match client.execute_tool(&name, parsed).await {
+                        Ok((success, output)) => {
+                            let status = if success { "succeeded" } else { "failed" };
+                            println!("tool '{}' {status}:", name);
+                            println!("{output}");
+                        }
+                        Err(err) => eprintln!("error calling tool '{}': {err}", name),
                     }
                 }
             }
@@ -1290,6 +1355,34 @@ fn run_memory_stats(memory: &MemoryManager) {
     println!("  semantic:     {}", stats.semantic);
     println!("  procedural:   {}", stats.procedural);
     println!("  episodic:     {}", stats.episodic);
+
+    // ── tool execution stats ──────────────────────────────────────
+    {
+        let tool_entries = memory.entries_by_tier(MemoryTier::Procedural);
+        let tool_execs: Vec<_> = tool_entries
+            .iter()
+            .filter(|e| e.source.starts_with("tool-use:"))
+            .collect();
+        let tool_total = tool_execs.len();
+        let cutoff = chrono::Utc::now() - chrono::Duration::hours(24);
+        let tool_today = tool_execs.iter().filter(|e| e.created_at > cutoff).count();
+        println!();
+        println!("── tool executions ──────────────────────────────────");
+        println!("  today (24h): {tool_today}");
+        println!("  all time:    {tool_total}");
+        if tool_total > 0 {
+            // Count by tool name for a per-tool breakdown.
+            let mut by_tool: std::collections::BTreeMap<&str, usize> =
+                std::collections::BTreeMap::new();
+            for e in &tool_execs {
+                let tool_name = e.source.trim_start_matches("tool-use:");
+                *by_tool.entry(tool_name).or_insert(0) += 1;
+            }
+            for (t, n) in &by_tool {
+                println!("    {t}: {n}");
+            }
+        }
+    }
 
     println!();
     println!("── redb index ───────────────────────────────────────");

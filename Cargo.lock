@@ -175,6 +175,8 @@ dependencies = [
  "aigent-core",
  "anyhow",
  "async-trait",
+ "chrono",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

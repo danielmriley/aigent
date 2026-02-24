@@ -54,6 +54,10 @@ struct DaemonState {
     proactive_total_sent: u64,
     /// Timestamp of the last proactive message sent.
     last_proactive_at: Option<DateTime<Utc>>,
+    /// Abort handle for Task C (proactive mode).  `None` when proactive mode is
+    /// disabled.  Aborted gracefully during daemon shutdown so the task does not
+    /// outlive the daemon process.
+    proactive_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl DaemonState {
@@ -83,6 +87,9 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
         allow_shell: config.safety.allow_shell,
         allow_wasm: config.safety.allow_wasm,
         workspace_root,
+        tool_allowlist: config.safety.tool_allowlist.clone(),
+        tool_denylist: config.safety.tool_denylist.clone(),
+        approval_exempt_tools: config.safety.approval_exempt_tools.clone(),
     }
 }
 
@@ -159,7 +166,8 @@ pub async fn run_unified_daemon(
 
     let policy = build_execution_policy(&config);
     let workspace_root = policy.workspace_root.clone();
-    let tool_registry = aigent_exec::default_registry(workspace_root);
+    let agent_data_dir = std::path::Path::new(".aigent").to_path_buf();
+    let tool_registry = aigent_exec::default_registry(workspace_root, agent_data_dir);
     let tool_executor = ToolExecutor::new(policy);
 
     // Extract sleep scheduling config before `config` is moved into the runtime.
@@ -181,6 +189,7 @@ pub async fn run_unified_daemon(
     let proactive_interval_minutes = config.memory.proactive_interval_minutes;
     let proactive_dnd_start = config.memory.proactive_dnd_start_hour as u32;
     let proactive_dnd_end = config.memory.proactive_dnd_end_hour as u32;
+    let proactive_cooldown_minutes = config.memory.proactive_cooldown_minutes as i64;
 
     let runtime = AgentRuntime::new(config);
     runtime.run().await?;
@@ -214,8 +223,11 @@ pub async fn run_unified_daemon(
         started_at: Instant::now(),
         last_turn_at: None,
         event_tx,
-        last_multi_agent_sleep_at,        proactive_total_sent: 0,
-        last_proactive_at: None,    }));
+        last_multi_agent_sleep_at,
+        proactive_total_sent: 0,
+        last_proactive_at: None,
+        proactive_handle: None,
+    }));
 
     // ── Bidirectional vault watcher ─────────────────────────────────────────────────
     // Watch the four summary files in the vault for human edits and ingest
@@ -439,7 +451,7 @@ pub async fn run_unified_daemon(
     if proactive_interval_minutes > 0 {
         let proactive_state = state.clone();
         let mut proactive_shutdown_rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        let proactive_join = tokio::spawn(async move {
             let interval = std::time::Duration::from_secs(proactive_interval_minutes * 60);
             let poll = std::time::Duration::from_secs(60);
             let mut last_check = std::time::Instant::now()
@@ -462,6 +474,19 @@ pub async fn run_unified_daemon(
                 // DND window guard — uses the same timezone as the sleep window.
                 if is_in_window(Utc::now(), sleep_tz, proactive_dnd_start, proactive_dnd_end) {
                     continue;
+                }
+
+                // Cooldown guard — skip if a message was sent too recently.
+                if proactive_cooldown_minutes > 0 {
+                    let in_cooldown = {
+                        let s = proactive_state.lock().await;
+                        s.last_proactive_at
+                            .map(|t| (Utc::now() - t).num_minutes() < proactive_cooldown_minutes)
+                            .unwrap_or(false)
+                    };
+                    if in_cooldown {
+                        continue;
+                    }
                 }
 
                 last_check = std::time::Instant::now();
@@ -499,6 +524,8 @@ pub async fn run_unified_daemon(
                 }
             }
         });
+        // Store the abort handle so shutdown can cancel Task C cleanly.
+        state.lock().await.proactive_handle = Some(proactive_join.abort_handle());
     }
 
     loop {
@@ -522,6 +549,14 @@ pub async fn run_unified_daemon(
     }
 
     info!("daemon shutting down gracefully");
+    {
+        // Cancel Task C before the final sleep so it cannot fire mid-shutdown.
+        let handle = state.lock().await.proactive_handle.take();
+        if let Some(h) = handle {
+            h.abort();
+            info!("proactive task stopped");
+        }
+    }
     {
         // Clone runtime and take memory while holding the lock, then release
         // before the LLM call so incoming connections (e.g. from daemon restart)
@@ -621,6 +656,49 @@ async fn handle_connection(
             // Phase 1: take what we need from state and RELEASE THE LOCK before
             // any LLM call.  This keeps GetStatus / GetMemoryPeek responsive
             // while the turn is being processed.
+            //
+            // ── Step 0: optional tool intent check ─────────────────────────
+            // Ask the LLM (without streaming) whether a tool should be called
+            // before the main response.  Runs without holding the state lock;
+            // holds it only for the brief synchronous tool execution below.
+            let (rt_early, tool_specs) = {
+                let s = state.lock().await;
+                (s.runtime.clone(), s.tool_registry.list_specs())
+            };
+            let tool_call_intent = rt_early.maybe_tool_call(&user, &tool_specs).await;
+
+            // Execute the tool (if intent detected) and collect the result.
+            let tool_result_text: Option<(String, String)> = if let Some(ref call) = tool_call_intent {
+                // Emit ToolCallStart to broadcast subscribers.
+                let info = crate::events::ToolCallInfo {
+                    name: call.tool.clone(),
+                    args: serde_json::to_string(&call.args).unwrap_or_default(),
+                };
+                let _ = event_tx.send(BackendEvent::ToolCallStart(info));
+
+                // Execute — holds lock only for the duration of the tool run.
+                let exec_result = {
+                    let mut s = state.lock().await;
+                    s.tool_executor
+                        .execute(&s.tool_registry, &call.tool, &call.args)
+                        .await
+                };
+
+                let (success, output) = match exec_result {
+                    Ok(ref o) => (o.success, o.output.clone()),
+                    Err(ref e) => (false, e.to_string()),
+                };
+                let _ = event_tx.send(BackendEvent::ToolCallEnd(crate::events::ToolResult {
+                    name: call.tool.clone(),
+                    success,
+                    output: output.clone(),
+                }));
+                info!(tool = %call.tool, success, output_len = output.len(), "tool call executed");
+                Some((call.tool.clone(), output))
+            } else {
+                None
+            };
+
             let (rt_clone, mut memory, recent, last_turn_at) = {
                 let mut s = state.lock().await;
                 let rt = s.runtime.clone();
@@ -632,9 +710,41 @@ async fn handle_connection(
             };
 
             // LLM respond + inline reflect, both WITHOUT holding state lock.
+            //
+            // If a tool was called above, record the result to Procedural memory
+            // and prepend it to the context so the LLM reply is grounded in the
+            // actual tool output.
+            if let Some((ref tool_name, ref tool_output)) = tool_result_text {
+                let outcome_text = format!(
+                    "Tool '{}' executed in response to user turn. Output (first 400 chars): {}",
+                    tool_name,
+                    &tool_output[..tool_output.len().min(400)],
+                );
+                if let Err(err) = memory.record(
+                    MemoryTier::Procedural,
+                    outcome_text,
+                    format!("tool-use:{tool_name}"),
+                ).await {
+                    warn!(?err, tool = %tool_name, "failed to record tool result to procedural memory");
+                }
+            }
+
+            // The effective user message presented to the main LLM.  When a tool
+            // was called, the result is prepended so the reply is grounded in it.
+            let effective_user: std::borrow::Cow<str> = if let Some((ref name, ref output)) = tool_result_text {
+                let label = "Tool call succeeded";
+                let preview = &output[..output.len().min(600)];
+                std::borrow::Cow::Owned(format!(
+                    "[TOOL_RESULT: {name} — {label}]\nOutput: {preview}\n\nOriginal request: {user}"
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(&user)
+            };
+
             let reply_result = rt_clone
-                .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
+                .respond_and_remember_stream(&mut memory, &effective_user, &recent, last_turn_at, chunk_tx)
                 .await;
+            // Reflect on the original user ↔ assistant exchange (not the tool-augmented prompt).
             let reflect_events: Vec<BackendEvent> = match reply_result {
                 Ok(ref reply) => rt_clone
                     .inline_reflect(&mut memory, &user, reply)

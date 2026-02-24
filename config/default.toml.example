@@ -40,8 +40,11 @@ proactive_interval_minutes = 0
 # between dnd_start and dnd_end (inclusive of both sides of midnight wrap).
 proactive_dnd_start_hour = 22
 proactive_dnd_end_hour = 8
+# Minimum gap (minutes) between sent proactive messages.
+# Prevents bursts even when the check interval is short.
+proactive_cooldown_minutes = 5
 # Maximum number of current beliefs injected into each conversation prompt.
-# Beliefs are sorted by confidence (descending) before truncation.
+# Beliefs are sorted by composite score (confidence × recency × valence) before truncation.
 # 0 = unlimited (use with care on long-running agents).
 max_beliefs_in_prompt = 5
 
@@ -49,6 +52,13 @@ max_beliefs_in_prompt = 5
 approval_required = true
 allow_shell = false
 allow_wasm = false
+# Per-tool allow-list (empty = all tools are permitted subject to capability gates).
+tool_allowlist = []
+# Per-tool deny-list (takes precedence over tool_allowlist).
+tool_denylist = []
+# Tools that bypass interactive approval even when approval_required = true.
+# The four safe built-in tools are exempt by default.
+approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search"]
 
 [telemetry]
 log_level = "info"

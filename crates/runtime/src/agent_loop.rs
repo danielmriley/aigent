@@ -1,5 +1,7 @@
 //! Types shared across the unified agent loop (reflection, proactive, turn source).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 // ─── reflection ──────────────────────────────────────────────────────────────
@@ -49,4 +51,21 @@ pub enum TurnSource {
     Telegram { chat_id: i64 },
     Cli,
     Proactive,
+}
+
+// ─── tool calling ─────────────────────────────────────────────────────────────
+
+/// A structured tool call produced by [`crate::AgentRuntime::maybe_tool_call`].
+///
+/// When the LLM decides that a tool should be invoked in order to answer the
+/// user's message, it returns one of these.  The daemon executes the named tool
+/// with the supplied `args`, records the result, and passes it back to the LLM
+/// as additional context for the final streaming response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmToolCall {
+    /// Name of the tool to invoke (must match a `ToolSpec::name` in the registry).
+    pub tool: String,
+    /// Key-value arguments to pass to the tool.
+    #[serde(default)]
+    pub args: HashMap<String, String>,
 }

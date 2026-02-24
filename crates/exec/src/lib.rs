@@ -17,6 +17,13 @@ pub struct ExecutionPolicy {
     pub allow_shell: bool,
     pub allow_wasm: bool,
     pub workspace_root: PathBuf,
+    /// Explicit allow-list of tool names.  Empty = all tools are eligible
+    /// (subject to the capability gates above).
+    pub tool_allowlist: Vec<String>,
+    /// Explicit deny-list of tool names.  Takes precedence over `tool_allowlist`.
+    pub tool_denylist: Vec<String>,
+    /// Tools that bypass interactive approval even when `approval_required = true`.
+    pub approval_exempt_tools: Vec<String>,
 }
 
 impl Default for ExecutionPolicy {
@@ -26,6 +33,14 @@ impl Default for ExecutionPolicy {
             allow_shell: false,
             allow_wasm: false,
             workspace_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            tool_allowlist: vec![],
+            tool_denylist: vec![],
+            approval_exempt_tools: vec![
+                "calendar_add_event".to_string(),
+                "remind_me".to_string(),
+                "draft_email".to_string(),
+                "web_search".to_string(),
+            ],
         }
     }
 }
@@ -120,8 +135,19 @@ impl ToolExecutor {
             "read_file" | "write_file" if !self.policy.allow_shell && !self.policy.allow_wasm => {
                 bail!("file access is disabled by safety policy (requires allow_shell or allow_wasm)")
             }
-            _ => Ok(()),
+            _ => {}
         }
+        // Per-tool deny-list (takes precedence over allow-list).
+        if self.policy.tool_denylist.contains(&tool_name.to_string()) {
+            bail!("tool '{}' is blocked by policy (tool_denylist)", tool_name);
+        }
+        // Per-tool allow-list (empty = all permitted).
+        if !self.policy.tool_allowlist.is_empty()
+            && !self.policy.tool_allowlist.contains(&tool_name.to_string())
+        {
+            bail!("tool '{}' is not in the tool_allowlist", tool_name);
+        }
+        Ok(())
     }
 
     async fn request_approval(
@@ -129,6 +155,12 @@ impl ToolExecutor {
         tool_name: &str,
         args: &HashMap<String, String>,
     ) -> Result<bool> {
+        // Approval-exempt tools are auto-approved regardless of policy.
+        if self.policy.approval_exempt_tools.contains(&tool_name.to_string()) {
+            info!(tool = tool_name, "tool is approval-exempt; auto-approving");
+            return Ok(true);
+        }
+
         let Some(tx) = &self.approval_tx else {
             // No approval channel → auto-deny when policy says approval required.
             warn!(
@@ -196,8 +228,8 @@ pub fn ensure_within_workspace(workspace_root: &Path, target: &Path) -> Result<P
 
 // ── Convenience: create a default registry with built-in tools ───────────────
 
-pub fn default_registry(workspace_root: PathBuf) -> ToolRegistry {
-    use aigent_tools::builtins::{ReadFileTool, RunShellTool, WriteFileTool};
+pub fn default_registry(workspace_root: PathBuf, agent_data_dir: PathBuf) -> ToolRegistry {
+    use aigent_tools::builtins::{CalendarAddEventTool, DraftEmailTool, ReadFileTool, RemindMeTool, RunShellTool, WebSearchTool, WriteFileTool};
 
     let mut registry = ToolRegistry::default();
     registry.register(Box::new(ReadFileTool {
@@ -207,6 +239,10 @@ pub fn default_registry(workspace_root: PathBuf) -> ToolRegistry {
         workspace_root: workspace_root.clone(),
     }));
     registry.register(Box::new(RunShellTool { workspace_root }));
+    registry.register(Box::new(CalendarAddEventTool { data_dir: agent_data_dir.clone() }));
+    registry.register(Box::new(WebSearchTool));
+    registry.register(Box::new(DraftEmailTool { data_dir: agent_data_dir.clone() }));
+    registry.register(Box::new(RemindMeTool { data_dir: agent_data_dir }));
     registry
 }
 
@@ -241,7 +277,7 @@ mod tests {
         };
 
         let executor = ToolExecutor::new(policy);
-        let registry = default_registry(workspace);
+        let registry = default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"));
 
         let mut args = HashMap::new();
         args.insert("command".to_string(), "echo hi".to_string());
@@ -263,10 +299,11 @@ mod tests {
             allow_wasm: true,
             approval_required: false,
             workspace_root: workspace.clone(),
+            ..ExecutionPolicy::default()
         };
 
         let executor = ToolExecutor::new(policy);
-        let registry = default_registry(workspace);
+        let registry = default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"));
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), "hello.txt".to_string());

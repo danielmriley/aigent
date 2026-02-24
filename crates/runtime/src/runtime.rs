@@ -6,7 +6,7 @@ use uuid::Uuid;
 use aigent_config::AppConfig;
 use aigent_llm::{LlmRouter, Provider, extract_json_output};
 use aigent_memory::{
-    MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights,
+    MemoryEntry, MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights,
     multi_sleep::{
         SpecialistRole, batch_memories, build_identity_context, deliberation_prompt,
         merge_insights, specialist_prompt,
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     BackendEvent,
-    agent_loop::{ProactiveOutput, ReflectionOutput},
+    agent_loop::{LlmToolCall, ProactiveOutput, ReflectionOutput},
 };
 
 #[derive(Debug, Clone)]
@@ -269,8 +269,19 @@ these elements into your responses naturally without explicitly announcing them.
         let beliefs_block = {
             let max_n = self.config.memory.max_beliefs_in_prompt;
             let mut beliefs = memory.all_beliefs();
-            // Sort by confidence descending (all_beliefs returns references).
-            beliefs.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+            // Sort by composite score: confidence × 0.6 + recency × 0.25 + valence × 0.15
+            // Recency factor decays as 1/(1+days) so today's beliefs score 1.0 and a
+            // 30-day-old belief scores ~0.03.  The most relevant + recent beliefs always
+            // appear first regardless of raw confidence.
+            let now = Utc::now();
+            beliefs.sort_by(|a, b| {
+                let belief_score = |e: &&MemoryEntry| {
+                    let days = (now - e.created_at).num_days().max(0) as f32;
+                    let recency = 1.0_f32 / (1.0 + days);
+                    e.confidence * 0.6 + recency * 0.25 + e.valence.clamp(0.0, 1.0) * 0.15
+                };
+                belief_score(b).total_cmp(&belief_score(a))
+            });
             let take_n = if max_n == 0 { beliefs.len() } else { max_n.min(beliefs.len()) };
             if take_n == 0 {
                 String::new()
@@ -870,6 +881,96 @@ these elements into your responses naturally without explicitly announcing them.
             "run_proactive_check: proactive message will be sent"
         );
         Some(output)
+    }
+
+    /// Decide whether the user's message should trigger a tool call.
+    ///
+    /// Sends a compact "tool-dispatcher" prompt to the LLM asking it to choose
+    /// one of the available tools (or return `{"no_action":true}`).  The method
+    /// returns `None` for all conversational messages so there is zero overhead
+    /// on normal turns.
+    ///
+    /// The result is used by the `SubmitTurn` handler to execute the tool
+    /// *before* the main streaming call, injecting the result into the prompt
+    /// context so the LLM's response is grounded in the actual tool output.
+    pub async fn maybe_tool_call(
+        &self,
+        user_message: &str,
+        tool_specs: &[aigent_tools::ToolSpec],
+    ) -> Option<LlmToolCall> {
+        if tool_specs.is_empty() {
+            return None;
+        }
+
+        let specs_block = tool_specs
+            .iter()
+            .map(|s| {
+                let params: Vec<String> = s
+                    .params
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}: {} ({})",
+                            p.name,
+                            p.description,
+                            if p.required { "required" } else { "optional" }
+                        )
+                    })
+                    .collect();
+                format!(
+                    "- {}: {}\n  params: {}",
+                    s.name,
+                    s.description,
+                    params.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            "TASK: Decide if the user message requires calling a tool.\n\
+             If YES — respond ONLY with JSON: {{\"tool\":\"name\",\"args\":{{\"key\":\"value\"}}}}\n\
+             If NO  — respond ONLY with: {{\"no_action\":true}}\n\
+             Default to no_action for conversational messages. Only call a tool for \
+             clear action requests (adding calendar events, searching, drafting emails, reminders).\n\n\
+             AVAILABLE TOOLS:\n{specs_block}\n\n\
+             USER MESSAGE: {user_message}\n\n\
+             JSON RESPONSE:"
+        );
+
+        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
+            Provider::OpenRouter
+        } else {
+            Provider::Ollama
+        };
+
+        let Ok((_provider, raw)) = self
+            .llm
+            .chat_with_fallback(
+                primary,
+                &self.config.llm.ollama_model,
+                &self.config.llm.openrouter_model,
+                &prompt,
+            )
+            .await
+        else {
+            debug!("maybe_tool_call: LLM unavailable");
+            return None;
+        };
+
+        let value: serde_json::Value = extract_json_output(&raw)?;
+        if value.get("no_action").and_then(|v| v.as_bool()).unwrap_or(false) {
+            debug!("maybe_tool_call: LLM chose no_action");
+            return None;
+        }
+
+        let call: LlmToolCall = serde_json::from_value(value).ok()?;
+        if call.tool.is_empty() {
+            return None;
+        }
+
+        info!(tool = %call.tool, args = ?call.args, "maybe_tool_call: LLM requested tool");
+        Some(call)
     }
 
     /// Legacy single-shot turn helper. Callers should use the server path
