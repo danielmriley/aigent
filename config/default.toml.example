@@ -85,6 +85,11 @@ brave_api_key = ""
 # (The workspace will be git-init'd automatically during onboarding if this is true.)
 git_auto_commit = false
 
+# Apply platform-level process sandboxing to `run_shell` children.
+# Requires the binary to have been compiled with the `sandbox` feature (default).
+# Set to false to disable sandboxing at runtime without recompiling.
+sandbox_enabled = true
+
 
 log_level = "info"
 

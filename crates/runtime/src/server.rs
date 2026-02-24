@@ -92,6 +92,7 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
         tool_denylist: config.safety.tool_denylist.clone(),
         approval_exempt_tools: config.safety.approval_exempt_tools.clone(),
         git_auto_commit: config.tools.git_auto_commit,
+        sandbox_enabled: config.tools.sandbox_enabled,
     }
 }
 

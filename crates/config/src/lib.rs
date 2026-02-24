@@ -160,6 +160,16 @@ pub struct ToolsConfig {
     /// and the workspace to be a git repository (or `git init` to have been
     /// run during onboarding).
     pub git_auto_commit: bool,
+    /// Apply platform-level process sandboxing to child processes spawned by
+    /// `run_shell`.  When `true` (the default) the daemon will install a
+    /// seccomp BPF filter on Linux (x86-64) and call `sandbox_init` on macOS
+    /// before executing the shell command.  Has no effect on platforms where
+    /// the `sandbox` Cargo feature is not supported.
+    ///
+    /// Set to `false` to disable sandboxing at runtime (the binary can still
+    /// be compiled without the `sandbox` feature for a permanent opt-out).
+    #[serde(default = "default_sandbox_enabled")]
+    pub sandbox_enabled: bool,
 }
 
 impl Default for ToolsConfig {
@@ -168,8 +178,13 @@ impl Default for ToolsConfig {
             approval_mode: ApprovalMode::Balanced,
             brave_api_key: String::new(),
             git_auto_commit: false,
+            sandbox_enabled: true,
         }
     }
+}
+
+fn default_sandbox_enabled() -> bool {
+    true
 }
 
 // ── Safety config ─────────────────────────────────────────────────────────────

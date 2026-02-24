@@ -44,6 +44,7 @@ version = "0.1.0"
 dependencies = [
  "aigent-config",
  "aigent-core",
+ "aigent-exec",
  "aigent-llm",
  "aigent-memory",
  "aigent-runtime",
@@ -104,6 +105,7 @@ dependencies = [
  "aigent-core",
  "aigent-tools",
  "anyhow",
+ "async-trait",
  "bytes",
  "libc",
  "serde",

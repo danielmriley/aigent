@@ -238,15 +238,24 @@ The **Wasmtime host runtime** (Cargo feature `wasm`, enabled by default) discove
 `.wasm` binaries at daemon start and registers them as live tools:
 
 ```bash
-# Build the guest sub-workspace
-rustup target add wasm32-wasip1
-cd extensions/tools-src && cargo build --release
+# Build the guest sub-workspace using the new CLI command
+aigent tools build
+# -> runs rustup target add wasm32-wasip1 then
+#    cargo build --release in extensions/tools-src/
 # -> creates extensions/tools-src/<crate>/target/wasm32-wasip1/release/*.wasm
 # The daemon picks them up automatically on next start
 ```
 
-WASM tools **shadow** the native Rust baseline by name (`read_file`, `write_file`, etc.).
-If no `.wasm` files are present, the native implementations remain active.
+WASM tools are registered **first** in the tool registry (first-match wins).  
+Native Rust implementations are registered only for names **not** already covered by a
+WASM binary.  Until `.wasm` files are built, all 8 tools run natively with a startup
+log message: _"native Rust fallback active for N tool(s) — run `aigent tools build`"_.
+
+Inspect the current mode without starting the daemon:
+
+```bash
+aigent tools status   # shows WASM vs native per tool + sandbox effective state
+```
 
 ## Capabilities matrix
 
@@ -280,10 +289,10 @@ If no `.wasm` files are present, the native implementations remain active.
 | Tool approval modes | ✅ Complete | Three modes: `safer` (always ask), `balanced` (read-only free, default), `autonomous` (no prompts). Configurable via `[tools] approval_mode`. |
 | Git auto-commit | ✅ Complete | Automatic `git add -A && git commit` after every `write_file`/`run_shell`; `git_rollback` tool reverts last commit. |
 | Brave Search integration | ✅ Complete | `web_search` uses Brave API when `brave_api_key` is set; falls back to DuckDuckGo. |
-| WASM extension interface | ✅ Complete | WIT host API + Wasmtime host runtime (`wasm` feature). Guest `.wasm` binaries shadow native tools; built-in tools remain as fallback when no guests are compiled. |
-| Platform sandboxing | ✅ Complete | `sandbox` feature: `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list (x86-64 Linux); `sandbox_init` profile (macOS). Applied in child process before shell `exec`. |
+| WASM extension interface | ✅ Complete | WIT host API + Wasmtime host runtime (`wasm` feature, **default-on**). WASM guests registered first (first-match wins); native tools fill gaps until guests are built. `aigent tools build` compiles guests; `aigent tools status` shows per-tool mode. |
+| Platform sandboxing | ✅ Complete | `sandbox` feature **default-on**: `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list (x86-64 Linux); `sandbox_init` profile (macOS). Applied in child process before shell `exec`. Runtime-configurable via `[tools] sandbox_enabled = false`. |
 | Memory CLI commands | ✅ Complete | `stats` (incl. tool exec counts), `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
-| Tool CLI commands | ✅ Complete | `aigent tool list`, `aigent tool call <name> [key=value ...]`. |
+| Tool CLI commands | ✅ Complete | `aigent tool list`, `aigent tool call <name> [key=value ...]`, `aigent tools build` (compile WASM guests), `aigent tools status` (WASM vs native + sandbox state). |
 | Telegram command parity | ✅ Complete | Core commands available; all memory, proactive, and tool events routed correctly. |
 | Phase review gate | 🟨 In progress | `doctor --review-gate` implemented; some checks in progress. |
 | Systemd/launchd unit | ⏳ Planned | Daemon auto-start on system boot. |

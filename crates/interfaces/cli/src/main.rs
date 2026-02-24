@@ -15,6 +15,7 @@ use fs2::FileExt;
 use tracing_subscriber::EnvFilter;
 
 use aigent_config::AppConfig;
+use aigent_exec::sandbox;
 use aigent_runtime::{
     BackendEvent, DaemonClient, run_unified_daemon,
 };
@@ -140,6 +141,11 @@ enum ToolCommands {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Build WASM guest tools from `extensions/tools-src/`.
+    /// Requires the `wasm32-wasip1` toolchain target.
+    Build,
+    /// Show per-tool runtime status: WASM binary present or native fallback.
+    Status,
 }
 
 async fn fetch_available_models() -> aigent_ui::onboard::AvailableModels {
@@ -327,6 +333,68 @@ async fn main() -> Result<()> {
                         Err(err) => eprintln!("error calling tool '{}': {err}", name),
                     }
                 }
+                ToolCommands::Build => {
+                    // Step 1: ensure wasm32-wasip1 target is installed.
+                    let status1 = Command::new("rustup")
+                        .args(["target", "add", "wasm32-wasip1"])
+                        .status()
+                        .map_err(|e| anyhow::anyhow!("failed to run rustup: {e}"))?;
+                    if !status1.success() {
+                        bail!("rustup target add wasm32-wasip1 failed");
+                    }
+                    // Step 2: cargo build in extensions/tools-src/
+                    let tools_src = Path::new("extensions").join("tools-src");
+                    if !tools_src.exists() {
+                        bail!(
+                            "extensions/tools-src/ not found — create WASM guest crates there first"
+                        );
+                    }
+                    let status2 = Command::new("cargo")
+                        .args(["build", "--release"])
+                        .env("CARGO_BUILD_TARGET", "wasm32-wasip1")
+                        .current_dir(&tools_src)
+                        .status()
+                        .map_err(|e| anyhow::anyhow!("failed to run cargo: {e}"))?;
+                    if !status2.success() {
+                        bail!("cargo build --release failed in extensions/tools-src/");
+                    }
+                    println!("WASM guest tools built successfully.");
+                    println!("Restart the daemon to activate (`aigent start`).");
+                }
+                ToolCommands::Status => {
+                    const KNOWN_TOOLS: &[&str] = &[
+                        "read_file", "write_file", "run_shell",
+                        "calendar_add_event", "web_search", "draft_email",
+                        "remind_me", "git_rollback",
+                    ];
+                    let extensions_dir = Path::new("extensions");
+
+                    println!("── tool runtime status ───────────────────────────────");
+                    for &name in KNOWN_TOOLS {
+                        let wasm = find_wasm_binary(extensions_dir, name);
+                        if let Some(ref p) = wasm {
+                            println!("  {name:<22}  WASM  ({})", p.display());
+                        } else {
+                            println!("  {name:<22}  native (run `aigent tools build` to activate WASM)");
+                        }
+                    }
+
+                    println!();
+                    println!("── sandbox status ────────────────────────────────────");
+                    let compiled_in = sandbox::is_active();
+                    println!(
+                        "  compiled-in     : {}",
+                        if compiled_in { "yes" } else { "no (rebuild with --features sandbox)" }
+                    );
+                    println!(
+                        "  config enabled  : {}",
+                        if config.tools.sandbox_enabled { "yes" } else { "no (sandbox_enabled = false in config)" }
+                    );
+                    println!(
+                        "  effective       : {}",
+                        if compiled_in && config.tools.sandbox_enabled { "ACTIVE" } else { "disabled" }
+                    );
+                }
             }
         },
         Commands::Reset { hard, yes } => {
@@ -335,6 +403,30 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve the `.wasm` binary path for a given tool name, checking both the
+/// direct layout (`extensions/<name>.wasm`) and the sub-workspace layout
+/// (`extensions/tools-src/<crate>/target/wasm32-wasip1/release/<name>.wasm`).
+fn find_wasm_binary(extensions_dir: &Path, tool_name: &str) -> Option<PathBuf> {
+    // Layout 1: direct binary next to extensions/
+    let direct = extensions_dir.join(format!("{tool_name}.wasm"));
+    if direct.exists() {
+        return Some(direct);
+    }
+    // Layout 2: sub-workspace built with `aigent tools build`
+    let crate_name = tool_name.replace('_', "-");
+    let sub = extensions_dir
+        .join("tools-src")
+        .join(&crate_name)
+        .join("target")
+        .join("wasm32-wasip1")
+        .join("release")
+        .join(format!("{tool_name}.wasm"));
+    if sub.exists() {
+        return Some(sub);
+    }
+    None
 }
 
 async fn seed_identity_from_config(config: &AppConfig, memory_log_path: &Path) -> Result<()> {

@@ -50,12 +50,14 @@
 pub unsafe fn apply_to_child(workspace_root: &str) -> std::io::Result<()> {
     #[cfg(all(feature = "sandbox", target_os = "linux"))]
     {
-        apply_linux()?;
+        // SAFETY: apply_linux is unsafe and must run between fork/exec.
+        unsafe { apply_linux()? };
     }
 
     #[cfg(all(feature = "sandbox", target_os = "macos"))]
     {
-        apply_macos(workspace_root)?;
+        // SAFETY: apply_macos is unsafe and must run between fork/exec.
+        unsafe { apply_macos(workspace_root)? };
     }
 
     Ok(())
@@ -80,7 +82,8 @@ unsafe fn apply_linux() -> std::io::Result<()> {
 
     // 1. No new privileges — inherited across execve, cannot be unset.
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
-    if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+    // SAFETY: prctl is async-signal-safe and called between fork/exec.
+    if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -95,7 +98,8 @@ unsafe fn apply_linux() -> std::io::Result<()> {
     //    sandbox for WASM guests.
     #[cfg(target_arch = "x86_64")]
     {
-        install_seccomp_allowlist()?;
+        // SAFETY: install_seccomp_allowlist is unsafe and must run between fork/exec.
+        unsafe { install_seccomp_allowlist()? };
     }
 
     Ok(())
@@ -316,12 +320,15 @@ unsafe fn install_seccomp_allowlist() -> std::io::Result<()> {
     const SECCOMP_SET_MODE_FILTER: libc::c_ulong = 1;
     const SECCOMP_FILTER_FLAG_TSYNC: libc::c_ulong = 2;
 
-    let ret = libc::syscall(
-        SYS_SECCOMP,
-        SECCOMP_SET_MODE_FILTER,
-        SECCOMP_FILTER_FLAG_TSYNC,
-        &fprog as *const SockFprog as *const libc::c_void,
-    );
+    // SAFETY: seccomp syscall is async-signal-safe; fprog outlives the call.
+    let ret = unsafe {
+        libc::syscall(
+            SYS_SECCOMP,
+            SECCOMP_SET_MODE_FILTER,
+            SECCOMP_FILTER_FLAG_TSYNC,
+            &fprog as *const SockFprog as *const libc::c_void,
+        )
+    };
 
     if ret != 0 {
         // Non-fatal: seccomp may be unavailable in some container environments.
@@ -378,13 +385,16 @@ unsafe fn apply_macos(workspace_root: &str) -> std::io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let mut errorbuf: *mut libc::c_char = ptr::null_mut();
 
-    let ret = sandbox_init(c_profile.as_ptr(), 0, &mut errorbuf);
+    // SAFETY: c_profile outlives the call; errorbuf is valid output pointer.
+    let ret = unsafe { sandbox_init(c_profile.as_ptr(), 0, &mut errorbuf) };
     if ret != 0 {
         let err_str = if errorbuf.is_null() {
             "unknown sandbox_init error".to_string()
         } else {
-            let msg = std::ffi::CStr::from_ptr(errorbuf).to_string_lossy().to_string();
-            sandbox_free_error(errorbuf);
+            // SAFETY: sandbox_init sets errorbuf to a valid C string on failure.
+            let msg = unsafe { std::ffi::CStr::from_ptr(errorbuf) }.to_string_lossy().to_string();
+            // SAFETY: errorbuf was allocated by sandbox_init.
+            unsafe { sandbox_free_error(errorbuf) };
             msg
         };
         return Err(io::Error::new(io::ErrorKind::Other, err_str));

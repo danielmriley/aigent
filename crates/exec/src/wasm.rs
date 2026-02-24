@@ -147,7 +147,8 @@ impl WasmTool {
             Err(parse_err) => {
                 let raw = String::from_utf8_lossy(&stdout_contents);
                 // Also surface any stderr for diagnostics.
-                let stderr_raw = String::from_utf8_lossy(&stderr_pipe.contents());
+                let stderr_contents = stderr_pipe.contents();
+                let stderr_raw = String::from_utf8_lossy(&stderr_contents);
                 warn!(
                     tool = %self.spec.name,
                     ?parse_err,

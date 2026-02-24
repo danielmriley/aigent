@@ -1044,3 +1044,130 @@ Both are persisted to `config.tools` in `apply()` and `apply_partial()`.
 - [ ] Build with `--features aigent-exec/sandbox` → `run_shell` child has seccomp
       filter active (use `strace -e seccomp` or `ausearch` to verify)
 - [ ] macOS: build with sandbox feature → `sandbox_init` applied (check Console.app)
+
+---
+
+## 2026-02-25 — Phase 6: WASM-First Default, Sandbox Default-On, New CLI Commands
+
+### Summary
+
+Three interlocking changes that make WASM and sandboxing the production defaults
+rather than opt-in features:
+
+1. **WASM-first registry** — WASM guest tools are now registered before native
+   implementations.  `ToolRegistry::get` uses `.find()` (first-match wins), so any
+   compiled `.wasm` binary takes precedence over the equivalent Rust builtin.  Native
+   tools are registered only for tool names that have no WASM binary present.
+2. **`sandbox` and `wasm` features are now default-on** — `default = ["wasm", "sandbox"]`
+   in `crates/exec/Cargo.toml`.  The platform sandbox is applied to every `run_shell`
+   child without needing a special build flag.
+3. **`aigent tools build` / `aigent tools status`** — two new CLI commands for
+   managing guest tools without touching `rustup` or `cargo` directly.
+
+### Breaking changes
+
+None.  All new fields use `serde(default = …)` so existing `config/default.toml`
+files continue to work.  The only behaviour change is that sandbox is now active by
+default on Linux/macOS; set `sandbox_enabled = false` in `[tools]` to opt out.
+
+### Changed files
+
+#### `crates/exec/Cargo.toml`
+
+```toml
+[features]
+default = ["wasm", "sandbox"]
+sandbox = ["dep:libc"]
+wasm    = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:bytes"]
+```
+
+Previously `default` was empty — both features had to be opted in.
+
+#### `crates/exec/src/lib.rs`
+
+- `ExecutionPolicy` gains a new field:
+
+  ```rust
+  /// Apply platform sandbox to shell children (`true` by default).
+  /// Set to `false` to disable without recompiling.
+  pub sandbox_enabled: bool,
+  ```
+
+  `Default` impl sets `sandbox_enabled: true`.
+
+- `default_registry()` rewritten for WASM-first:
+  1. Load WASM tools → collect names into `HashSet`
+  2. Register WASM tools first (they win in `.find()`)
+  3. Register native tools only for names not in the WASM set
+  4. Log at `info!` which tools are in WASM mode vs native fallback
+
+- Sandbox gate guarded by `self.policy.sandbox_enabled` as well as the feature flag:
+  ```rust
+  #[cfg(all(feature = "sandbox", unix))]
+  if tool_name == "run_shell" && self.policy.sandbox_enabled { … }
+  ```
+
+#### `crates/config/src/lib.rs`
+
+New field on `ToolsConfig`:
+
+```toml
+# config/default.toml
+[tools]
+sandbox_enabled = true   # set false to disable runtime sandboxing
+```
+
+```rust
+pub struct ToolsConfig {
+    // … existing fields …
+    #[serde(default = "default_sandbox_enabled")]
+    pub sandbox_enabled: bool,
+}
+```
+
+#### `crates/runtime/src/server.rs`
+
+`build_execution_policy()` now forwards `config.tools.sandbox_enabled` into the policy.
+
+#### `crates/interfaces/cli/src/main.rs`
+
+Two new `ToolCommands` variants:
+
+```text
+aigent tools build   — rustup target add wasm32-wasip1 + cargo build --release
+                       in extensions/tools-src/
+aigent tools status  — filesystem check: WASM binary found vs native fallback
+                       for each of the 8 built-in tool names, plus sandbox state
+```
+
+`aigent tools status` is a pure filesystem check — it does **not** require the
+daemon to be running.
+
+`crates/interfaces/cli/Cargo.toml` gains `aigent-exec` as a direct dependency
+(zero extra build cost — already compiled transitively).
+
+### Migration steps
+
+1. `cargo build --workspace` — all features now compile by default, no flags needed.
+2. Run `aigent tools status` — all 8 tools will show **native** until WASM guests are built.
+3. `aigent tools build` — compiles guests; then `aigent daemon restart` to activate.
+4. Run `aigent tools status` again — tools with a built `.wasm` now show **WASM**.
+5. To disable sandboxing at runtime (without recompiling):
+
+   ```toml
+   # config/default.toml
+   [tools]
+   sandbox_enabled = false
+   ```
+
+### Verification checklist
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] `aigent tools status` before building guests → all 8 tools show "native"
+- [ ] `aigent tools build` → succeeds; `aigent tools status` shows WASM for built crates
+- [ ] Daemon logs show `"native Rust fallback active for N tool(s)"` on startup (no WASM)
+- [ ] Daemon logs show `"wasm: N guest tool(s) active"` after building guests
+- [ ] `sandbox_enabled = false` in config → shell children no longer sandboxed
+- [ ] Linux: sandbox active by default → `strace -e seccomp aigent start` shows seccomp applied
+- [ ] macOS: `sandbox_init` applied without `--features sandbox` build flag

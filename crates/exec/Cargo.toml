@@ -5,14 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+## Default features: WASM tool loading is always on.
+## sandbox is default-on — it is a graceful no-op on platforms where it is not
+## implemented (anything other than Linux and macOS).
+default = ["wasm", "sandbox"]
 ## Enable platform sandboxing (no-new-privs on Linux, sandbox_init on macOS).
 sandbox = ["dep:libc"]
-## Enable wasmtime WASM tool loading.  Active by default so the registry
-## discovers guest .wasm binaries at runtime without a separate flag.
-wasm = ["dep:wasmtime", "dep:wasmtime-wasi"]
+## Enable wasmtime WASM tool loading.
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:bytes"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

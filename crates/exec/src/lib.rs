@@ -40,6 +40,10 @@ pub struct ExecutionPolicy {
     /// When `true` the executor calls `git add -A && git commit` after every
     /// successful `write_file` or `run_shell` invocation.
     pub git_auto_commit: bool,
+    /// Apply platform sandbox to shell children when `true` (default).
+    /// Requires the `sandbox` Cargo feature to be compiled in, otherwise
+    /// this field has no effect.
+    pub sandbox_enabled: bool,
 }
 
 impl Default for ExecutionPolicy {
@@ -59,6 +63,7 @@ impl Default for ExecutionPolicy {
                 "web_search".to_string(),
             ],
             git_auto_commit: false,
+            sandbox_enabled: true,
         }
     }
 }
@@ -145,8 +150,9 @@ impl ToolExecutor {
 
         // For run_shell with the `sandbox` feature active we spawn the child
         // with a pre-exec sandbox hook instead of delegating to the tool impl.
+        // Respects `policy.sandbox_enabled` so operators can opt out at runtime.
         #[cfg(all(feature = "sandbox", unix))]
-        if tool_name == "run_shell" {
+        if tool_name == "run_shell" && self.policy.sandbox_enabled {
             let result = self.run_shell_sandboxed(args).await?;
             if result.success && self.policy.git_auto_commit {
                 let detail = args
@@ -278,7 +284,8 @@ impl ToolExecutor {
         unsafe {
             let ws = workspace_str.clone();
             cmd.as_std_mut().pre_exec(move || {
-                sandbox::apply_to_child(&ws)
+                // SAFETY: called between fork and exec; only async-signal-safe calls.
+                unsafe { sandbox::apply_to_child(&ws) }
             });
         }
 
@@ -397,43 +404,81 @@ pub fn default_registry(
     };
 
     let mut registry = ToolRegistry::default();
-    registry.register(Box::new(ReadFileTool {
-        workspace_root: workspace_root.clone(),
-    }));
-    registry.register(Box::new(WriteFileTool {
-        workspace_root: workspace_root.clone(),
-    }));
-    registry.register(Box::new(RunShellTool {
-        workspace_root: workspace_root.clone(),
-    }));
-    registry.register(Box::new(CalendarAddEventTool {
-        data_dir: agent_data_dir.clone(),
-    }));
-    registry.register(Box::new(WebSearchTool {
-        brave_api_key: brave_api_key.clone(),
-    }));
-    registry.register(Box::new(DraftEmailTool {
-        data_dir: agent_data_dir.clone(),
-    }));
-    registry.register(Box::new(RemindMeTool {
-        data_dir: agent_data_dir,
-    }));
-    registry.register(Box::new(GitRollbackTool {
-        workspace_root: workspace_root.clone(),
-    }));
 
-    // ── WASM tool overlay ──────────────────────────────────────────────────
-    // Discover compiled `.wasm` guest binaries and register them under the
-    // same tool names.  WASM tools shadow the native baseline above; if no
-    // `.wasm` files are present the native tools continue to serve all calls.
+    // ── Step 1: WASM-first ─────────────────────────────────────────────────
+    // Register compiled WASM guests before native tools.  `ToolRegistry::get`
+    // uses `.find()` (first-match wins) so WASM tools always take precedence
+    // over any native fallback registered below.
     #[cfg(feature = "wasm")]
-    {
-        // Look for guests in `<workspace_root>/extensions/` and in the
-        // sub-workspace layout produced by `extensions/tools-src/`.
+    let wasm_names: std::collections::HashSet<String> = {
         let extensions_dir = workspace_root.join("extensions");
-        for tool in wasm::load_wasm_tools_from_dir(&extensions_dir) {
+        let tools = wasm::load_wasm_tools_from_dir(&extensions_dir);
+        let names: std::collections::HashSet<String> =
+            tools.iter().map(|t| t.spec().name.clone()).collect();
+        if !names.is_empty() {
+            info!(count = names.len(), "wasm: {} guest tool(s) active", names.len());
+        }
+        for tool in tools {
             registry.register(tool);
         }
+        names
+    };
+    #[cfg(not(feature = "wasm"))]
+    let wasm_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // ── Step 2: Native fallbacks (only for names not covered by WASM) ──────
+    // Build the candidate list.  Each entry is (canonical-name, boxed-tool).
+    // We consume each Box exactly once so we shadow the outer variables after
+    // construction to avoid partial-move issues.
+    let native_candidates: Vec<(&str, Box<dyn aigent_tools::Tool>)> = vec![
+        (
+            "read_file",
+            Box::new(ReadFileTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "write_file",
+            Box::new(WriteFileTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "run_shell",
+            Box::new(RunShellTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "calendar_add_event",
+            Box::new(CalendarAddEventTool { data_dir: agent_data_dir.clone() }),
+        ),
+        (
+            "web_search",
+            Box::new(WebSearchTool { brave_api_key: brave_api_key.clone() }),
+        ),
+        (
+            "draft_email",
+            Box::new(DraftEmailTool { data_dir: agent_data_dir.clone() }),
+        ),
+        (
+            "remind_me",
+            Box::new(RemindMeTool { data_dir: agent_data_dir }),
+        ),
+        (
+            "git_rollback",
+            Box::new(GitRollbackTool { workspace_root: workspace_root.clone() }),
+        ),
+    ];
+
+    let mut native_active: Vec<&str> = Vec::new();
+    for (name, tool) in native_candidates {
+        if !wasm_names.contains(name) {
+            native_active.push(name);
+            registry.register(tool);
+        }
+    }
+    if !native_active.is_empty() {
+        info!(
+            tools = ?native_active,
+            "native Rust fallback active for {} tool(s) — no WASM binary built yet \
+             — run `aigent tools build` to activate WASM mode",
+            native_active.len()
+        );
     }
 
     registry
