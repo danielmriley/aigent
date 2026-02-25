@@ -23,6 +23,19 @@ use crate::{
 /// Broadcast channel capacity. Old events are dropped when subscribers lag.
 const BROADCAST_CAP: usize = 256;
 
+
+/// Return `&text[..limit]` rounded down to a UTF-8 char boundary.
+/// Avoids panics when the target byte index falls inside a multi-byte character.
+fn safe_truncate(text: &str, limit: usize) -> &str {
+    if limit >= text.len() {
+        return text;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
 /// Returns `true` when `now` (UTC) falls within the `[start_hour, end_hour)` window
 /// expressed in the given timezone.  Handles midnight-wrap correctly
 /// (e.g. 22 00 06 spans midnight and wraps around 0).
@@ -264,7 +277,7 @@ pub async fn run_unified_daemon(
                 let note = format!(
                     "[human-edit] {} was updated in the vault:\n{}",
                     ev.filename,
-                    &ev.content[..ev.content.len().min(800)]
+                    safe_truncate(&ev.content, 800)
                 );
                 if let Err(err) = s.memory.record(tier, note, "human-edit").await {
                     warn!(?err, file = %ev.filename, "vault watcher: failed to record human edit");
@@ -735,7 +748,7 @@ async fn handle_connection(
                 let outcome_text = format!(
                     "Tool '{}' executed in response to user turn. Output (first 400 chars): {}",
                     tool_name,
-                    &tool_output[..tool_output.len().min(400)],
+                    safe_truncate(tool_output, 400),
                 );
                 if let Err(err) = memory.record(
                     MemoryTier::Procedural,
@@ -787,9 +800,81 @@ async fn handle_connection(
                 std::borrow::Cow::Borrowed(&user)
             };
 
-            let reply_result = rt_clone
+            let mut reply_result = rt_clone
                 .respond_and_remember_stream(&mut memory, &effective_user, &recent, last_turn_at, chunk_tx, &tool_specs)
                 .await;
+
+            // ── Fallback: post-stream tool detection ──────────────────────
+            // If maybe_tool_call missed the intent (e.g. model returned bare
+            // JSON on the main path), detect tool JSON in the streamed reply,
+            // execute the tool, and do a second LLM call with the result.
+            if tool_result_text.is_none() {
+                if let Ok(ref reply) = reply_result {
+                    let trimmed = reply.trim();
+                    if let Ok(call) = serde_json::from_str::<crate::agent_loop::LlmToolCall>(trimmed) {
+                        if !call.tool.is_empty() {
+                            warn!(tool = %call.tool, "fallback: streamed reply was tool JSON — executing post-hoc");
+                            let info = crate::events::ToolCallInfo {
+                                name: call.tool.clone(),
+                                args: serde_json::to_string(&call.args).unwrap_or_default(),
+                            };
+                            let _ = event_tx.send(BackendEvent::ToolCallStart(info));
+
+                            let exec_result = {
+                                let s = state.lock().await;
+                                s.tool_executor
+                                    .execute(&s.tool_registry, &call.tool, &call.args)
+                                    .await
+                            };
+                            let (success, output) = match exec_result {
+                                Ok(ref o) => (o.success, o.output.clone()),
+                                Err(ref e) => (false, e.to_string()),
+                            };
+                            let _ = event_tx.send(BackendEvent::ToolCallEnd(crate::events::ToolResult {
+                                name: call.tool.clone(),
+                                success,
+                                output: output.clone(),
+                            }));
+
+                            // Build a grounded follow-up prompt and re-stream.
+                            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                            let followup = format!(
+                                "{user}\n\n                                 ===== TOOL RESULT (retrieved {now}) from \'{tool_name}\' =====\n                                 {output}\n                                 ===== END TOOL RESULT =====\n\n                                 CRITICAL INSTRUCTION:\n                                 1. The TOOL RESULT above is in your context NOW.\n                                 2. Give a complete, natural answer using it.\n                                 3. Quote numbers and facts verbatim.\n                                 4. Do NOT say the result is unavailable or pending.\n                                 5. Speak conversationally as yourself.",
+                                user = user,
+                                now = now,
+                                tool_name = call.tool,
+                                output = output,
+                            );
+
+                            let (followup_tx, mut followup_rx) = mpsc::channel::<String>(128);
+                            let writer2 = writer.clone();
+                            let event_tx2 = if is_external { Some(event_tx.clone()) } else { None };
+                            let followup_streamer = tokio::spawn(async move {
+                                while let Some(chunk) = followup_rx.recv().await {
+                                    {
+                                        let mut guard = writer2.lock().await;
+                                        let _ = send_event(
+                                            &mut guard,
+                                            ServerEvent::Backend(BackendEvent::Token(chunk.clone())),
+                                        ).await;
+                                    }
+                                    if let Some(ref tx) = event_tx2 {
+                                        let _ = tx.send(BackendEvent::Token(chunk));
+                                    }
+                                }
+                            });
+
+                            reply_result = rt_clone
+                                .respond_and_remember_stream(
+                                    &mut memory, &followup, &recent, last_turn_at, followup_tx, &tool_specs,
+                                )
+                                .await;
+                            let _ = followup_streamer.await;
+                        }
+                    }
+                }
+            }
+
             // Reflect on the original user ↔ assistant exchange (not the tool-augmented prompt).
             let reflect_events: Vec<BackendEvent> = match reply_result {
                 Ok(ref reply) => rt_clone
@@ -914,7 +999,7 @@ async fn handle_connection(
                         "Tool '{}' {}: {}",
                         name,
                         if output.success { "succeeded" } else { "failed" },
-                        &output.output[..output.output.len().min(200)],
+                        safe_truncate(&output.output, 200),
                     );
                     if let Err(err) = state.memory.record(
                         MemoryTier::Procedural,

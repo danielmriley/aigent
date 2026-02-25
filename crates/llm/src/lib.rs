@@ -489,14 +489,33 @@ pub struct StructuredOutput {
 /// }
 /// ```
 pub fn extract_json_output<T: serde::de::DeserializeOwned>(response: &str) -> Option<T> {
-    // Find the opening fence.
-    let fence_start = response.find("```json")?;
-    let after_fence = &response[fence_start + "```json".len()..];
-    // Skip any whitespace/newlines immediately after the opening fence.
-    let json_start = after_fence.find(|c: char| !c.is_whitespace())?;
-    let json_body = &after_fence[json_start..];
-    // Find the closing fence.
-    let fence_end = json_body.find("```")?;
-    let json_str = json_body[..fence_end].trim();
-    serde_json::from_str(json_str).ok()
+    // Strategy 1: fenced ```json ... ``` blocks.
+    if let Some(fence_start) = response.find("```json") {
+        let after_fence = &response[fence_start + "```json".len()..];
+        if let Some(json_start) = after_fence.find(|c: char| !c.is_whitespace()) {
+            let json_body = &after_fence[json_start..];
+            if let Some(fence_end) = json_body.find("```") {
+                let json_str = json_body[..fence_end].trim();
+                if let Ok(val) = serde_json::from_str(json_str) {
+                    return Some(val);
+                }
+            }
+        }
+    }
+
+    // Strategy 2: bare JSON object — find the first '{' and its matching '}'.
+    let trimmed = response.trim();
+    if let Some(start) = trimmed.find('{') {
+        // Walk from the end to find the last matching '}'.
+        if let Some(end) = trimmed.rfind('}') {
+            if end > start {
+                let candidate = &trimmed[start..=end];
+                if let Ok(val) = serde_json::from_str(candidate) {
+                    return Some(val);
+                }
+            }
+        }
+    }
+
+    None
 }
