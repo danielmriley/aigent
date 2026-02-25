@@ -6,26 +6,28 @@ Aigent is a persistent, self-improving AI agent written in Rust. It runs as a ba
 
 | Change | Details |
 |---|---|
+| **Non-blocking TUI event loop** | Crossterm key/mouse reading moved to a dedicated OS thread — spinner, tick, and backend events get fair `tokio::select!` scheduling. Eliminates all spinner stutter during streaming or tool calls. |
+| **10-rule truth-seeking grounding** | Rule 10: "After a tool has been called on your behalf, the result appears verbatim in your prompt. NEVER claim the tool result is missing." |
+| **7-point tool continuation instruction** | The synthetic continuation prompt after every tool call is now a numbered CRITICAL INSTRUCTION block — the LLM can no longer dodge tool results. |
+| **Ctrl+T theme cycling** | Press Ctrl+T to cycle through Catppuccin Mocha → Tokyo Night → Nord live. Keybindings bar updated. |
+| **`aigent status` CLI** | New top-level command shows daemon uptime, memory stats, tool list, and full sleep schedule at a glance. |
+| **Sleep cycle tracing** | Passive and nightly sleep tasks now emit `info!` at start/completion. Sleep schedule injected into LLM environment context. |
+| **Auto-follow on insights** | ReflectionInsight and BeliefAdded events now trigger auto-follow so the viewport scrolls to show them. |
 | **Time-based spinner** | Spinner animation uses wall-clock time instead of event-loop tick counter — immune to starvation from rapid streaming events or slow event loops. Animates reliably during LLM generation, tool execution, inline reflection, and sleep cycles. |
 | **Config-driven theming** | New `[ui]` config section: `theme` (catppuccin-mocha / tokyo-night / nord) and `show_sidebar` (default true). Theme is read on startup from `config/default.toml`. |
 | **Styled keybindings bar** | Context-aware footer: shows input-mode keys in normal mode, history-mode keys when browsing transcript. Accent-coloured key labels with dimmed separators. |
 | **Tool detail Enter-toggle** | Press Enter on a tool message in history mode to view the full tool output inline. |
-| **Styled header** | Bot name in accent, status in foreground — clean single-line header. |
-| **Stronger tool propagation** | Continuation instruction explicitly tells the LLM to "give a complete, natural, helpful final answer" and not qualify with "according to the tool". |
+| **Stronger tool propagation** | 7-point CRITICAL INSTRUCTION explicitly tells the LLM to use the verbatim tool result and never claim it is unavailable. |
 | **WASM-first tool execution** | Wasmtime host runtime is default-on. WASM guest binaries win over native at registry lookup (first-match). Native Rust builtins fall back only until `aigent tools build` compiles guests. |
 | **Platform sandboxing default-on** | `PR_SET_NO_NEW_PRIVS` + seccomp BPF (Linux x86-64) and `sandbox_init` (macOS) compiled in by default. Disable at runtime via `[tools] sandbox_enabled = false`; no recompile needed. |
 | **Three-level approval modes** | `safer` / `balanced` (default) / `autonomous` — configurable in onboarding wizard and in `[tools] approval_mode`. |
 | **Git auto-commit & rollback** | `git_auto_commit = true` commits every write/shell call; `git_rollback` tool reverts with one call. Wizard will `git init` the workspace automatically. |
 | **Brave Search** | `web_search` tool uses Brave API when `brave_api_key` is set; DuckDuckGo Instant Answer always available as fallback. |
 | **`aigent tools build/status` CLI** | Build WASM guests and inspect per-tool runtime state without starting the daemon. |
-| **Onboarding wizard** | Approval Mode and API Keys (Brave Search key) steps added inside the Safety section. |
-| **Prompt builder extraction** | All prompt assembly logic centralised in `prompt_builder.rs` — 10 composable block-builder functions, `PromptInputs` struct. `runtime.rs` 1161 → 948 lines. |
-| **9-rule truth-seeking grounding** | Every LLM call now includes date/time injection, tool-result-as-ground-truth, anti-hallucination, honest-uncertainty, and independent-reasoning directives. |
-| **TUI auto-follow polish** | Viewport auto-scrolls on `Thinking`, `Done`, and `ToolCallEnd` events; spinner persists through tool→stream handoff; UTF-8-safe tool output truncation. |
 
 ## Status
 
-Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Phase 10 (time-based spinner, config theming, styled keybindings bar, tool propagation hardening) is the latest shipped milestone. All features above are live and enabled by default.
+Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Phase 11 (non-blocking event loop, bulletproof tool propagation, TUI polish, sleep debuggability) is the latest shipped milestone. All features above are live and enabled by default.
 
 ## Building from source
 

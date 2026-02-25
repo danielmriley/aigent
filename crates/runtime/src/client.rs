@@ -232,6 +232,17 @@ impl DaemonClient {
         bail!("daemon did not return ProactiveStats")
     }
 
+    /// Retrieve sleep cycle status from the daemon.
+    pub async fn get_sleep_status(&self) -> Result<crate::commands::SleepStatusPayload> {
+        let events = self.request_events(ClientCommand::GetSleepStatus).await?;
+        for event in events {
+            if let ServerEvent::SleepStatus(payload) = event {
+                return Ok(payload);
+            }
+        }
+        bail!("daemon did not return SleepStatus")
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<aigent_tools::ToolSpec>> {
         let events = self.request_events(ClientCommand::ListTools).await?;
         for event in events {

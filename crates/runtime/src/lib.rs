@@ -10,7 +10,7 @@ mod server;
 
 pub use agent_loop::{LlmToolCall, ProactiveOutput, ReflectionBelief, ReflectionOutput, TurnSource};
 pub use client::DaemonClient;
-pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, ServerEvent};
+pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, SleepStatusPayload, ServerEvent};
 pub use events::{BackendEvent, ToolCallInfo, ToolResult};
 pub use runtime::{AgentRuntime, ConversationTurn};
 pub use server::run_unified_daemon;

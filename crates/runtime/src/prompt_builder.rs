@@ -178,7 +178,9 @@ fn build_environment_block(
          - memory_semantic: {}\n\
          - memory_episodic: {}\n\
          - memory_procedural: {}\n\
-         - recent_conversation_turns: {recent_turn_count}",
+         - recent_conversation_turns: {recent_turn_count}\n\
+         - sleep_mode: {}\n\
+         - sleep_quiet_window: {:02}:00-{:02}:00 {}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         config.llm.provider,
@@ -191,6 +193,10 @@ fn build_environment_block(
         stats.semantic,
         stats.episodic,
         stats.procedural,
+        config.memory.auto_sleep_mode,
+        config.memory.night_sleep_start_hour,
+        config.memory.night_sleep_end_hour,
+        config.memory.timezone,
     )
 }
 
@@ -324,7 +330,10 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
             to your reflective memory tier for sleep-distillation review.\n\
          9. When no tool result is available and you are genuinely uncertain, \
             say so explicitly rather than guessing — honest uncertainty is \
-            better than confident fabrication."
+            better than confident fabrication.\n\
+         10. After a tool has been called on your behalf, the result appears \
+             verbatim in your prompt. NEVER claim the tool result is missing, \
+             unavailable, or \"not yet loaded\". It is HERE — use it."
     );
 
     if tool_specs.is_empty() {

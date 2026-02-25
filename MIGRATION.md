@@ -1515,3 +1515,73 @@ This closes the remaining gap where some models would still hedge with
 - [ ] TUI: footer shows input-mode keys; press Esc → shows history-mode keys
 - [ ] TUI: Enter on ⚙ tool message in history mode → detail expands
 - [ ] Tool query → agent answers naturally without "according to the tool"
+
+---
+
+## Phase 11 — Non-blocking event loop, bulletproof tool propagation, TUI polish & sleep debuggability
+
+### Non-blocking TUI event loop (`tui.rs`)
+
+The previous event loop used `crossterm::event::poll(10ms)` inside the
+`tokio::select!` macro — a **synchronous blocking call** that starved the tick
+and backend branches.  The fix:
+
+- `spawn_crossterm_reader()` spawns a dedicated OS thread that runs
+  `crossterm::event::read()` in a tight loop, sending events through a
+  `tokio::sync::mpsc::unbounded_channel`.
+- The `tokio::select!` loop now receives crossterm events via `term_rx.recv()`,
+  a proper async future that yields cooperatively.
+- Result: spinner animation, backend event handling, and keyboard input all get
+  fair scheduling — no more stutter during rapid streaming.
+
+### Bulletproof tool propagation (`server.rs`, `prompt_builder.rs`)
+
+- The continuation instruction after a tool call is now a **7-point CRITICAL
+  INSTRUCTION** block:
+  1. The tool result is ALREADY in your context.
+  2. Give a complete, natural answer immediately.
+  3. Quote numbers/dates/facts verbatim.
+  4. Speak conversationally.
+  5. Never say the result is unavailable.
+  6. Never use "according to the tool".
+  7. If the tool returned an error, explain it honestly.
+- Grounding rule 10 added: "After a tool has been called on your behalf, the
+  result appears verbatim in your prompt. NEVER claim the tool result is
+  missing."
+
+### Ctrl+T theme cycling (`app.rs`)
+
+- New `theme_name: ThemeName` field on `App` tracks the active theme variant.
+- Ctrl+T cycles Catppuccin Mocha → Tokyo Night → Nord → Catppuccin Mocha.
+- Keybindings bar updated to show "Ctrl+T theme".
+
+### Auto-follow on Reflection events (`app.rs`)
+
+`ReflectionInsight` and `BeliefAdded` backend events now set
+`self.auto_follow = true` so the viewport scrolls to show them.
+
+### `aigent status` CLI command (`main.rs`)
+
+New top-level command queries the daemon over the Unix socket and prints:
+- Daemon status: bot name, provider, model, uptime, memory stats, tools.
+- Sleep schedule: mode, passive interval, last passive/nightly times, quiet
+  window, whether currently in window.
+
+### Sleep cycle debuggability (`server.rs`, `commands.rs`, `client.rs`)
+
+- **`GetSleepStatus`** client command and **`SleepStatusPayload`** struct.
+- **`last_passive_sleep_at`** field added to `DaemonState`.
+- Task A (passive) and Task B (nightly) now emit `info!` tracing at start and
+  completion.
+- Sleep schedule (mode, quiet window, timezone) injected into the
+  `build_environment_block()` so the LLM knows its own sleep schedule.
+
+### Verification checklist
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] TUI: spinner animates smoothly during streaming and tool calls
+- [ ] TUI: Ctrl+T cycles through all 3 themes
+- [ ] TUI: ReflectionInsight auto-scrolls the viewport
+- [ ] `aigent status` shows daemon status and sleep schedule
+- [ ] Tool query → agent uses result directly, no "not in context"

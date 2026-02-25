@@ -50,6 +50,8 @@ struct DaemonState {
     event_tx: broadcast::Sender<BackendEvent>,
     /// Instant of the last successful multi-agent sleep cycle run.
     last_multi_agent_sleep_at: Option<std::time::Instant>,
+    /// Instant of the last successful passive distillation run.
+    last_passive_sleep_at: Option<std::time::Instant>,
     /// Total proactive messages sent since daemon start.
     proactive_total_sent: u64,
     /// Timestamp of the last proactive message sent.
@@ -231,6 +233,7 @@ pub async fn run_unified_daemon(
         last_turn_at: None,
         event_tx,
         last_multi_agent_sleep_at,
+        last_passive_sleep_at: None,
         proactive_total_sent: 0,
         last_proactive_at: None,
         proactive_handle: None,
@@ -343,6 +346,7 @@ pub async fn run_unified_daemon(
                 }
 
                 last_passive_at = std::time::Instant::now();
+                info!("passive distillation starting");
                 // Take memory out while briefly locked, then release the lock
                 // before the (potentially long) distillation call so incoming
                 // connections are never blocked here.
@@ -357,7 +361,9 @@ pub async fn run_unified_daemon(
                             "background passive distillation complete"
                         );
                     }
-                    Ok(_) => {}
+                    Ok(_) => {
+                        info!("passive distillation complete (no promotions)");
+                    }
                     Err(ref err) => warn!(?err, "background passive distillation failed"),
                 }
                 // Lightweight forgetting: prune old low-confidence episodic entries.
@@ -370,6 +376,7 @@ pub async fn run_unified_daemon(
                 {
                     let mut s = sleep_state.lock().await;
                     s.memory = memory;
+                    s.last_passive_sleep_at = Some(std::time::Instant::now());
                 }
             }
         });
@@ -425,6 +432,7 @@ pub async fn run_unified_daemon(
                 }
 
                 // All guards passed — run the nightly multi-agent cycle.
+                info!("nightly multi-agent sleep cycle starting");
                 // Clone runtime and take memory, then release lock before the
                 // LLM call so incoming connections are never blocked here.
                 let (rt_clone, mut memory) = {
@@ -758,13 +766,18 @@ async fn handle_connection(
                      ===== TOOL RESULT (retrieved {now}) from '{tool_name}' =====\n\
                      {output}\n\
                      ===== END TOOL RESULT =====\n\n\
-                     IMPORTANT: The TOOL RESULT above is already in your context. \
-                     Using it, give a complete, natural, helpful final answer. \
-                     Quote numbers, dates, and facts verbatim from the result. \
-                     Speak conversationally as yourself — do NOT mention tools, \
-                     say the result is unavailable, pending, or \"not yet in memory\", \
-                     or qualify with phrases like \"according to the tool\" or \
-                     \"based on the search result\". Simply state the answer.",
+                     CRITICAL INSTRUCTION — read carefully:\n\
+                     1. The TOOL RESULT above is ALREADY in your context right now.\n\
+                     2. Using it, give a complete, natural, helpful final answer immediately.\n\
+                     3. Quote numbers, dates, and facts verbatim from the result.\n\
+                     4. Speak conversationally as yourself.\n\
+                     5. Do NOT say the result is unavailable, pending, \"not yet in memory\", \
+                        or that you need to check further.\n\
+                     6. Do NOT use phrases like \"according to the tool\", \"the search result \
+                        shows\", or \"based on the data retrieved\". Simply state the answer \
+                        as if you know it.\n\
+                     7. If the tool returned an error, explain the error honestly and suggest \
+                        alternatives.",
                     user = user,
                     now = now,
                     tool_name = tool_name,
@@ -1096,6 +1109,27 @@ async fn handle_connection(
                 dnd_end_hour: s.runtime.config.memory.proactive_dnd_end_hour,
             };
             send_event(&mut write_half, ServerEvent::ProactiveStats(payload)).await?;
+        }
+        ClientCommand::GetSleepStatus => {
+            use crate::commands::SleepStatusPayload;
+            let s = state.lock().await;
+            let cfg = &s.runtime.config.memory;
+            let tz: chrono_tz::Tz = cfg.timezone.parse().unwrap_or(chrono_tz::UTC);
+            let start_h = cfg.night_sleep_start_hour as u32;
+            let end_h = cfg.night_sleep_end_hour as u32;
+            let payload = SleepStatusPayload {
+                auto_sleep_mode: cfg.auto_sleep_mode.clone(),
+                passive_interval_hours: cfg.auto_sleep_turn_interval as u64,
+                last_passive_sleep_at: s.last_passive_sleep_at
+                    .map(|t| format!("{}s ago", t.elapsed().as_secs())),
+                last_nightly_sleep_at: s.last_multi_agent_sleep_at
+                    .map(|t| format!("{}s ago", t.elapsed().as_secs())),
+                quiet_window_start: start_h as u8,
+                quiet_window_end: end_h as u8,
+                timezone: cfg.timezone.clone(),
+                in_quiet_window: is_in_window(Utc::now(), tz, start_h, end_h),
+            };
+            send_event(&mut write_half, ServerEvent::SleepStatus(payload)).await?;
         }
     }
 

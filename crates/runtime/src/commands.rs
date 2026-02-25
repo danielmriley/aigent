@@ -42,6 +42,20 @@ pub enum ClientCommand {
     TriggerProactive,
     /// Return statistics about proactive mode activity.
     GetProactiveStats,
+    /// Return sleep cycle status: last passive/nightly times, schedule info.
+    GetSleepStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SleepStatusPayload {
+    pub auto_sleep_mode: String,
+    pub passive_interval_hours: u64,
+    pub last_passive_sleep_at: Option<String>,
+    pub last_nightly_sleep_at: Option<String>,
+    pub quiet_window_start: u8,
+    pub quiet_window_end: u8,
+    pub timezone: String,
+    pub in_quiet_window: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -67,4 +81,6 @@ pub enum ServerEvent {
     StatusLine(String),
     /// Response to `GetProactiveStats`.
     ProactiveStats(ProactiveStatsPayload),
+    /// Response to `GetSleepStatus`.
+    SleepStatus(SleepStatusPayload),
 }

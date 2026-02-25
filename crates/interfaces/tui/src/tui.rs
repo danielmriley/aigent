@@ -19,6 +19,22 @@ use crate::app::App;
 use crate::app::UiCommand;
 use crate::events::AppEvent;
 
+/// Read crossterm events using a non-blocking channel so we never call
+/// synchronous `event::poll()` inside the async `tokio::select!` loop.
+/// This prevents a 10ms block on every iteration and lets the spinner
+/// tick truly in parallel with rapid backend events.
+fn spawn_crossterm_reader() -> mpsc::UnboundedReceiver<CrosstermEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while let Ok(ev) = event::read() {
+            if tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 pub fn banner() -> &'static str {
     r#"
     _    _                  _
@@ -52,6 +68,10 @@ where
     let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
     // First tick fires immediately; skip it so we don't double-draw on entry.
     tick_interval.tick().await;
+    // Read crossterm events on a dedicated OS thread so we never block the
+    // async runtime with synchronous `event::poll()`.  This guarantees the
+    // spinner tick and backend branches get fair scheduling.
+    let mut term_rx = spawn_crossterm_reader();
 
     let result = async {
         loop {
@@ -60,6 +80,8 @@ where
             }
 
             tokio::select! {
+                // Drain all pending backend events before anything else so
+                // the UI stays responsive during rapid streaming.
                 backend = app.backend_rx.recv() => {
                     if let Some(backend) = backend {
                         let _ = app.update(AppEvent::Backend(backend));
@@ -68,13 +90,7 @@ where
                 _ = tick_interval.tick() => {
                     let _ = app.update(AppEvent::Tick);
                 }
-                key_event = async {
-                    if event::poll(Duration::from_millis(10)).unwrap_or(false) {
-                        event::read().ok()
-                    } else {
-                        None
-                    }
-                } => {
+                key_event = term_rx.recv() => {
                     if let Some(CrosstermEvent::Key(key)) = key_event {
                         let force_quit = key.code == crossterm::event::KeyCode::Char('c')
                             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)

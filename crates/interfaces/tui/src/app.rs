@@ -26,7 +26,7 @@ use aigent_runtime::{
 
 use crate::{
     events::AppEvent,
-    theme::Theme,
+    theme::{Theme, ThemeName},
     widgets::{
         chat::{chat_visual_line_count, draw_chat, message_visual_line_start},
         input::draw_input,
@@ -96,6 +96,7 @@ pub struct App {
     pub backend_rx: mpsc::UnboundedReceiver<BackendEvent>,
     pub focus: Focus,
     pub theme: Theme,
+    pub theme_name: ThemeName,
     pub scroll: usize,
     pub max_scroll: usize,
     pub auto_follow: bool,
@@ -152,6 +153,7 @@ impl App {
             backend_rx,
             focus: Focus::Input,
             theme: Theme::from_config(&config.ui.theme),
+            theme_name: ThemeName::from_config(&config.ui.theme),
             scroll: 0,
             max_scroll: 0,
             auto_follow: true,
@@ -255,6 +257,17 @@ impl App {
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
                     self.command_palette.visible = !self.command_palette.visible;
+                    return None;
+                }
+                // Ctrl+T — cycle colour theme.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+                    let next = match self.theme_name {
+                        ThemeName::CatppuccinMocha => ThemeName::TokyoNight,
+                        ThemeName::TokyoNight => ThemeName::Nord,
+                        ThemeName::Nord => ThemeName::CatppuccinMocha,
+                    };
+                    self.theme_name = next;
+                    self.theme = Theme::from_name(next);
                     return None;
                 }
 
@@ -591,6 +604,7 @@ impl App {
                 self.auto_follow = true;
             }
             BackendEvent::ReflectionInsight(insight) => {
+                self.auto_follow = true;
                 // UTF-8 safe: use char iterator, not byte slice, to avoid panics.
                 let char_count = insight.chars().count();
                 let display: String = insight.chars().take(80).collect();
@@ -602,6 +616,7 @@ impl App {
                 self.state.status = format!("💡 {}", display);
             }
             BackendEvent::BeliefAdded { claim, confidence } => {
+                self.auto_follow = true;
                 // UTF-8 safe truncation.
                 let char_count = claim.chars().count();
                 let truncated: String = claim.chars().take(70).collect();
@@ -813,6 +828,8 @@ impl App {
                 Span::styled("@", key_style), Span::styled(" files ", label),
                 sep.clone(),
                 Span::styled("Ctrl+S", key_style), Span::styled(" sidebar ", label),
+                sep.clone(),
+                Span::styled("Ctrl+T", key_style), Span::styled(" theme ", label),
                 sep.clone(),
                 Span::styled("Alt+S", key_style), Span::styled(" select ", label),
             ])
