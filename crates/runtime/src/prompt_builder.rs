@@ -51,6 +51,9 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
         "You are {name}. Thinking depth: {thought_style}.\n\
          Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
          continuity, and MEMORY CONTEXT for durable background facts.\n\
+         When a TOOL RESULT appears in RECENT CONVERSATION or LATEST USER MESSAGE, it is already \n\
+         in your context — treat it as ground truth and base your answer on it. Never claim a tool \n\
+         result is unavailable, not yet loaded, or not in memory when it appears in the prompt.\n\
          Never repeat previous answers unless asked.\n\
          Respond directly and specifically to the LATEST user message.\
          {relational_block}{follow_ups}{proactive_directive}\n\n\
@@ -193,15 +196,20 @@ fn build_environment_block(
 
 fn build_conversation_block(recent_turns: &[ConversationTurn]) -> String {
     let start = recent_turns.len().saturating_sub(6);
-    let formatted = recent_turns[start..]
+    let turns = &recent_turns[start..];
+    let last_idx = turns.len().saturating_sub(1);
+    let formatted = turns
         .iter()
         .enumerate()
         .map(|(index, turn)| {
+            // Give the most recent turn a generous assistant limit so a
+            // synthetic TOOL RESULT turn is not aggressively clipped.
+            let assistant_limit = if index == last_idx { 2000 } else { 360 };
             format!(
                 "Turn {}\nUser: {}\nAssistant: {}",
                 index + 1,
                 truncate_for_prompt(&turn.user, 280),
-                truncate_for_prompt(&turn.assistant, 360),
+                truncate_for_prompt(&turn.assistant, assistant_limit),
             )
         })
         .collect::<Vec<_>>()

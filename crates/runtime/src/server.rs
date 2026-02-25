@@ -706,7 +706,7 @@ async fn handle_connection(
                 None
             };
 
-            let (rt_clone, mut memory, recent, last_turn_at) = {
+            let (rt_clone, mut memory, mut recent, last_turn_at) = {
                 let mut s = state.lock().await;
                 let rt = s.runtime.clone();
                 let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
@@ -718,9 +718,11 @@ async fn handle_connection(
 
             // LLM respond + inline reflect, both WITHOUT holding state lock.
             //
-            // If a tool was called above, record the result to Procedural memory
-            // and prepend it to the context so the LLM reply is grounded in the
-            // actual tool output.
+            // If a tool was called above, (a) record the result to Procedural
+            // memory for long-term recall, (b) inject a synthetic conversation
+            // turn so the RECENT CONVERSATION block in the prompt contains an
+            // explicit tool-result exchange, and (c) build an effective user
+            // message that presents the result as ground truth.
             if let Some((ref tool_name, ref tool_output)) = tool_result_text {
                 let outcome_text = format!(
                     "Tool '{}' executed in response to user turn. Output (first 400 chars): {}",
@@ -734,27 +736,38 @@ async fn handle_connection(
                 ).await {
                     warn!(?err, tool = %tool_name, "failed to record tool result to procedural memory");
                 }
+
+                // (b) Inject the tool result as an explicit conversation turn.
+                // This ensures the LLM sees the result in RECENT CONVERSATION
+                // even before reading LATEST USER MESSAGE, creating a strong
+                // two-point reinforcement that prevents the "result isn't in
+                // my context yet" failure mode.
+                recent.push(ConversationTurn {
+                    user: format!("[system: tool '{}' was invoked for this request]", tool_name),
+                    assistant: format!("[TOOL RESULT from '{}']: {}", tool_name, tool_output),
+                });
             }
 
-            // The effective user message presented to the main LLM.  When a tool
-            // was called, the result is prepended so the reply is grounded in it.
-            // Build the effective user message.  When a tool was executed, wrap the
-            // raw output in a structured block that tells the LLM *exactly* how to
-            // use it: treat it as ground truth, cite numbers verbatim, respond in
-            // natural prose without exposing the tool machinery.
+            // Build the effective user message.  When a tool was executed, the
+            // user question is stated first (so the LLM knows what to answer),
+            // followed by the full tool output in a clearly demarcated block.
             let effective_user: std::borrow::Cow<str> = if let Some((ref tool_name, ref output)) = tool_result_text {
                 let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-                std::borrow::Cow::Owned({
-                    let body = format!(
-                        "[{now}] TOOL RESULT from '{tool_name}':\n{output}\n\n\u{2501}\u{2501}\u{2501} GROUNDING DIRECTIVE (highest priority) \u{2501}\u{2501}\u{2501}\nThe TOOL RESULT above is the single authoritative source of truth.\n\u{2022} Extract every relevant number, date, and fact verbatim from the TOOL RESULT \
-— do NOT substitute values from training data.\n\u{2022} If the result contains a price, quote it exactly.\n\u{2022} If the result contains a date or event, state it precisely.\n\u{2022} Do NOT hedge (\"I believe...\", \"approximately...\") when the tool gave a concrete answer.\n\u{2022} Respond conversationally in first person; do not reveal that a tool was called.\n\u{2022} If the tool result appears incomplete or erroneous, say so honestly.\n\nOriginal user question: {user}",
-                        now = now,
-                        tool_name = tool_name,
-                        output = output,
-                        user = user,
-                    );
-                    body
-                })
+                std::borrow::Cow::Owned(format!(
+                    "{user}\n\n\
+                     ===== TOOL RESULT (retrieved {now}) from '{tool_name}' =====\n\
+                     {output}\n\
+                     ===== END TOOL RESULT =====\n\n\
+                     IMPORTANT: The TOOL RESULT above is already in your context. \
+                     Do NOT say the result is unavailable, pending, or \"not yet in memory\". \
+                     Base your answer on the TOOL RESULT. \
+                     Quote numbers, dates, and facts verbatim. \
+                     Respond conversationally without revealing a tool was used.",
+                    user = user,
+                    now = now,
+                    tool_name = tool_name,
+                    output = output,
+                ))
             } else {
                 std::borrow::Cow::Borrowed(&user)
             };
