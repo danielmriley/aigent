@@ -738,11 +738,23 @@ async fn handle_connection(
 
             // The effective user message presented to the main LLM.  When a tool
             // was called, the result is prepended so the reply is grounded in it.
-            let effective_user: std::borrow::Cow<str> = if let Some((ref _name, ref output)) = tool_result_text {
-                std::borrow::Cow::Owned(format!(
-                    "TOOL RESULT:\n{}\n\nUsing the TOOL RESULT above, provide a complete, natural, helpful final answer to the user's original question. Do not ask the user what the result was or say 'I used a tool'. Just give the answer as if you had the information all along.\n\nOriginal request: {}",
-                    output, user
-                ))
+            // Build the effective user message.  When a tool was executed, wrap the
+            // raw output in a structured block that tells the LLM *exactly* how to
+            // use it: treat it as ground truth, cite numbers verbatim, respond in
+            // natural prose without exposing the tool machinery.
+            let effective_user: std::borrow::Cow<str> = if let Some((ref tool_name, ref output)) = tool_result_text {
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                std::borrow::Cow::Owned({
+                    let body = format!(
+                        "[{now}] TOOL RESULT from '{tool_name}':\n{output}\n\n\u{2501}\u{2501}\u{2501} GROUNDING DIRECTIVE (highest priority) \u{2501}\u{2501}\u{2501}\nThe TOOL RESULT above is the single authoritative source of truth.\n\u{2022} Extract every relevant number, date, and fact verbatim from the TOOL RESULT \
+— do NOT substitute values from training data.\n\u{2022} If the result contains a price, quote it exactly.\n\u{2022} If the result contains a date or event, state it precisely.\n\u{2022} Do NOT hedge (\"I believe...\", \"approximately...\") when the tool gave a concrete answer.\n\u{2022} Respond conversationally in first person; do not reveal that a tool was called.\n\u{2022} If the tool result appears incomplete or erroneous, say so honestly.\n\nOriginal user question: {user}",
+                        now = now,
+                        tool_name = tool_name,
+                        output = output,
+                        user = user,
+                    );
+                    body
+                })
             } else {
                 std::borrow::Cow::Borrowed(&user)
             };

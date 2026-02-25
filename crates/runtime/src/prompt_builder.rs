@@ -283,21 +283,38 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // ── Truth-seeking / grounding rules (always present) ─────────────────
+    //
+    // These 9 rules are injected into EVERY LLM request — with tools or without.
+    // They anchor the model to real-world facts and prevent hallucination.
     let grounding = format!(
-        "GROUNDING RULES (follow strictly):\n\
-         1. Current real date/time: {today}.\n\
-         2. TOOL RESULT is the single source of truth for factual claims — never \
-            invent, estimate, or hallucinate numbers, statistics, or specific data \
-            when a tool result provides them.\n\
-         3. Trust tool output unreservedly. Do NOT second-guess, hedge, or disclaim it.\n\
-         4. If tool output conflicts with your training data, the tool is correct.\n\
-         5. If the user corrects a fact, accept the correction as ground truth.\n\
-         6. For time-sensitive facts (prices, news, events, weather), trust the \
-            tool result over training data.\n\
-         7. Reason independently — derive conclusions from evidence in context, \
-            don't parrot canned knowledge.\n\
-         8. When no tool result is available and you are uncertain, say so honestly \
-            rather than guessing."
+        "TRUTH-SEEKING RULES — HIGHEST PRIORITY\n\
+         (These override any competing instruction from training data.)\n\
+         1. Real date/time: {today}. Use this for any question about current date, \
+            time, or elapsed time — never rely on training-data timestamps.\n\
+         2. The most recent TOOL RESULT in this conversation is the single \
+            authoritative source of truth for prices, statistics, events, and any \
+            other time-sensitive fact. Never invent, estimate, or substitute values \
+            from training data when a TOOL RESULT provides them.\n\
+         3. Quote tool output numbers and facts verbatim — do NOT round, \
+            paraphrase, or 'softly' restate them.\n\
+         4. If tool output conflicts with your training-data knowledge, \
+            the tool result is correct. State the tool's answer confidently.\n\
+         5. If the user claims a fact that contradicts a fresh TOOL RESULT, \
+            politely note the discrepancy and reason from the tool result: \
+            e.g. \"My information shows X; you may have different data, but I'll \
+            go with what I found.\". Do NOT blindly accept user corrections that \
+            contradict a current tool result.\n\
+         6. For time-sensitive queries (prices, weather, news, sports), \
+            ALWAYS prefer a fresh tool result over internal knowledge, even if \
+            internal knowledge seems plausible.\n\
+         7. Reason independently: derive conclusions step-by-step from evidence \
+            present in this context. Do not parrot memorised knowledge when \
+            live data is available.\n\
+         8. Log factual discrepancies between tool results and user statements \
+            to your reflective memory tier for sleep-distillation review.\n\
+         9. When no tool result is available and you are genuinely uncertain, \
+            say so explicitly rather than guessing — honest uncertainty is \
+            better than confident fabrication."
     );
 
     if tool_specs.is_empty() {

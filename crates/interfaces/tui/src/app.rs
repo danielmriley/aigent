@@ -80,7 +80,7 @@ pub struct CommandPalette {
     pub commands: Vec<&'static str>,
 }
 
-const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub struct App {
     pub state: AppState,
@@ -565,22 +565,26 @@ impl App {
                 self.auto_follow = true;
             }
             BackendEvent::ReflectionInsight(insight) => {
-                // Trim to a single line for the status bar; long insights are
-                // truncated with an ellipsis so the header stays compact.
-                let display = if insight.len() > 80 {
-                    format!("{}…", &insight[..80])
+                // UTF-8 safe: use char iterator, not byte slice, to avoid panics.
+                let char_count = insight.chars().count();
+                let display: String = insight.chars().take(80).collect();
+                let display = if char_count > 80 {
+                    format!("{}…", display)
                 } else {
-                    insight.clone()
+                    display
                 };
-                self.state.status = format!("\u{1f4a1} {}", display);
+                self.state.status = format!("💡 {}", display);
             }
             BackendEvent::BeliefAdded { claim, confidence } => {
-                let display = if claim.len() > 70 {
-                    format!("{}…", &claim[..70])
+                // UTF-8 safe truncation.
+                let char_count = claim.chars().count();
+                let truncated: String = claim.chars().take(70).collect();
+                let display = if char_count > 70 {
+                    format!("{}…", truncated)
                 } else {
-                    claim.clone()
+                    truncated
                 };
-                self.state.status = format!("belief ({:.2}): {}", confidence, display);
+                self.state.status = format!("🧠 belief ({:.2}): {}", confidence, display);
             }
             BackendEvent::ProactiveMessage { content } => {
                 let rendered = render_markdown_lines(&content);

@@ -1370,3 +1370,25 @@ is imported from the prompt builder; `environment_snapshot` removed (logic moved
 - [ ] TUI: Thinking event auto-scrolls to bottom
 - [ ] TUI: tool call → result → streaming response auto-scrolls throughout
 - [ ] Grounding rules include real date/time and all 8 truth-seeking directives
+
+---
+
+## Phase 10 — Tool-result grounding hardening, 9-rule truth-seeking, TUI polish (February 2026)
+
+### What changed
+
+| Area | Change |
+|---|---|
+| **server.rs** — `effective_user` | Replaced weak continuation prompt with a structured `GROUNDING DIRECTIVE` block: timestamp-stamped TOOL RESULT, 6 explicit bullet directives (verbatim facts, no hedging, reveal-error honesty, natural prose). |
+| **prompt_builder.rs** — grounding rules | Upgraded from 8 rules to **9 truth-seeking rules** with corrected user-correction handling: rule 5 now says "politely note the discrepancy and reason from the tool result" instead of blindly accepting user corrections. |
+| **app.rs** — spinner | Upgraded from 4-frame ASCII `|/-\` to 10-frame **braille spinner** `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` for smoother animation. |
+| **app.rs** — status bar | `ReflectionInsight` and `BeliefAdded` handlers: replaced panicky byte-index slicing `&s[..N]` with UTF-8-safe `.chars().take(N)`. `BeliefAdded` now shows 🧠 emoji. |
+
+### Verification checklist
+
+- [ ] `cargo check --workspace` — 0 errors
+- [ ] `cargo test -p aigent-runtime` — all 10 tests pass
+- [ ] Weather/stock query → agent cites exact number from tool result, no hedging
+- [ ] User contradicts tool result → agent politely notes discrepancy, holds tool value
+- [ ] TUI: braille spinner visible during tool + stream phases
+- [ ] TUI: no panic on non-ASCII content in status bar (e.g. CJK characters in tool output)
