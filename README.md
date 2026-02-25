@@ -6,6 +6,12 @@ Aigent is a persistent, self-improving AI agent written in Rust. It runs as a ba
 
 | Change | Details |
 |---|---|
+| **Time-based spinner** | Spinner animation uses wall-clock time instead of event-loop tick counter — immune to starvation from rapid streaming events or slow event loops. Animates reliably during LLM generation, tool execution, inline reflection, and sleep cycles. |
+| **Config-driven theming** | New `[ui]` config section: `theme` (catppuccin-mocha / tokyo-night / nord) and `show_sidebar` (default true). Theme is read on startup from `config/default.toml`. |
+| **Styled keybindings bar** | Context-aware footer: shows input-mode keys in normal mode, history-mode keys when browsing transcript. Accent-coloured key labels with dimmed separators. |
+| **Tool detail Enter-toggle** | Press Enter on a tool message in history mode to view the full tool output inline. |
+| **Styled header** | Bot name in accent, status in foreground — clean single-line header. |
+| **Stronger tool propagation** | Continuation instruction explicitly tells the LLM to "give a complete, natural, helpful final answer" and not qualify with "according to the tool". |
 | **WASM-first tool execution** | Wasmtime host runtime is default-on. WASM guest binaries win over native at registry lookup (first-match). Native Rust builtins fall back only until `aigent tools build` compiles guests. |
 | **Platform sandboxing default-on** | `PR_SET_NO_NEW_PRIVS` + seccomp BPF (Linux x86-64) and `sandbox_init` (macOS) compiled in by default. Disable at runtime via `[tools] sandbox_enabled = false`; no recompile needed. |
 | **Three-level approval modes** | `safer` / `balanced` (default) / `autonomous` — configurable in onboarding wizard and in `[tools] approval_mode`. |
@@ -14,12 +20,12 @@ Aigent is a persistent, self-improving AI agent written in Rust. It runs as a ba
 | **`aigent tools build/status` CLI** | Build WASM guests and inspect per-tool runtime state without starting the daemon. |
 | **Onboarding wizard** | Approval Mode and API Keys (Brave Search key) steps added inside the Safety section. |
 | **Prompt builder extraction** | All prompt assembly logic centralised in `prompt_builder.rs` — 10 composable block-builder functions, `PromptInputs` struct. `runtime.rs` 1161 → 948 lines. |
-| **8-rule truth-seeking grounding** | Every LLM call now includes date/time injection, tool-result-as-ground-truth, anti-hallucination, honest-uncertainty, and independent-reasoning directives. |
+| **9-rule truth-seeking grounding** | Every LLM call now includes date/time injection, tool-result-as-ground-truth, anti-hallucination, honest-uncertainty, and independent-reasoning directives. |
 | **TUI auto-follow polish** | Viewport auto-scrolls on `Thinking`, `Done`, and `ToolCallEnd` events; spinner persists through tool→stream handoff; UTF-8-safe tool output truncation. |
 
 ## Status
 
-Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Phase 9 (prompt-builder extraction, truth-seeking grounding, TUI polish) is the latest shipped milestone. All features above are live and enabled by default.
+Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Phase 10 (time-based spinner, config theming, styled keybindings bar, tool propagation hardening) is the latest shipped milestone. All features above are live and enabled by default.
 
 ## Building from source
 
@@ -164,8 +170,10 @@ A **cooldown gate** (`proactive_cooldown_minutes`, default 5) prevents message b
 - `ProactiveMessage` events rendered as chat bubbles in the main transcript (Markdown-rendered).
 - External turns from Telegram visible inline in the TUI transcript via `ExternalTurn` events.
 - **TUI chat persistence**: every turn is appended to `.aigent/history/YYYY-MM-DD.jsonl` so the last 200 turns are automatically restored when you reopen the TUI. Manage with `aigent history clear`, `aigent history export <path>`, `aigent history path`.
-- **Animated spinner** (braille cycle) is visible throughout the entire agent turn — LLM generation, tool execution, and reflection phases. Viewport auto-scrolls to follow new content.
+- **Animated spinner** (braille cycle) is visible throughout the entire agent turn — LLM generation, tool execution, and reflection phases. Uses wall-clock time for frame calculation, immune to event-loop starvation. Viewport auto-scrolls to follow new content.
 - **Auto-follow**: viewport always follows streaming tokens, tool results, and proactive messages. Scrolling up disables auto-follow; pressing End re-enables it.
+- **Config-driven theming**: set `[ui] theme = "tokyo-night"` (or `catppuccin-mocha`, `nord`) in `config/default.toml`. Sidebar visibility also configurable via `[ui] show_sidebar`.
+- **Context-aware keybindings bar**: footer shows relevant shortcuts for the current mode (input vs history), with accent-coloured key labels and dimmed separators.
 
 #### Telegram bot
 

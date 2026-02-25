@@ -759,10 +759,12 @@ async fn handle_connection(
                      {output}\n\
                      ===== END TOOL RESULT =====\n\n\
                      IMPORTANT: The TOOL RESULT above is already in your context. \
-                     Do NOT say the result is unavailable, pending, or \"not yet in memory\". \
-                     Base your answer on the TOOL RESULT. \
-                     Quote numbers, dates, and facts verbatim. \
-                     Respond conversationally without revealing a tool was used.",
+                     Using it, give a complete, natural, helpful final answer. \
+                     Quote numbers, dates, and facts verbatim from the result. \
+                     Speak conversationally as yourself — do NOT mention tools, \
+                     say the result is unavailable, pending, or \"not yet in memory\", \
+                     or qualify with phrases like \"according to the tool\" or \
+                     \"based on the search result\". Simply state the answer.",
                     user = user,
                     now = now,
                     tool_name = tool_name,

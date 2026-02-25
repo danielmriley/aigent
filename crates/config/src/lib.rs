@@ -263,6 +263,26 @@ impl Default for DaemonConfig {
     }
 }
 
+/// User-interface appearance settings exposed in `[ui]` config section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Named colour theme.  Recognised values: `catppuccin-mocha` (default),
+    /// `tokyo-night`, `nord`.
+    pub theme: String,
+    /// Show the collapsible sidebar on startup.
+    pub show_sidebar: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            theme: "catppuccin-mocha".to_string(),
+            show_sidebar: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -275,6 +295,7 @@ pub struct AppConfig {
     pub onboarding: OnboardingConfig,
     pub integrations: IntegrationsConfig,
     pub daemon: DaemonConfig,
+    pub ui: UiConfig,
 }
 
 impl AppConfig {

@@ -7,11 +7,13 @@ use ignore::WalkBuilder;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use std::fs;
 use std::path::Path;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::debug;
 use tui_textarea::{Input, Key, TextArea};
@@ -98,7 +100,9 @@ pub struct App {
     pub max_scroll: usize,
     pub auto_follow: bool,
     pub show_sidebar: bool,
-    pub spinner_tick: usize,
+    /// Wall-clock epoch used to compute spinner frame index — immune to
+    /// event-loop starvation from rapid backend events.
+    pub spinner_epoch: Instant,
     pub pending_stream: String,
     pub input_wrap_width: usize,
     pub workspace_files: Vec<String>,
@@ -147,12 +151,12 @@ impl App {
             textarea,
             backend_rx,
             focus: Focus::Input,
-            theme: Theme::default(),
+            theme: Theme::from_config(&config.ui.theme),
             scroll: 0,
             max_scroll: 0,
             auto_follow: true,
-            show_sidebar: true,
-            spinner_tick: 0,
+            show_sidebar: config.ui.show_sidebar,
+            spinner_epoch: Instant::now(),
             is_thinking: false,
             is_sleeping: false,
             active_tool: None,
@@ -217,7 +221,6 @@ impl App {
     pub fn update(&mut self, event: AppEvent) -> Option<UiCommand> {
         match event {
             AppEvent::Tick => {
-                self.spinner_tick = self.spinner_tick.wrapping_add(1);
                 self.refresh_file_popup();
                 None
             }
@@ -352,6 +355,20 @@ impl App {
                                 (current + 1).min(self.state.messages.len().saturating_sub(1)),
                             );
                             self.auto_follow = false;
+                        }
+                        KeyCode::Enter => {
+                            // Toggle expand/collapse on tool messages (⚙).
+                            // Re-selecting the same message collapses it;
+                            // selecting a different one expands only the new one.
+                            if let Some(idx) = self.state.selected_message {
+                                if let Some(msg) = self.state.messages.get(idx) {
+                                    if msg.role == "⚙" && msg.content.contains('\0') {
+                                        // Toggle: deselect to collapse, keep selection
+                                        // to expand.  The chat widget shows detail only
+                                        // when the message is the current selection.
+                                    }
+                                }
+                            }
                         }
                         KeyCode::Char('c') => {
                             if let Some(code) = self.selected_code_block() {
@@ -625,15 +642,21 @@ impl App {
             .split(frame.area());
 
         let status_display = if self.is_thinking || self.is_sleeping {
-            let frame = SPINNER_FRAMES[self.spinner_tick % SPINNER_FRAMES.len()];
+            let elapsed_ms = self.spinner_epoch.elapsed().as_millis();
+            let frame_idx = (elapsed_ms / 80) as usize % SPINNER_FRAMES.len();
+            let frame = SPINNER_FRAMES[frame_idx];
             format!("{} {}", frame, self.state.status)
         } else {
             self.state.status.clone()
         };
-        let header = Paragraph::new(Line::from(format!(
-            "{} • {} • Ctrl+S sidebar • Esc history",
-            self.state.bot_name, status_display
-        )));
+        let header = Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {} ", self.state.bot_name),
+                Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" • ", Style::default().fg(self.theme.muted)),
+            Span::styled(status_display, Style::default().fg(self.theme.foreground)),
+        ]));
         frame.render_widget(header, outer[0]);
 
         let middle = if self.show_sidebar {
@@ -760,9 +783,41 @@ impl App {
             frame.render_widget(widget, area);
         }
 
-        let footer = Paragraph::new(Line::from(
-            "Enter send • Alt+Enter newline • Ctrl+K commands • Alt+S select/copy • @ file picker • history: Esc/Up/Down",
-        ));
+        let key_style = Style::default()
+            .fg(self.theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let sep = Span::styled(" │ ", Style::default().fg(self.theme.muted));
+        let label = Style::default().fg(self.theme.muted);
+        let footer_line = if self.state.history_mode {
+            Line::from(vec![
+                Span::styled("Esc", key_style), Span::styled(" exit ", label),
+                sep.clone(),
+                Span::styled("↑↓", key_style), Span::styled(" navigate ", label),
+                sep.clone(),
+                Span::styled("Enter", key_style), Span::styled(" expand tool ", label),
+                sep.clone(),
+                Span::styled("c", key_style), Span::styled(" copy code ", label),
+                sep.clone(),
+                Span::styled("a", key_style), Span::styled(" apply code ", label),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("Enter", key_style), Span::styled(" send ", label),
+                sep.clone(),
+                Span::styled("Alt+Enter", key_style), Span::styled(" newline ", label),
+                sep.clone(),
+                Span::styled("Esc", key_style), Span::styled(" history ", label),
+                sep.clone(),
+                Span::styled("Ctrl+K", key_style), Span::styled(" commands ", label),
+                sep.clone(),
+                Span::styled("@", key_style), Span::styled(" files ", label),
+                sep.clone(),
+                Span::styled("Ctrl+S", key_style), Span::styled(" sidebar ", label),
+                sep.clone(),
+                Span::styled("Alt+S", key_style), Span::styled(" select ", label),
+            ])
+        };
+        let footer = Paragraph::new(footer_line);
         frame.render_widget(footer, outer[3]);
     }
 

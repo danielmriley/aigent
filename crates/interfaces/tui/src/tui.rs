@@ -49,6 +49,9 @@ where
     terminal.clear()?;
     let mut selection_mode = false;
     let mut previous_status: Option<String> = None;
+    let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
+    // First tick fires immediately; skip it so we don't double-draw on entry.
+    tick_interval.tick().await;
 
     let result = async {
         loop {
@@ -62,7 +65,7 @@ where
                         let _ = app.update(AppEvent::Backend(backend));
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                _ = tick_interval.tick() => {
                     let _ = app.update(AppEvent::Tick);
                 }
                 key_event = async {

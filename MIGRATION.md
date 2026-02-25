@@ -1439,3 +1439,79 @@ result.
 - [ ] Onboarding: Welcome screen lists 8 tools; Summary screen lists them
 - [ ] Onboarding: Brave key saved to `.env` after finalize
 - [ ] Weather/stock query → agent uses tool result directly, no "not in context" disclaimer
+
+---
+
+## 2026-02-26 — Phase 10: Time-based spinner, config theming, TUI polish
+
+### Time-based spinner (`app.rs`, `tui.rs`)
+
+The thinking spinner was unreliable during heavy streaming because
+`tokio::select!` created a fresh `sleep(50ms)` each loop iteration — rapid
+backend events would cancel the sleep before it expired, starving the `Tick`
+that advanced the spinner counter.
+
+**Fix**: Replaced `spinner_tick: usize` (counter) with `spinner_epoch: Instant`
+(wall-clock epoch).  The spinner frame is now computed as
+`(elapsed_ms / 80) % SPINNER_FRAMES.len()` inside `draw()`, making it
+completely independent of the event loop.  Additionally, the event loop now
+uses `tokio::time::interval(50ms)` instead of `tokio::time::sleep(50ms)` so
+ticks accumulate properly and the file-popup refresh fires reliably.
+
+### Config-driven theming (`config/lib.rs`, `theme.rs`)
+
+New `[ui]` config section:
+
+```toml
+[ui]
+theme = "catppuccin-mocha"   # also: "tokyo-night", "nord"
+show_sidebar = true
+```
+
+`Theme::from_config(s)` parses the string and returns the corresponding
+colour palette.  `App::new()` reads `config.ui.theme` and `config.ui.show_sidebar`.
+
+### Styled header and keybindings bar (`app.rs`)
+
+- **Header**: bot name in accent + bold, status in foreground.
+- **Footer**: context-aware keybindings bar — switches between input-mode and
+  history-mode key hints.  Key labels use accent colour; separators use `│`
+  in muted colour.
+
+### Enter-toggle for tool details (`app.rs`)
+
+In history mode, pressing Enter on a `⚙` tool message with stashed detail
+(NUL-delimited) is now an explicit key binding.  The existing selection-based
+expand/collapse continues to work — Enter simply makes the interaction
+discoverable via the keybindings bar.
+
+### Stronger tool propagation instruction (`server.rs`)
+
+The continuation instruction appended to `effective_user` was tightened:
+- "Using it, give a complete, natural, helpful final answer"
+- "do NOT mention tools, say the result is unavailable, pending, or 'not yet
+  in memory', or qualify with phrases like 'according to the tool'"
+
+This closes the remaining gap where some models would still hedge with
+"according to the search result" qualifiers.
+
+### Changes summary
+
+| Area | Change |
+|---|---|
+| **app.rs** | `spinner_tick → spinner_epoch: Instant`, time-based frame calc, styled header, context-aware keybindings bar, Enter toggle for tool messages, config-driven theme + sidebar |
+| **tui.rs** | `tokio::time::interval` replaces `tokio::time::sleep`; first-tick skip for clean startup |
+| **theme.rs** | `ThemeName::from_config()`, `Theme::from_config()` for config-string parsing |
+| **config/lib.rs** | New `UiConfig` struct (`theme`, `show_sidebar`); added `ui: UiConfig` to `AppConfig` |
+| **server.rs** | Strengthened tool-result continuation instruction |
+| **README.md** | Documented time-based spinner, config theming, styled keybindings bar, 9-rule truth-seeking |
+
+### Verification checklist
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] TUI: spinner animates smoothly during streaming, tool calls, and sleep
+- [ ] TUI: `[ui] theme = "tokyo-night"` in config → blue accent colours
+- [ ] TUI: footer shows input-mode keys; press Esc → shows history-mode keys
+- [ ] TUI: Enter on ⚙ tool message in history mode → detail expands
+- [ ] Tool query → agent answers naturally without "according to the tool"

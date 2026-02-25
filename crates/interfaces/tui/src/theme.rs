@@ -17,6 +17,18 @@ pub enum ThemeName {
     Nord,
 }
 
+impl ThemeName {
+    /// Parse a config string into a [`ThemeName`].  Falls back to
+    /// `CatppuccinMocha` for unrecognised values.
+    pub fn from_config(s: &str) -> Self {
+        match s.to_lowercase().replace('_', "-").as_str() {
+            "tokyo-night" | "tokyonight" => Self::TokyoNight,
+            "nord" => Self::Nord,
+            _ => Self::CatppuccinMocha,
+        }
+    }
+}
+
 impl Theme {
     pub fn from_name(name: ThemeName) -> Self {
         match name {
@@ -45,6 +57,11 @@ impl Theme {
                 assistant_bubble: Color::Rgb(67, 76, 94),
             },
         }
+    }
+
+    /// Build a theme from a config string (e.g. `"tokyo-night"`).
+    pub fn from_config(s: &str) -> Self {
+        Self::from_name(ThemeName::from_config(s))
     }
 }
 
