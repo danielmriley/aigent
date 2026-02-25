@@ -1392,3 +1392,50 @@ is imported from the prompt builder; `environment_snapshot` removed (logic moved
 - [ ] User contradicts tool result → agent politely notes discrepancy, holds tool value
 - [ ] TUI: braille spinner visible during tool + stream phases
 - [ ] TUI: no panic on non-ASCII content in status bar (e.g. CJK characters in tool output)
+
+---
+
+## 2026-02-25 — Phase 8: TUI polish + truth-seeking hardening
+
+### Rich tool visualization (`chat.rs`)
+
+Tool-call messages (`⚙` role) now have a dedicated rendering path:
+- Compact single-line summary (`✓ web_search — snippet…`) with a `▸` / `▾`
+  indicator when the full output is stashed behind a NUL byte.
+- Selecting the tool message in history mode (Esc → arrow keys) expands the
+  full output as indented, dimmed detail lines underneath.
+- Failure messages show `✗ tool_name failed — reason…`.
+
+### Auto-follow on streaming tokens
+
+`BackendEvent::Token` now sets `auto_follow = true`, so the viewport tracks
+streaming content in real-time without requiring the user to scroll down.
+
+### Onboarding improvements
+
+- **Welcome screen** now lists all 8 built-in tools by name.
+- **Summary screen** appends the tool list so users see their capabilities
+  before finalizing setup.
+- **Brave API key** is now persisted to `.env` (`BRAVE_API_KEY=…`) alongside
+  the OpenRouter and Telegram keys.  Previously it was only saved to the TOML
+  config file, which meant the env-var override path (`AppConfig::load_from`)
+  could not find it until the TOML was re-read.
+
+### Truth-seeking rule 5 strengthened (`prompt_builder.rs`)
+
+Rule 5 now explicitly states: *"You are allowed — and expected — to maintain
+your own verified view"* and *"Prefer the tool result unless the user provides
+compelling evidence otherwise."*  This gives the agent stronger grounding
+against socially-motivated capitulation when a user contradicts a fresh tool
+result.
+
+### Verification checklist
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] TUI: trigger a tool call → `⚙ calling <name>…` appears, updates to
+      `✓ name — snippet… ▸`; select in history mode → full output expands
+- [ ] TUI: streaming tokens auto-scroll the viewport
+- [ ] Onboarding: Welcome screen lists 8 tools; Summary screen lists them
+- [ ] Onboarding: Brave key saved to `.env` after finalize
+- [ ] Weather/stock query → agent uses tool result directly, no "not in context" disclaimer

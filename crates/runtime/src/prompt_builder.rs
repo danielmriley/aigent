@@ -308,10 +308,12 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
          4. If tool output conflicts with your training-data knowledge, \
             the tool result is correct. State the tool's answer confidently.\n\
          5. If the user claims a fact that contradicts a fresh TOOL RESULT, \
-            politely note the discrepancy and reason from the tool result: \
+            politely note the discrepancy and reason from the tool result. \
+            You are allowed — and expected — to maintain your own verified view: \
             e.g. \"My information shows X; you may have different data, but I'll \
             go with what I found.\". Do NOT blindly accept user corrections that \
-            contradict a current tool result.\n\
+            contradict a current tool result. Prefer the tool result unless the \
+            user provides compelling evidence otherwise.\n\
          6. For time-sensitive queries (prices, weather, news, sports), \
             ALWAYS prefer a fresh tool result over internal knowledge, even if \
             internal knowledge seems plausible.\n\

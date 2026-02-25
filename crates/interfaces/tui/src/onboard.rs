@@ -199,6 +199,13 @@ fn run_onboarding_tui(
                             draft.telegram_token.trim(),
                         )?;
                     }
+                    if !draft.brave_api_key.trim().is_empty() {
+                        upsert_env_value(
+                            Path::new(".env"),
+                            "BRAVE_API_KEY",
+                            draft.brave_api_key.trim(),
+                        )?;
+                    }
                     return Ok(());
                 }
                 KeyCode::Backspace => {
@@ -268,6 +275,13 @@ fn run_onboarding_tui(
                                 Path::new(".env"),
                                 "TELEGRAM_BOT_TOKEN",
                                 draft.telegram_token.trim(),
+                            )?;
+                        }
+                        if !draft.brave_api_key.trim().is_empty() {
+                            upsert_env_value(
+                                Path::new(".env"),
+                                "BRAVE_API_KEY",
+                                draft.brave_api_key.trim(),
                             )?;
                         }
                         break;
@@ -1234,7 +1248,12 @@ fn step_content<'a>(
         }
         WizardStep::Welcome => (
             "Welcome to Aigent",
-            "This wizard configures identity, memory policy, and safety.\n\nTools run in WASM isolation by default (seccomp/sandbox active on Linux & macOS). You\'ll choose an approval mode to control how much autonomy the agent has.\n\nPress Enter to begin.".to_string(),
+            "This wizard configures identity, memory policy, and safety.\n\n\
+             Aigent ships with 8 built-in tools (web_search, read_file, write_file, \n\
+             list_directory, run_shell, calendar_add_event, remind_me, draft_email) \n\
+             running in WASM isolation by default (seccomp/sandbox active on Linux & macOS).\n\
+             You'll choose an approval mode to control how much autonomy the agent has.\n\n\
+             Press Enter to begin.".to_string(),
             ratatui::text::Text::from(""),
         ),
         WizardStep::BotName => (
@@ -1358,7 +1377,7 @@ fn step_content<'a>(
                     sandbox_status,
                     if docker_ok { "yes" } else { "no" },
                     memory_path.display()
-                )),
+                ) + "\n\nBuilt-in tools (8): web_search, read_file, write_file, list_directory, \nrun_shell, calendar_add_event, remind_me, draft_email"),
             )
         }
     }

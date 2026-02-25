@@ -468,6 +468,7 @@ impl App {
         match event {
             BackendEvent::Token(chunk) => {
                 self.is_thinking = true;
+                self.auto_follow = true;
                 self.pending_stream.push_str(&chunk);
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
@@ -540,14 +541,22 @@ impl App {
                 self.auto_follow = true;
                 // Keep is_thinking=true — the LLM streaming response follows.
                 // Update the last ⚙ message to reflect the outcome.
+                // The summary is shown inline; the full output is stashed
+                // after a NUL byte so chat.rs can expand it on selection.
                 if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| m.role == "⚙") {
-                    msg.content = if result.success {
-                        let snip: String = result.output.chars().take(80).collect();
-                        let ellipsis = if result.output.chars().count() > 80 { "…" } else { "" };
+                    let snip: String = result.output.chars().take(80).collect();
+                    let ellipsis = if result.output.chars().count() > 80 { "…" } else { "" };
+                    let summary = if result.success {
                         format!("✓ {} — {}{}", result.name, snip, ellipsis)
                     } else {
-                        format!("✗ {} — {}", result.name, result.output.chars().take(60).collect::<String>())
+                        format!("✗ {} failed — {}{}", result.name, snip, ellipsis)
                     };
+                    // Stash full output behind NUL for expandable detail.
+                    if result.output.chars().count() > 80 {
+                        msg.content = format!("{}\0{}", summary, result.output);
+                    } else {
+                        msg.content = summary;
+                    }
                 }
                 self.state.status = if result.success {
                     "tool complete".to_string()

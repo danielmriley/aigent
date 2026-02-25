@@ -111,6 +111,39 @@ fn build_chat_lines_with_starts(
                 Span::styled(format!("{}> ", assistant_label), prefix_style),
                 Span::styled(streaming.to_string(), body_style),
             ]));
+        } else if message.role == "⚙" {
+            // Tool-call messages get a dedicated dimmed style with an
+            // expandable detail section when selected in history mode.
+            let tool_style = Style::default().fg(theme.muted);
+            let tool_prefix = Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::DIM);
+            // The content may contain a hidden detail block after \0.
+            let (summary, detail) = message.content.split_once('\0')
+                .map(|(s, d)| (s, Some(d)))
+                .unwrap_or((&message.content, None));
+            let toggle_hint = if detail.is_some() {
+                if is_selected { " ▾" } else { " ▸" }
+            } else {
+                ""
+            };
+            lines.push(Line::from(vec![
+                Span::styled("  ", tool_prefix),
+                Span::styled(format!("{}{}", summary, toggle_hint), tool_style),
+            ]));
+            // When this message is selected in history mode, show the
+            // full tool output underneath as indented detail lines.
+            if is_selected {
+                if let Some(detail_text) = detail {
+                    let detail_style = Style::default().fg(theme.muted).add_modifier(Modifier::DIM);
+                    for detail_line in detail_text.lines() {
+                        lines.push(Line::from(Span::styled(
+                            format!("    {detail_line}"),
+                            detail_style,
+                        )));
+                    }
+                }
+            }
         } else if message.role != "assistant" {
             // External source (e.g. telegram) — show role as prefix
             let mut ext_prefix = Style::default()

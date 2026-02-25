@@ -159,12 +159,13 @@ A **cooldown gate** (`proactive_cooldown_minutes`, default 5) prevents message b
 - Fuzzy-search file picker (`@` prefix) and slash-command palette.
 - Clipboard copy, history mode, and keyboard-driven focus switching (sidebar / chat / input).
 - Sleep cycle progress shown with an animated indicator while the nightly consolidation runs.
-- Tool call activity (name, success/failure) surfaces in the status bar and inline transcript during agent turns.
+- Tool call activity (name, success/failure) surfaces in the status bar and inline transcript during agent turns. Tool messages are **expandable**: select one in history mode to reveal the full tool output.
 - `BeliefAdded` and `ReflectionInsight` events shown in the status bar immediately after each turn completes.
 - `ProactiveMessage` events rendered as chat bubbles in the main transcript (Markdown-rendered).
 - External turns from Telegram visible inline in the TUI transcript via `ExternalTurn` events.
 - **TUI chat persistence**: every turn is appended to `.aigent/history/YYYY-MM-DD.jsonl` so the last 200 turns are automatically restored when you reopen the TUI. Manage with `aigent history clear`, `aigent history export <path>`, `aigent history path`.
-- **Animated spinner** (`| / - \`) is visible throughout the entire agent turn — LLM generation, tool execution, and reflection phases.
+- **Animated spinner** (braille cycle) is visible throughout the entire agent turn — LLM generation, tool execution, and reflection phases. Viewport auto-scrolls to follow new content.
+- **Auto-follow**: viewport always follows streaming tokens, tool results, and proactive messages. Scrolling up disables auto-follow; pressing End re-enables it.
 
 #### Telegram bot
 
