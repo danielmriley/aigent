@@ -1302,3 +1302,71 @@ aigent history path           # print the path to today's file
 - [ ] `aigent history path` prints `.aigent/history/YYYY-MM-DD.jsonl`
 - [ ] `aigent history export /tmp/out.jsonl` creates the file
 - [ ] `aigent history clear` removes today's file
+
+---
+
+## Phase 9 — Prompt builder extraction + strengthened truth-seeking + TUI polish
+
+### `crates/runtime/src/prompt_builder.rs` — new file
+
+Extracted all prompt assembly logic from `respond_and_remember_stream` into a
+dedicated module.  `runtime.rs` shrank from 1161 → 948 lines.
+
+| Function | Purpose |
+| --- | --- |
+| `build_chat_prompt(PromptInputs)` | Assemble the full system+user prompt |
+| `build_follow_up_block` | Pending follow-up items for returning users |
+| `build_context_block` | Ranked memory context with authoritative header |
+| `build_relational_block` | HIGH-DENSITY relational matrix (beliefs, dynamic) |
+| `build_environment_block` | OS, model, memory stats, git, cwd snapshot |
+| `build_conversation_block` | Last 6 conversation turns |
+| `build_identity_block` | Communication style, top traits, long-term goals |
+| `build_beliefs_block` | MY_BELIEFS with composite confidence/recency scoring |
+| `build_tools_and_grounding` | Tool catalogue + 8-rule grounding directives |
+| `truncate_for_prompt` | UTF-8-safe text truncation with ellipsis |
+
+`PromptInputs` struct bundles all pre-computed data needed by the builder:
+`config`, `memory`, `user_message`, `recent_turns`, `tool_specs`,
+`pending_follow_ups`, `context_items`, `stats`.
+
+### Strengthened grounding rules
+
+The grounding section now contains 8 explicit truth-seeking directives (up from
+4).  New rules:
+
+1. Real date/time injection (was present but now always formatted with seconds)
+2. **TOOL RESULT is single source of truth** — never invent/estimate/hallucinate
+3. **Trust tool output unreservedly** — no second-guessing or hedging
+4. Training-data conflicts resolve in favour of tool result
+5. User corrections accepted as ground truth
+6. Time-sensitive facts (prices, news, weather) trust tool over training data
+7. **Reason independently** — derive conclusions from evidence, don't parrot
+8. **Honest uncertainty** — when no tool result is available and uncertain, say so
+
+### `crates/runtime/src/runtime.rs` — simplified
+
+`respond_and_remember_stream` now delegates prompt assembly to
+`prompt_builder::build_chat_prompt`.  Only async pre-work (embedding computation,
+context retrieval, follow-up collection) remains in the caller.  `truncate_for_prompt`
+is imported from the prompt builder; `environment_snapshot` removed (logic moved).
+
+### `crates/interfaces/tui/src/app.rs` — auto-follow + tool viz polish
+
+- `auto_follow = true` now set on `Thinking`, `Done`, and `ToolCallEnd` events
+  (not only `ToolCallStart`, `ExternalTurn`, and `ProactiveMessage`).  This ensures
+  the viewport always follows the active conversation without requiring manual
+  scroll-down after each phase transition.
+- `ToolCallEnd` keeps `is_thinking = true` so the spinner continues through the
+  tool→streaming handoff (no visual gap).
+- Tool result snippet in the ⚙ message is now truncated using `.chars().take(80)`
+  instead of byte-level slicing, preventing panics on multi-byte UTF-8 content.
+- Failed tool calls now show the error message (first 60 chars) instead of just
+  "failed".
+
+### Verification checklist
+
+- [ ] `cargo check --workspace` — 0 errors
+- [ ] `cargo test -p aigent-runtime` — all 10 tests pass
+- [ ] TUI: Thinking event auto-scrolls to bottom
+- [ ] TUI: tool call → result → streaming response auto-scrolls throughout
+- [ ] Grounding rules include real date/time and all 8 truth-seeking directives

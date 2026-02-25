@@ -484,6 +484,7 @@ impl App {
             BackendEvent::Thinking => {
                 self.is_thinking = true;
                 self.is_sleeping = false;
+                self.auto_follow = true;
                 self.state.status = "thinking".to_string();
             }
             BackendEvent::SleepCycleRunning => {
@@ -494,6 +495,7 @@ impl App {
             BackendEvent::Done => {
                 self.is_thinking = false;
                 self.is_sleeping = false;
+                self.auto_follow = true;
                 self.state.status = "idle".to_string();
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
@@ -535,17 +537,16 @@ impl App {
             }
             BackendEvent::ToolCallEnd(result) => {
                 self.active_tool = None;
+                self.auto_follow = true;
+                // Keep is_thinking=true — the LLM streaming response follows.
                 // Update the last ⚙ message to reflect the outcome.
                 if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| m.role == "⚙") {
                     msg.content = if result.success {
-                        let snip = if result.output.len() > 80 {
-                            format!("{}…", &result.output[..80])
-                        } else {
-                            result.output.clone()
-                        };
-                        format!("✓ {} — {}", result.name, snip)
+                        let snip: String = result.output.chars().take(80).collect();
+                        let ellipsis = if result.output.chars().count() > 80 { "…" } else { "" };
+                        format!("✓ {} — {}{}", result.name, snip, ellipsis)
                     } else {
-                        format!("✗ {} failed", result.name)
+                        format!("✗ {} — {}", result.name, result.output.chars().take(60).collect::<String>())
                     };
                 }
                 self.state.status = if result.success {

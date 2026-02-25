@@ -4,6 +4,7 @@ mod commands;
 mod events;
 pub mod history;
 pub mod micro_profile;
+pub mod prompt_builder;
 mod runtime;
 mod server;
 

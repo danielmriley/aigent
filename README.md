@@ -13,10 +13,13 @@ Aigent is a persistent, self-improving AI agent written in Rust. It runs as a ba
 | **Brave Search** | `web_search` tool uses Brave API when `brave_api_key` is set; DuckDuckGo Instant Answer always available as fallback. |
 | **`aigent tools build/status` CLI** | Build WASM guests and inspect per-tool runtime state without starting the daemon. |
 | **Onboarding wizard** | Approval Mode and API Keys (Brave Search key) steps added inside the Safety section. |
+| **Prompt builder extraction** | All prompt assembly logic centralised in `prompt_builder.rs` — 10 composable block-builder functions, `PromptInputs` struct. `runtime.rs` 1161 → 948 lines. |
+| **8-rule truth-seeking grounding** | Every LLM call now includes date/time injection, tool-result-as-ground-truth, anti-hallucination, honest-uncertainty, and independent-reasoning directives. |
+| **TUI auto-follow polish** | Viewport auto-scrolls on `Thinking`, `Done`, and `ToolCallEnd` events; spinner persists through tool→stream handoff; UTF-8-safe tool output truncation. |
 
 ## Status
 
-Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Active Phase 3 polish covers WASM tool extensions, platform sandboxing, approval modes, and full-channel UX. All features above are live and enabled by default.
+Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Phase 9 (prompt-builder extraction, truth-seeking grounding, TUI polish) is the latest shipped milestone. All features above are live and enabled by default.
 
 ## Building from source
 
@@ -215,17 +218,6 @@ Built-in tools registered in the daemon and accessible via `/tools` slash comman
 All 8 tools run in **WASM mode** when a compiled `.wasm` binary is present (see `aigent tools status`); otherwise they run as native Rust code with an identical API. All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
 
 **LLM-driven tool calling**: before each streaming response, the daemon asks the LLM whether the user’s message requires a tool. If yes, the daemon executes the tool, records the result to Procedural memory, emits `ToolCallStart` / `ToolCallEnd` events, and injects the result into the main LLM prompt so the reply is grounded in the actual output.
-### Tool result handling & anti-hallucination grounding
-
-Every `respond_and_remember_stream` call receives the full list of registered `ToolSpec`s. These are injected into the system prompt in an `AVAILABLE TOOLS` block that tells the LLM which tools it has and how to invoke them (`{"tool":"name","args":{…}}`). Immediately after that block the prompt appends five **GROUNDING RULES**:
-
-1. Current real date is `{today}` — eliminates simulated-future hallucinations.
-2. Always prioritise fresh tool results over any internal knowledge.
-3. For time-sensitive facts (prices, news, events) trust the tool result as ground truth.
-4. If tool result conflicts with training data, trust the tool result.
-5. If the user corrects a fact, accept the correction as ground truth immediately.
-
-After a tool executes, `server.rs` injects the output as an explicit user message ending with *"…provide a complete, natural, helpful final answer to the user's original question"*, ensuring the agent **automatically continues** rather than stopping and asking the user what the result was.
 ### Daemon / IPC
 
 The daemon exposes a Unix socket (`/tmp/aigent.sock` by default) and handles:
