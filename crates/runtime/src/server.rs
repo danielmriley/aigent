@@ -738,18 +738,17 @@ async fn handle_connection(
 
             // The effective user message presented to the main LLM.  When a tool
             // was called, the result is prepended so the reply is grounded in it.
-            let effective_user: std::borrow::Cow<str> = if let Some((ref name, ref output)) = tool_result_text {
-                let label = "Tool call succeeded";
-                let preview = &output[..output.len().min(600)];
+            let effective_user: std::borrow::Cow<str> = if let Some((ref _name, ref output)) = tool_result_text {
                 std::borrow::Cow::Owned(format!(
-                    "[TOOL_RESULT: {name} — {label}]\nOutput: {preview}\n\nOriginal request: {user}"
+                    "TOOL RESULT:\n{}\n\nUsing the TOOL RESULT above, provide a complete, natural, helpful final answer to the user's original question. Do not ask the user what the result was or say 'I used a tool'. Just give the answer as if you had the information all along.\n\nOriginal request: {}",
+                    output, user
                 ))
             } else {
                 std::borrow::Cow::Borrowed(&user)
             };
 
             let reply_result = rt_clone
-                .respond_and_remember_stream(&mut memory, &effective_user, &recent, last_turn_at, chunk_tx)
+                .respond_and_remember_stream(&mut memory, &effective_user, &recent, last_turn_at, chunk_tx, &tool_specs)
                 .await;
             // Reflect on the original user ↔ assistant exchange (not the tool-augmented prompt).
             let reflect_events: Vec<BackendEvent> = match reply_result {

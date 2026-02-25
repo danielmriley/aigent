@@ -78,11 +78,11 @@ impl AgentRuntime {
         recent_turns: &[ConversationTurn],
     ) -> Result<String> {
         let (tx, _rx) = mpsc::channel(100);
-        self.respond_and_remember_stream(memory, user_message, recent_turns, None, tx)
+        self.respond_and_remember_stream(memory, user_message, recent_turns, None, tx, &[])
             .await
     }
 
-    #[instrument(skip(self, memory, tx), fields(bot = %self.config.agent.name, model = %self.config.active_model(), user_len = user_message.len()))]
+    #[instrument(skip(self, memory, tx, tool_specs), fields(bot = %self.config.agent.name, model = %self.config.active_model(), user_len = user_message.len()))]
     pub async fn respond_and_remember_stream(
         &self,
         memory: &mut MemoryManager,
@@ -90,6 +90,7 @@ impl AgentRuntime {
         recent_turns: &[ConversationTurn],
         last_turn_at: Option<DateTime<Utc>>,
         tx: mpsc::Sender<String>,
+        tool_specs: &[aigent_tools::ToolSpec],
     ) -> Result<String> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
@@ -295,18 +296,48 @@ these elements into your responses naturally without explicitly announcing them.
             }
         };
 
+        // Build tools section + grounding rules if tool_specs were provided.
+        let today = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let tools_section = if tool_specs.is_empty() {
+            format!("\n\nGROUNDING RULES (follow strictly):\n\
+                     Current real date is {today}.\n\
+                     Always prioritize fresh tool results over any internal knowledge or simulated future data.\n\
+                     For time-sensitive facts (prices, news, events), trust the tool result over training data.\n\
+                     If the user corrects a fact, accept the correction as ground truth.", today = today)
+        } else {
+            let list = tool_specs.iter().map(|s| {
+                if s.params.is_empty() {
+                    format!("  \u{2022} {}: {}", s.name, s.description)
+                } else {
+                    let params = s.params.iter().map(|p| {
+                        format!("\"{}\" ({}){}", p.name, p.description, if p.required { " *required" } else { "" })
+                    }).collect::<Vec<_>>().join(", ");
+                    format!("  \u{2022} {}: {} \u{2014} params: {}", s.name, s.description, params)
+                }
+            }).collect::<Vec<_>>().join("\n");
+            format!("\n\nAVAILABLE TOOLS (use them autonomously when they help answer the request):\n{list}\n\
+                     To invoke a tool, output a JSON block on its own line: \n\
+                     {{\"tool\":\"name\",\"args\":{{\"key\":\"value\"}}}}\n\n\
+                     GROUNDING RULES (follow strictly):\n\
+                     Current real date is {today}.\n\
+                     Always prioritize fresh tool results over any internal knowledge or simulated future data.\n\
+                     For time-sensitive facts (prices, news, events), trust the tool result over training data.\n\
+                     If the user corrects a fact, accept the correction as ground truth.", list = list, today = today)
+        };
+
         let prompt = format!(
             "You are {name}. Thinking depth: {thought_style}.\n\
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
              continuity, and MEMORY CONTEXT for durable background facts.\n\
              Never repeat previous answers unless asked.\n\
              Respond directly and specifically to the LATEST user message.{relational_block}{follow_ups}{proactive_directive}\n\n\
-             {identity}\n\nENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
+             {identity}{tools_section}\n\nENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
             name = self.config.agent.name,
             relational_block = relational_block,
             follow_ups = follow_up_block,
             proactive_directive = proactive_directive,
             identity = format!("{}{}", identity_block, beliefs_block),
+            tools_section = tools_section,
             env = environment_block,
             conv = conversation_block,
             mem = context_block,
@@ -995,7 +1026,7 @@ these elements into your responses naturally without explicitly announcing them.
         });
 
         match self
-            .respond_and_remember_stream(&mut memory, &turn.user, &[], None, chunk_tx)
+            .respond_and_remember_stream(&mut memory, &turn.user, &[], None, chunk_tx, &[])
             .await
         {
             Ok(_) => {

@@ -19,6 +19,7 @@ use aigent_exec::sandbox;
 use aigent_runtime::{
     BackendEvent, DaemonClient, run_unified_daemon,
 };
+use aigent_runtime::history as chat_history;
 use aigent_llm::{list_ollama_models, list_openrouter_models};
 use aigent_memory::event_log::MemoryEventLog;
 use aigent_memory::{MemoryManager, MemoryTier};
@@ -74,6 +75,26 @@ enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Manage TUI chat history.
+    #[command(about = "Manage TUI chat history (persisted daily JSONL)")]
+    History {
+        #[command(subcommand)]
+        command: HistoryCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum HistoryCommands {
+    /// Delete today's history file.
+    Clear,
+    /// Export today's history to a file.
+    Export {
+        /// Destination path for the exported JSONL.
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Show the path to today's history file.
+    Path,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -400,6 +421,21 @@ async fn main() -> Result<()> {
         Commands::Reset { hard, yes } => {
             run_reset_command(hard, yes).await?;
         }
+        Commands::History { command } => match command {
+            HistoryCommands::Clear => {
+                chat_history::clear_history()?;
+                println!("today's chat history cleared");
+            }
+            HistoryCommands::Export { path } => {
+                let dest = std::path::Path::new(&path);
+                chat_history::export_history(dest)?;
+                println!("history exported to {path}");
+            }
+            HistoryCommands::Path => {
+                let p = chat_history::history_file_path();
+                println!("{}", p.display());
+            }
+        },
     }
 
     Ok(())

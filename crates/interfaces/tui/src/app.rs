@@ -17,7 +17,10 @@ use tracing::debug;
 use tui_textarea::{Input, Key, TextArea};
 
 use aigent_config::AppConfig;
-use aigent_runtime::BackendEvent;
+use aigent_runtime::{
+    BackendEvent,
+    history::{append_turn, load_recent},
+};
 
 use crate::{
     events::AppEvent,
@@ -77,7 +80,7 @@ pub struct CommandPalette {
     pub commands: Vec<&'static str>,
 }
 
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 
 pub struct App {
     pub state: AppState,
@@ -113,7 +116,25 @@ impl App {
                 bot_name: config.agent.name.clone(),
                 sessions: vec!["default".to_string()],
                 current_session: 0,
-                messages: Vec::new(),
+                messages: {
+                    let mut msgs = Vec::new();
+                    if let Ok(records) = load_recent(200) {
+                        for r in records {
+                            let rendered = if r.role == "assistant" {
+                                use crate::widgets::markdown::render_markdown_lines;
+                                Some(render_markdown_lines(&r.content))
+                            } else {
+                                None
+                            };
+                            msgs.push(Message {
+                                role: r.role,
+                                content: r.content,
+                                rendered_md: rendered,
+                            });
+                        }
+                    }
+                    msgs
+                },
                 status: format!(
                     "model={} provider={}",
                     config.active_model(),
@@ -173,6 +194,7 @@ impl App {
     }
 
     pub fn push_user_message(&mut self, text: String) {
+        let _ = append_turn("user", &text);
         self.state.messages.push(Message {
             role: "user".to_string(),
             content: text,
@@ -445,6 +467,7 @@ impl App {
     fn apply_backend(&mut self, event: BackendEvent) {
         match event {
             BackendEvent::Token(chunk) => {
+                self.is_thinking = true;
                 self.pending_stream.push_str(&chunk);
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
@@ -478,6 +501,10 @@ impl App {
                         last.rendered_md = Some(render_markdown_lines(&last.content));
                     }
                 }
+                let content = self.pending_stream.clone();
+                if !content.is_empty() {
+                    let _ = append_turn("assistant", &content);
+                }
                 self.pending_stream.clear();
             }
             BackendEvent::Error(err) => {
@@ -494,6 +521,7 @@ impl App {
                 self.state.status = "memory updated".to_string();
             }
             BackendEvent::ToolCallStart(info) => {
+                self.is_thinking = true;
                 self.active_tool = Some(info.name.clone());
                 self.state.status = format!("\u{1f527} {}", info.name);
                 // Show as a dimmed inline transcript entry so the user can
@@ -583,7 +611,7 @@ impl App {
             .split(frame.area());
 
         let status_display = if self.is_thinking || self.is_sleeping {
-            let frame = SPINNER_FRAMES[self.spinner_tick / 2 % SPINNER_FRAMES.len()];
+            let frame = SPINNER_FRAMES[self.spinner_tick % SPINNER_FRAMES.len()];
             format!("{} {}", frame, self.state.status)
         } else {
             self.state.status.clone()

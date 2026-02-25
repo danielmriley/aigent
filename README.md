@@ -160,6 +160,8 @@ A **cooldown gate** (`proactive_cooldown_minutes`, default 5) prevents message b
 - `BeliefAdded` and `ReflectionInsight` events shown in the status bar immediately after each turn completes.
 - `ProactiveMessage` events rendered as chat bubbles in the main transcript (Markdown-rendered).
 - External turns from Telegram visible inline in the TUI transcript via `ExternalTurn` events.
+- **TUI chat persistence**: every turn is appended to `.aigent/history/YYYY-MM-DD.jsonl` so the last 200 turns are automatically restored when you reopen the TUI. Manage with `aigent history clear`, `aigent history export <path>`, `aigent history path`.
+- **Animated spinner** (`| / - \`) is visible throughout the entire agent turn — LLM generation, tool execution, and reflection phases.
 
 #### Telegram bot
 
@@ -213,7 +215,17 @@ Built-in tools registered in the daemon and accessible via `/tools` slash comman
 All 8 tools run in **WASM mode** when a compiled `.wasm` binary is present (see `aigent tools status`); otherwise they run as native Rust code with an identical API. All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
 
 **LLM-driven tool calling**: before each streaming response, the daemon asks the LLM whether the user’s message requires a tool. If yes, the daemon executes the tool, records the result to Procedural memory, emits `ToolCallStart` / `ToolCallEnd` events, and injects the result into the main LLM prompt so the reply is grounded in the actual output.
+### Tool result handling & anti-hallucination grounding
 
+Every `respond_and_remember_stream` call receives the full list of registered `ToolSpec`s. These are injected into the system prompt in an `AVAILABLE TOOLS` block that tells the LLM which tools it has and how to invoke them (`{"tool":"name","args":{…}}`). Immediately after that block the prompt appends five **GROUNDING RULES**:
+
+1. Current real date is `{today}` — eliminates simulated-future hallucinations.
+2. Always prioritise fresh tool results over any internal knowledge.
+3. For time-sensitive facts (prices, news, events) trust the tool result as ground truth.
+4. If tool result conflicts with training data, trust the tool result.
+5. If the user corrects a fact, accept the correction as ground truth immediately.
+
+After a tool executes, `server.rs` injects the output as an explicit user message ending with *"…provide a complete, natural, helpful final answer to the user's original question"*, ensuring the agent **automatically continues** rather than stopping and asking the user what the result was.
 ### Daemon / IPC
 
 The daemon exposes a Unix socket (`/tmp/aigent.sock` by default) and handles:

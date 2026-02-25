@@ -1234,3 +1234,71 @@ were called, the response is extended with an italic footnote:
 - [ ] TUI: Back navigation through Safety / ApprovalMode / ApiKeys steps works correctly
 - [ ] TUI: `Summary` screen shows sandbox active/inactive status
 - [ ] Telegram: response for a tool-using query ends with `_🔧 Tools used: …_`
+
+---
+
+## Phase 8 — Tool result grounding + anti-hallucination + TUI history + spinner polish
+
+### `crates/runtime/src/runtime.rs` — tools section + grounding rules
+
+`respond_and_remember_stream` now accepts a final `tool_specs: &[aigent_tools::ToolSpec]` parameter.
+Before building the prompt it constructs a `tools_section` string that is injected between the identity block and the `ENVIRONMENT CONTEXT` section:
+
+- When tools are present: an `AVAILABLE TOOLS` block listing each tool with its description and params, followed by five **GROUNDING RULES** (current date, trust tool results, correction handling).
+- When no tools are present: only the GROUNDING RULES are injected (date + trust rules still apply).
+
+The shim `respond_and_remember` passes `&[]` so all existing callers remain source-compatible.
+
+### `crates/runtime/src/server.rs` — pass tool_specs + automatic continuation
+
+`respond_and_remember_stream` is now called with `&tool_specs` so the LLM receives the full registered tool list on every streaming turn.
+
+The `effective_user` override (already present since Phase 7) ensures that after a tool result is injected the agent generates a complete final answer automatically — it no longer stops and asks the user what the result was.
+
+### `crates/runtime/src/history.rs` — new file
+
+TUI chat history module (completely separate from the 6-tier memory system):
+
+| Function | Purpose |
+| --- | --- |
+| `history_dir()` | `.aigent/history/` relative to workspace root |
+| `history_file_path()` | `.aigent/history/YYYY-MM-DD.jsonl` for today |
+| `append_turn(role, content)` | Atomically append one `TurnRecord` line |
+| `load_recent(max_turns)` | Load last N turns from today's file |
+| `clear_history()` | Delete today's JSONL file |
+| `export_history(dest)` | Copy today's JSONL to an arbitrary path |
+
+`TurnRecord` is `{ role: String, content: String, timestamp: DateTime<Utc> }`.
+
+### `crates/runtime/src/lib.rs`
+
+Added `pub mod history;`.
+
+### `crates/interfaces/tui/src/app.rs` — history restore + spinner polish
+
+- On `App::new` the last 200 turns are loaded from `load_recent(200)` and prepopulated into `state.messages` so the previous session is visible immediately.
+- `push_user_message` calls `append_turn("user", …)` before pushing to the in-memory list.
+- The `Done` event calls `append_turn("assistant", …)` with the completed `pending_stream` content.
+- `is_thinking = true` is now set on `ToolCallStart` and `Token` events so the spinner animates throughout tool execution and streaming, not only during the pre-turn thinking phase.
+- `SPINNER_FRAMES` replaced with a simple 4-frame ASCII cycle `["| ", "/ ", "- ", "\\ "]`; frame advances every tick (~50 ms) for a smooth 20 fps animation.
+
+### `crates/interfaces/cli/src/main.rs` — `aigent history` subcommand
+
+New `history` subcommand with three sub-subcommands:
+
+```
+aigent history clear          # delete today's .aigent/history/YYYY-MM-DD.jsonl
+aigent history export <PATH>  # copy today's history to PATH
+aigent history path           # print the path to today's file
+```
+
+### Verification checklist
+
+- [ ] `cargo build --workspace` — 0 errors, 0 warnings
+- [ ] `cargo test --workspace` — all tests pass (57 total)
+- [ ] TUI: start a new session, prior turns from today appear in the transcript immediately
+- [ ] TUI: send a message → spinner (`|`, `/`, `-`, `\`) animates the entire turn including during tool execution
+- [ ] Tool-using query: agent responds with final answer without prompting user
+- [ ] `aigent history path` prints `.aigent/history/YYYY-MM-DD.jsonl`
+- [ ] `aigent history export /tmp/out.jsonl` creates the file
+- [ ] `aigent history clear` removes today's file

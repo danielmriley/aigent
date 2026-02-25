@@ -2,6 +2,7 @@ pub mod agent_loop;
 mod client;
 mod commands;
 mod events;
+pub mod history;
 pub mod micro_profile;
 mod runtime;
 mod server;
