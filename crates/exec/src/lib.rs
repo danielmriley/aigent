@@ -285,7 +285,7 @@ impl ToolExecutor {
             let ws = workspace_str.clone();
             cmd.as_std_mut().pre_exec(move || {
                 // SAFETY: called between fork and exec; only async-signal-safe calls.
-                unsafe { sandbox::apply_to_child(&ws) }
+                sandbox::apply_to_child(&ws)
             });
         }
 
