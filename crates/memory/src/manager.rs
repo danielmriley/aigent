@@ -93,7 +93,9 @@ impl MemoryManager {
 
         let event_count = events.len();
         for event in events {
-            manager.apply_replayed_entry(event.entry)?;
+            if let Err(err) = manager.apply_replayed_entry(event.entry) {
+                warn!(%err, "skipping quarantined entry during replay");
+            }
         }
 
         let stats = manager.stats();

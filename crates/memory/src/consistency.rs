@@ -29,7 +29,8 @@ fn evaluate_core(identity: &IdentityKernel, entry: &MemoryEntry) -> ConsistencyD
     let trusted_source = entry.source.starts_with("onboarding")
         || entry.source.starts_with("sleep:")
         || entry.source.starts_with("identity:")
-        || entry.source.starts_with("constitution:");
+        || entry.source.starts_with("constitution:")
+        || entry.source.starts_with("belief");
 
     if !trusted_source {
         warn!(
