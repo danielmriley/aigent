@@ -152,6 +152,7 @@ impl App {
                     "/switch",
                     "/memory",
                     "/sleep",
+                    "/dedup",
                     "/doctor",
                     "/status",
                     "/context",

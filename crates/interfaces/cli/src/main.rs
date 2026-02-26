@@ -1001,7 +1001,7 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                 aigent_ui::UiCommand::Submit(line) => {
                     if line == "/help" {
                         let _ = backend_tx.send(BackendEvent::Token(
-                            "Commands: /help, /status, /memory, /sleep, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
+                            "Commands: /help, /status, /memory, /sleep, /dedup, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
                         ));
                         let _ = backend_tx.send(BackendEvent::Done);
                         return Ok(());
@@ -1067,6 +1067,25 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                                 })
                                 .await
                             {
+                                Ok(msg) => {
+                                    let _ = tx_spawn.send(BackendEvent::Token(msg));
+                                    let _ = tx_spawn.send(BackendEvent::Done);
+                                }
+                                Err(err) => {
+                                    let _ = tx_spawn.send(BackendEvent::Error(err.to_string()));
+                                }
+                            }
+                        });
+                        return Ok(());
+                    }
+
+                    if line == "/dedup" {
+                        let _ = backend_tx.send(BackendEvent::SleepProgress(
+                            "Running content deduplication…".to_string(),
+                        ));
+                        let tx_spawn = backend_tx.clone();
+                        tokio::spawn(async move {
+                            match daemon.deduplicate_memory().await {
                                 Ok(msg) => {
                                     let _ = tx_spawn.send(BackendEvent::Token(msg));
                                     let _ = tx_spawn.send(BackendEvent::Done);
@@ -1223,6 +1242,7 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
             println!("/status");
             println!("/memory");
             println!("/sleep  -- trigger an agentic sleep cycle now");
+            println!("/dedup  -- remove content-duplicate memory entries");
             println!("/model show");
             println!("/model list [ollama|openrouter]");
             println!("/model provider <ollama|openrouter>");
@@ -1267,6 +1287,15 @@ async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
                 .run_sleep_cycle_with_progress(|msg| println!("  {msg}"))
                 .await
             {
+                Ok(msg) => println!("{msg}"),
+                Err(err) => eprintln!("error: {err}"),
+            }
+            continue;
+        }
+
+        if line == "/dedup" {
+            println!("Running content deduplication…");
+            match daemon.deduplicate_memory().await {
                 Ok(msg) => println!("{msg}"),
                 Err(err) => eprintln!("error: {err}"),
             }

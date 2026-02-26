@@ -1235,6 +1235,27 @@ async fn handle_connection(
             };
             send_event(&mut write_half, ServerEvent::SleepStatus(payload)).await?;
         }
+        ClientCommand::DeduplicateMemory => {
+            let mut s = state.lock().await;
+            match s.memory.deduplicate_by_content().await {
+                Ok(removed) => {
+                    let msg = if removed > 0 {
+                        let _ = s.memory.flush_all();
+                        format!("deduplication complete: removed {removed} duplicate entries")
+                    } else {
+                        "deduplication complete: no duplicates found".to_string()
+                    };
+                    send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+                }
+                Err(err) => {
+                    send_event(
+                        &mut write_half,
+                        ServerEvent::Ack(format!("deduplication failed: {err}")),
+                    )
+                    .await?;
+                }
+            }
+        }
     }
 
     Ok(())

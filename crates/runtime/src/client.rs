@@ -243,6 +243,18 @@ impl DaemonClient {
         bail!("daemon did not return SleepStatus")
     }
 
+    /// Run content-level deduplication across all memory tiers.
+    /// Returns the number of entries removed.
+    pub async fn deduplicate_memory(&self) -> Result<String> {
+        let events = self.request_events(ClientCommand::DeduplicateMemory).await?;
+        for event in events {
+            if let ServerEvent::Ack(msg) = event {
+                return Ok(msg);
+            }
+        }
+        bail!("daemon did not return an Ack for DeduplicateMemory")
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<aigent_tools::ToolSpec>> {
         let events = self.request_events(ClientCommand::ListTools).await?;
         for event in events {

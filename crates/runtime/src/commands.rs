@@ -44,6 +44,8 @@ pub enum ClientCommand {
     GetProactiveStats,
     /// Return sleep cycle status: last passive/nightly times, schedule info.
     GetSleepStatus,
+    /// Run content-level deduplication across all memory tiers.
+    DeduplicateMemory,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

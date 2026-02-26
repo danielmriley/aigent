@@ -331,6 +331,15 @@ impl MemoryManager {
 
     #[instrument(skip(self))]
     pub async fn run_sleep_cycle(&mut self) -> Result<SleepSummary> {
+        // ── Pre-sleep deduplication ────────────────────────────────────
+        // Remove content-identical entries before distillation so the
+        // repetition counter in `distill()` works on a clean slate and
+        // the LLM doesn't see bloated memory counts.
+        let deduped = self.deduplicate_by_content().await?;
+        if deduped > 0 {
+            info!(deduped, "pre-sleep deduplication removed entries");
+        }
+
         let snapshot = self.store.all().to_vec();
         info!(entries = snapshot.len(), "sleep cycle starting");
         let mut summary = distill(&snapshot);
@@ -412,6 +421,43 @@ impl MemoryManager {
             );
         }
         removed
+    }
+
+    // ── Content deduplication ──────────────────────────────────────────────
+
+    /// Remove content-duplicate entries from the in-memory store **and** the
+    /// persistent event log.
+    ///
+    /// For every group of entries that share the same `(tier, normalised_content)`,
+    /// the **newest** entry (by `created_at`) is kept and all older copies are
+    /// purged.  Returns the number of entries removed.
+    ///
+    /// This is called automatically at the start of every sleep cycle and can
+    /// also be triggered manually via `/dedup` or the daemon API.
+    pub async fn deduplicate_by_content(&mut self) -> Result<usize> {
+        let dupe_ids = self.store.find_content_duplicates();
+        if dupe_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let id_set: HashSet<Uuid> = dupe_ids.iter().copied().collect();
+        let removed = self.store.retain(|e| !id_set.contains(&e.id));
+
+        // Purge corresponding event-log entries so duplicates don't reappear
+        // on the next daemon restart.
+        if let Some(event_log) = &self.event_log {
+            let events = event_log.load()?;
+            let kept = events
+                .into_iter()
+                .filter(|ev| !id_set.contains(&ev.entry.id))
+                .collect::<Vec<_>>();
+            event_log.overwrite(&kept).await?;
+        }
+
+        if removed > 0 {
+            info!(removed, "content deduplication: purged duplicate entries");
+        }
+        Ok(removed)
     }
 
     // ── Belief API ─────────────────────────────────────────────────────────

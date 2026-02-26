@@ -1,19 +1,46 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::schema::MemoryEntry;
+use crate::schema::{MemoryEntry, MemoryTier};
+
+/// Compute a stable content key for deduplication: `"tier:sha256(normalised_content)"`.
+///
+/// Normalisation: trim whitespace, lowercase, collapse runs of whitespace.
+/// Two entries are considered duplicates when they share the same tier and
+/// the same normalised content hash.
+fn content_dedup_key(tier: MemoryTier, content: &str) -> String {
+    let norm: String = content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    let mut h = Sha256::new();
+    h.update(norm.as_bytes());
+    format!("{}:{:x}", tier.slug(), h.finalize())
+}
 
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     entries: Vec<MemoryEntry>,
     /// Maps entry UUID → index in `entries` for O(1) lookup.
     by_id: HashMap<Uuid, usize>,
+    /// Set of `content_dedup_key` strings for entries currently in the store.
+    /// Used for O(1) content-level duplicate rejection at insert time.
+    content_keys: HashSet<String>,
 }
 
 impl MemoryStore {
     pub fn insert(&mut self, entry: MemoryEntry) -> bool {
         if self.by_id.contains_key(&entry.id) {
+            return false;
+        }
+
+        // Content-level dedup: reject if an entry with the same tier +
+        // normalised content already exists.
+        let ck = content_dedup_key(entry.tier, &entry.content);
+        if !self.content_keys.insert(ck) {
             return false;
         }
 
@@ -35,6 +62,7 @@ impl MemoryStore {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.by_id.clear();
+        self.content_keys.clear();
     }
 
     pub fn retain<F>(&mut self, mut keep: F) -> usize
@@ -43,8 +71,9 @@ impl MemoryStore {
     {
         let before = self.entries.len();
         self.entries.retain(|entry| keep(entry));
-        // Rebuild lookup structure after retain.
+        // Rebuild lookup structures after retain.
         self.by_id = self.entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+        self.content_keys = self.entries.iter().map(|e| content_dedup_key(e.tier, &e.content)).collect();
         before.saturating_sub(self.entries.len())
     }
 
@@ -64,12 +93,43 @@ impl MemoryStore {
         self.entries.retain(|e| e.id != id);
         if self.entries.len() < before {
             self.by_id.remove(&id);
-            // Remap positions for entries that shifted.
+            // Rebuild both lookup structures.
             self.by_id = self.entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+            self.content_keys = self.entries.iter().map(|e| content_dedup_key(e.tier, &e.content)).collect();
             true
         } else {
             false
         }
+    }
+
+    /// Identify content-duplicate entries within the store.
+    ///
+    /// For each group of entries sharing the same `(tier, normalised_content)`,
+    /// **keeps the newest** (by `created_at`) and returns the UUIDs of all
+    /// older duplicates that should be removed.
+    ///
+    /// Does **not** mutate the store — callers decide how to dispose of dupes
+    /// (e.g. also purging them from the event log).
+    pub fn find_content_duplicates(&self) -> Vec<Uuid> {
+        // Map content_dedup_key → Vec of (created_at, id).
+        let mut groups: HashMap<String, Vec<(chrono::DateTime<chrono::Utc>, Uuid)>> = HashMap::new();
+        for entry in &self.entries {
+            let ck = content_dedup_key(entry.tier, &entry.content);
+            groups.entry(ck).or_default().push((entry.created_at, entry.id));
+        }
+        let mut dupes = Vec::new();
+        for (_key, mut group) in groups {
+            if group.len() <= 1 {
+                continue;
+            }
+            // Sort newest first.
+            group.sort_by(|a, b| b.0.cmp(&a.0));
+            // Everything after the first (newest) is a duplicate.
+            for &(_, id) in &group[1..] {
+                dupes.push(id);
+            }
+        }
+        dupes
     }
 
     /// Update the `valence` field of the first entry whose UUID string starts
