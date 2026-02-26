@@ -81,9 +81,6 @@ enum Commands {
         #[command(subcommand)]
         command: HistoryCommands,
     },
-    /// Show daemon and sleep cycle status at a glance.
-    #[command(about = "Show daemon status: uptime, memory, sleep schedule")]
-    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -437,45 +434,6 @@ async fn main() -> Result<()> {
             HistoryCommands::Path => {
                 let p = chat_history::history_file_path();
                 println!("{}", p.display());
-            }
-        },
-        Commands::Status => {
-            let socket_path = config.daemon.socket_path.clone();
-            let client = aigent_runtime::DaemonClient::new(&socket_path);
-            match client.get_status().await {
-                Ok(status) => {
-                    println!("── daemon status ─────────────────────────────────────");
-                    println!("  bot:       {}", status.bot_name);
-                    println!("  provider:  {}", status.provider);
-                    println!("  model:     {}", status.model);
-                    println!("  thinking:  {}", status.thinking_level);
-                    println!("  uptime:    {}s", status.uptime_secs);
-                    println!("  memory:    {} total ({} core, {} user, {} reflective, {} semantic, {} episodic)",
-                        status.memory_total, status.memory_core, status.memory_user_profile,
-                        status.memory_reflective, status.memory_semantic, status.memory_episodic);
-                    println!("  tools:     {}", status.available_tools.join(", "));
-                }
-                Err(err) => {
-                    eprintln!("daemon not reachable: {err}");
-                    eprintln!("is the daemon running? try: aigent daemon start");
-                    std::process::exit(1);
-                }
-            }
-            match client.get_sleep_status().await {
-                Ok(sleep) => {
-                    println!();
-                    println!("── sleep schedule ────────────────────────────────────");
-                    println!("  mode:      {}", sleep.auto_sleep_mode);
-                    println!("  passive:   every {}h", sleep.passive_interval_hours);
-                    println!("  last passive:  {}", sleep.last_passive_sleep_at.as_deref().unwrap_or("never"));
-                    println!("  last nightly:  {}", sleep.last_nightly_sleep_at.as_deref().unwrap_or("never"));
-                    println!("  quiet window:  {:02}:00–{:02}:00 {}",
-                        sleep.quiet_window_start, sleep.quiet_window_end, sleep.timezone);
-                    println!("  in window now: {}", if sleep.in_quiet_window { "yes" } else { "no" });
-                }
-                Err(err) => {
-                    eprintln!("  (sleep status unavailable: {err})");
-                }
             }
         },
     }
@@ -1099,7 +1057,7 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                         match daemon
                             .run_sleep_cycle_with_progress(|msg| {
                                 let _ = tx_clone
-                                    .send(BackendEvent::Token(format!("[sleep] {msg}")));
+                                    .send(BackendEvent::SleepProgress(msg.to_string()));
                             })
                             .await
                         {

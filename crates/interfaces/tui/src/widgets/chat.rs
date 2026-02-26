@@ -144,6 +144,15 @@ fn build_chat_lines_with_starts(
                     }
                 }
             }
+        } else if message.role == "system" {
+            // System / progress messages (e.g. sleep cycle stages).
+            let sys_style = Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC);
+            lines.push(Line::from(Span::styled(
+                format!("  {}", message.content),
+                sys_style,
+            )));
         } else if message.role != "assistant" {
             // External source (e.g. telegram) — show role as prefix
             let mut ext_prefix = Style::default()

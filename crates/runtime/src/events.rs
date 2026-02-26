@@ -22,6 +22,10 @@ pub enum BackendEvent {
     /// Emitted when a manual /sleep command is in progress so the TUI can
     /// show a dedicated animated indicator without polluting the chat log.
     SleepCycleRunning,
+    /// Incremental stage update from a running sleep cycle.
+    /// Displayed as a distinct system line in the chat window so
+    /// the user can follow the pipeline's progress.
+    SleepProgress(String),
     Done,
     Error(String),
     MemoryUpdated,

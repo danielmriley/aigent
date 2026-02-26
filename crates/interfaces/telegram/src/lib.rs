@@ -229,6 +229,7 @@ async fn handle_telegram_input(
             // Telegram response context (not a persistent subscriber).
             BackendEvent::Thinking
             | BackendEvent::SleepCycleRunning
+            | BackendEvent::SleepProgress(_)
             | BackendEvent::MemoryUpdated
             | BackendEvent::ToolCallStart(_)
             | BackendEvent::ExternalTurn { .. }

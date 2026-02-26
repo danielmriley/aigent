@@ -469,6 +469,21 @@ impl App {
                 self.is_sleeping = true;
                 self.is_thinking = false;
                 self.state.status = "sleep cycle running".to_string();
+                self.auto_follow = true;
+                self.state.messages.push(Message {
+                    role: "system".to_string(),
+                    content: "Starting sleep cycle\u{2026}".to_string(),
+                    rendered_md: None,
+                });
+            }
+            BackendEvent::SleepProgress(msg) => {
+                self.state.status = format!("sleep: {msg}");
+                self.auto_follow = true;
+                self.state.messages.push(Message {
+                    role: "system".to_string(),
+                    content: msg,
+                    rendered_md: None,
+                });
             }
             BackendEvent::Done => {
                 self.is_thinking = false;
