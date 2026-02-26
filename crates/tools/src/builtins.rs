@@ -366,7 +366,6 @@ impl WebSearchTool {
             .get("https://api.search.brave.com/res/v1/web/search")
             .query(&[("q", query), ("count", &max_results.to_string())])
             .header("Accept", "application/json")
-            .header("Accept-Encoding", "gzip")
             .header("X-Subscription-Token", api_key)
             .send()
             .await?;
