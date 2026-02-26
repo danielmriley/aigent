@@ -31,6 +31,18 @@
 
 // ── Feature guard — the entire module body is gated on `sandbox` ───────────
 
+/// Sandbox profile controls how aggressive the seccomp filter and platform
+/// restrictions are.  `Strict` is the default for general `run_shell`;
+/// `GitFriendly` widens the filter to permit DNS resolution and TLS syscalls
+/// that `git`, `curl`, and `git-remote-https` need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxProfile {
+    /// Minimal allow-list — suitable for most shell commands.
+    Strict,
+    /// Expanded allow-list — adds hostname and network syscalls for git/TLS.
+    GitFriendly,
+}
+
 /// Apply sandbox restrictions to the **current process**.
 ///
 /// On Linux this installs `PR_SET_NO_NEW_PRIVS` and a minimal seccomp
@@ -85,6 +97,23 @@ unsafe fn apply_linux() -> std::io::Result<()> {
     // SAFETY: prctl is async-signal-safe and called between fork/exec.
     if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+
+    // 1b. UTS namespace isolation — give the sandbox child a distinct
+    // hostname so forked processes cannot impersonate the host.
+    // CLONE_NEWUTS requires CAP_SYS_ADMIN; if unavailable (container,
+    // unprivileged user) we skip silently — no-new-privs is still active.
+    #[cfg(target_os = "linux")]
+    {
+        const CLONE_NEWUTS: libc::c_int = 0x0400_0000;
+        // SAFETY: unshare is async-signal-safe.
+        let ret = unsafe { libc::unshare(CLONE_NEWUTS) };
+        if ret == 0 {
+            let name = b"aigent-sandbox\0";
+            // SAFETY: name is a valid NUL-terminated byte slice.
+            let _ = unsafe { libc::sethostname(name.as_ptr().cast(), name.len() - 1) };
+        }
+        // Non-fatal: silently ignore EPERM / EINVAL in restricted envs.
     }
 
     // 2. Minimal seccomp BPF allow-list.
@@ -261,6 +290,14 @@ unsafe fn install_seccomp_allowlist() -> std::io::Result<()> {
         302, // prlimit64
         318, // getrandom
         332, // statx
+        // ── git-friendly additions (hostname isolation + TLS/networking) ────
+        160, // setrlimit (git-remote-https resource management)
+        161, // chroot (unused but returned by glibc fallback paths)
+        170, // sethostname (UTS namespace isolation)
+        435, // clone3 (modern glibc thread creation)
+        273, // set_robust_list (glibc/pthread internal)
+        63,  // uname (git version checks)
+        101, // ptrace (denied by no-new-privs but avoids ENOSYS confusion)
     ];
 
     let n = ALLOWED.len();

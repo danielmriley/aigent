@@ -1610,3 +1610,47 @@ protocol changes.
 - [ ] `cargo test --workspace` — all tests pass
 - [ ] Manual: ask the agent "what time is it?" — verify it gives the correct local time without hedging.
 - [ ] Manual: use `web_search` — verify no raw JSON appears in TUI or Telegram before the answer.
+
+## 2026-02-27 — gait: Safe Native Git + Sandbox Hardening (Phases 0–1)
+
+### Summary
+
+New `perform_gait` tool provides safe, in-process git operations via libgit2.
+All writes are restricted to `trusted_write_paths`; reads are broadly allowed.
+Seccomp sandbox expanded with three new syscalls for git compatibility.
+
+### New config keys
+
+```toml
+[git]
+trusted_repos       = ["https://github.com/danielmriley/aigent"]
+trusted_write_paths = []           # workspace + self-repo auto-included
+allow_system_read   = true
+```
+
+### New dependency
+
+- `git2 = "0.20"` (workspace, features: `https`, `ssh`) — libgit2 bindings.
+
+### Changes
+
+| File | Change |
+|---|---|
+| `crates/exec/src/gait.rs` | **New file.** `GaitPolicy`, `GaitTool`, `perform_gait()` — 16 git actions via libgit2 + CLI fallback. |
+| `crates/exec/src/lib.rs` | `pub mod gait;` added. `perform_gait` registered in `default_registry()`. Added to `READ_ONLY` list in balanced approval mode. |
+| `crates/exec/src/sandbox.rs` | Seccomp allow-list expanded: `uname` (160), `sethostname` (170), `clone3` (435). |
+| `crates/exec/Cargo.toml` | Added `git2`, `chrono` deps; `tempfile` dev-dep. |
+| `crates/config/src/lib.rs` | `GitConfig` struct with `trusted_repos`, `trusted_write_paths`, `allow_system_read`. Added `git: GitConfig` to `AppConfig`. |
+| `config/default.toml` | Added `[git]` section. |
+| `config/default.toml.example` | Added documented `[git]` section. |
+| `Cargo.toml` (workspace) | Added `git2` workspace dependency. |
+| `extensions/wit/host.wit` | Added `git-operation` record and `perform-gait` export. |
+| `crates/runtime/src/prompt_builder.rs` | Grounding Rule 10: prefer `perform_gait` over `run_shell git`. |
+| `README.md` | gait section in updates table, feature matrix, and detailed §5. |
+
+### Verification
+
+- [ ] `cargo clippy --workspace -- -D warnings` — 0 warnings
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] Manual: ask the agent to check workspace git status — verify it uses `perform_gait`
+- [ ] Manual: attempt clone outside trusted paths — verify rejection

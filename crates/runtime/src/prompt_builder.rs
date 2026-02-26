@@ -307,7 +307,10 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
          9. After a tool has been called on your behalf, its output is embedded verbatim \
             in the LATEST USER MESSAGE block below (between the ===== TOOL RESULT ===== markers). \
             NEVER state that tool results are missing, pending, or not yet in your context. \
-            The markers are your contract: if they are present, the data IS present."
+            The markers are your contract: if they are present, the data IS present.\n\
+         10. For git operations, ALWAYS prefer `perform_gait` over `run_shell git …`. \
+            `perform_gait` is safer (enforces write boundaries), faster (in-process), \
+            and more expressive. Use run_shell only if gait lacks the needed action."
     );
 
     if tool_specs.is_empty() {

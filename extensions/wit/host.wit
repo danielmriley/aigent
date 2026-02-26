@@ -50,6 +50,25 @@ world host {
   /// when the workspace has no commits.
   export git-log-last: func() -> result<string, string>;
 
+  // ── gait — safe native git ─────────────────────────────────
+  /// A structured git operation request for the gait tool.
+  /// `action`: status | log | diff | commit | checkout | branch | reset |
+  ///           clone | pull | push | fetch | ls-remote | show | blame |
+  ///           tag | stash.
+  /// `repo`: "workspace", "self", an absolute path, or a remote URL.
+  record git-operation {
+    action: string,
+    repo: string,
+    target-dir: option<string>,
+    branch: option<string>,
+    message: option<string>,
+    paths: option<list<string>>,
+    force: option<bool>,
+  }
+  /// Preferred git interface — enforces trust boundaries.
+  /// Returns rich formatted output suitable for LLM reflection.
+  export perform-gait: func(op: git-operation) -> result<string, string>;
+
   // ── Secrets store ────────────────────────────────────────────
   /// Read a named secret from the workspace .secrets/ directory.
   /// The host validates that the name is a safe filename component.

@@ -33,3 +33,10 @@ bytes           = { workspace = true, optional = true }
 # Platform sandboxing (optional – enabled via `sandbox` feature)
 libc = { workspace = true, optional = true }
 
+# Native git operations (gait) — uses libgit2 for safe, in-process git.
+git2 = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+

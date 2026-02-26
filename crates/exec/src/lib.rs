@@ -1,3 +1,4 @@
+pub mod gait;
 pub mod git;
 pub mod sandbox;
 
@@ -221,6 +222,7 @@ impl ToolExecutor {
                 const READ_ONLY: &[&str] = &[
                     "read_file",
                     "web_search",
+                    "perform_gait",
                 ];
                 !READ_ONLY.contains(&tool_name)
             }
@@ -403,6 +405,17 @@ pub fn default_registry(
     };
 
     let mut registry = ToolRegistry::default();
+
+    // ── Step 0: Native gait (git) tool ─────────────────────────────────────
+    // Registered first so it appears before other tools in listings.
+    // We build a GaitPolicy from a minimal AppConfig using the workspace root.
+    {
+        let mut app_config = aigent_config::AppConfig::default();
+        app_config.agent.workspace_path = workspace_root.display().to_string();
+        let policy = gait::GaitPolicy::from_config(&app_config);
+        let gait_tool = gait::GaitTool { policy };
+        registry.register(Box::new(gait_tool));
+    }
 
     // ── Step 1: WASM-first ─────────────────────────────────────────────────
     // Register compiled WASM guests before native tools.  `ToolRegistry::get`

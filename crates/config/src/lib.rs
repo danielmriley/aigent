@@ -278,6 +278,38 @@ impl Default for UiConfig {
     }
 }
 
+/// Git integration (`gait`) security and trust configuration.
+///
+/// Controls which repositories the agent can write to and whether read-only
+/// git operations are allowed against arbitrary system paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GitConfig {
+    /// Repository URLs or local paths considered "trusted" for identity.
+    /// Used for commit authorship verification and push safety.
+    pub trusted_repos: Vec<String>,
+    /// Absolute paths where git write operations (commit, checkout, merge,
+    /// reset, clone, etc.) are permitted.  `agent.workspace_path` and the
+    /// detected Aigent source directory are **always** included at runtime
+    /// even if not listed here.
+    pub trusted_write_paths: Vec<String>,
+    /// When `true` (the default), read-only git operations (`status`, `log`,
+    /// `diff`, `blame`, `ls-remote`, etc.) are allowed on any accessible
+    /// repository.  Set to `false` in `safer` mode to restrict reads to
+    /// `trusted_write_paths` only.
+    pub allow_system_read: bool,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self {
+            trusted_repos: vec!["https://github.com/danielmriley/aigent".to_string()],
+            trusted_write_paths: vec![],
+            allow_system_read: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -291,6 +323,7 @@ pub struct AppConfig {
     pub integrations: IntegrationsConfig,
     pub daemon: DaemonConfig,
     pub ui: UiConfig,
+    pub git: GitConfig,
 }
 
 impl AppConfig {

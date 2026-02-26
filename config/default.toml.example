@@ -101,3 +101,14 @@ telegram_enabled = false
 
 [daemon]
 socket_path = "/tmp/aigent.sock"
+
+# ── Git integration (gait) ──────────────────────────────────────────────────────────
+[git]
+# Repository URLs considered trusted for push / commit identity.
+trusted_repos = ["https://github.com/danielmriley/aigent"]
+# Absolute paths where git write ops are allowed.
+# workspace_path and the Aigent source dir are always auto-added at runtime.
+trusted_write_paths = []
+# Allow read-only git ops (status, log, diff, blame, ls-remote) on any repo.
+# Set to false in "safer" mode to restrict reads to trusted_write_paths only.
+allow_system_read = true

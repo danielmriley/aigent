@@ -6,10 +6,12 @@ Aigent is a persistent, self-improving AI agent written in Rust. It runs as a ba
 
 | Change | Details |
 |---|---|
+| **gait — safe native git** | New `perform_gait` tool powered by libgit2 (`git2` crate). All git writes restricted to `trusted_write_paths`; reads broadly allowed. Grounding rule 10 instructs the LLM to prefer gait over `run_shell git …`. Config: `[git]` section with `trusted_repos`, `trusted_write_paths`, `allow_system_read`. WIT `git-operation` record + `perform-gait` export added. |
+| **Sandbox seccomp expansion** | Added `uname` (160), `sethostname` (170), and `clone3` (435) to the seccomp BPF allow-list so git / build tools work inside the sandbox. |
 | **Tool-result propagation v2** | Rule 9 added to grounding block: LLM is contractually bound by the ===== TOOL RESULT ===== markers. Fallback follow-up prompt cleaned up. TUI now suppresses raw tool-JSON tokens before `ClearStream` fires. Telegram `ClearStream` handler clears streamed output before second pass. |
 | **Prominent date/time in prompt** | `local_time` added to ENVIRONMENT CONTEXT. `Today is <weekday, Month D, YYYY>` injected into the system preamble so the LLM cannot hallucinate the date. |
 | **Non-blocking TUI event loop** | Crossterm key/mouse reading moved to a dedicated OS thread — spinner, tick, and backend events get fair `tokio::select!` scheduling. Eliminates all spinner stutter during streaming or tool calls. |
-| **10-rule truth-seeking grounding** | Rule 10: "After a tool has been called on your behalf, the result appears verbatim in your prompt. NEVER claim the tool result is missing." |
+| **11-rule truth-seeking grounding** | Rule 10: prefer `perform_gait` over `run_shell git`. Rule 9 (tool-result markers). All prior rules retained. |
 | **7-point tool continuation instruction** | The synthetic continuation prompt after every tool call is now a numbered CRITICAL INSTRUCTION block — the LLM can no longer dodge tool results. |
 | **Ctrl+T theme cycling** | Press Ctrl+T to cycle through Catppuccin Mocha → Tokyo Night → Nord live. Keybindings bar updated. |
 | **`aigent status` CLI** | New top-level command shows daemon uptime, memory stats, tool list, and full sleep schedule at a glance. |
@@ -329,6 +331,7 @@ aigent tools status   # shows WASM vs native per tool + sandbox effective state
 | Brave Search integration | ✅ Complete | `web_search` uses Brave API when `brave_api_key` is set; falls back to DuckDuckGo. |
 | WASM extension interface | ✅ Complete | WIT host API + Wasmtime host runtime (`wasm` feature, **default-on**). WASM guests registered first (first-match wins); native tools fill gaps until guests are built. `aigent tools build` compiles guests; `aigent tools status` shows per-tool mode. |
 | Platform sandboxing | ✅ Complete | `sandbox` feature **default-on**: `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list (x86-64 Linux); `sandbox_init` profile (macOS). Applied in child process before shell `exec`. Runtime-configurable via `[tools] sandbox_enabled = false`. |
+| **gait (native git)** | ✅ Complete | `perform_gait` tool: in-process git via libgit2. Supports status, log, diff, commit, checkout, branch, reset, clone, pull, push, fetch, ls-remote, show, blame, tag, stash. All writes restricted to `trusted_write_paths` (auto-includes workspace + self-repo). Config: `[git]` section. Grounding rule 10 instructs LLM to prefer gait. |
 | Memory CLI commands | ✅ Complete | `stats` (incl. tool exec counts), `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
 | Tool CLI commands | ✅ Complete | `aigent tool list`, `aigent tool call <name> [key=value ...]`, `aigent tools build` (compile WASM guests), `aigent tools status` (WASM vs native + sandbox state). |
 | Telegram command parity | ✅ Complete | Core commands available; all memory, proactive, and tool events routed correctly. |
@@ -505,6 +508,38 @@ aigent tools status
 
 The workspace isolation, approval-mode gating, and `tool_allowlist`/`tool_denylist`
 layers remain active on all platforms regardless of `sandbox_enabled`.
+
+### 5 — gait: safe native git interface
+
+`perform_gait` is the recommended git tool.  It uses libgit2 (via the `git2`
+crate) for in-process operations and falls back to the `git` CLI only for
+network-heavy actions (clone, push, pull, fetch, ls-remote, blame).
+
+**Security model:**
+
+| Classification | Operations | Rule |
+|----------------|-----------|------|
+| **WRITE** | commit, checkout, merge, reset, pull, push, clone, branch, tag, stash | Path MUST be inside `trusted_write_paths` |
+| **READ** | status, log, diff, show, blame, ls-remote, fetch | When `allow_system_read = true`, any path; otherwise same as WRITE |
+
+`clone` is **always a WRITE operation** — it requires an explicit `target_dir`
+that resolves inside `trusted_write_paths`.
+
+**Configuration:**
+
+```toml
+# config/default.toml
+[git]
+trusted_repos       = ["https://github.com/danielmriley/aigent"]
+trusted_write_paths = []           # workspace + self-repo auto-added
+allow_system_read   = true         # reads OK anywhere; set false for lockdown
+```
+
+**Magic repo names:**
+
+- `"workspace"` — resolves to the agent's workspace root.
+- `"self"` — resolves to the Aigent source directory (auto-detected from
+  binary path or `AIGENT_SOURCE_DIR` env var).
 
 ## Development
 

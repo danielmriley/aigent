@@ -232,7 +232,7 @@ mod tests {
 
         let ranked = assemble_context_with_provenance(
             &[semantic],
-            &[core.clone()],
+            std::slice::from_ref(&core),
             "what is your name",
             2,
             None,

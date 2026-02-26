@@ -744,13 +744,15 @@ mod tests {
 
     #[test]
     fn merge_insights_deduplicates_learned() {
-        let mut a = AgenticSleepInsights::default();
-        a.learned_about_user =
-            vec!["User likes Rust".to_string(), "User prefers async".to_string()];
+        let a = AgenticSleepInsights {
+            learned_about_user: vec!["User likes Rust".to_string(), "User prefers async".to_string()],
+            ..Default::default()
+        };
 
-        let mut b = AgenticSleepInsights::default();
-        b.learned_about_user =
-            vec!["user likes rust".to_string(), "User prefers Python".to_string()];
+        let b = AgenticSleepInsights {
+            learned_about_user: vec!["user likes rust".to_string(), "User prefers Python".to_string()],
+            ..Default::default()
+        };
 
         let merged = merge_insights(vec![a, b]);
         // "user likes rust" and "User likes Rust" are duplicates (case-insensitive)
@@ -764,11 +766,15 @@ mod tests {
 
     #[test]
     fn merge_insights_retire_loses_to_rewrite() {
-        let mut a = AgenticSleepInsights::default();
-        a.retire_core_ids = vec!["abcd1234".to_string()];
+        let a = AgenticSleepInsights {
+            retire_core_ids: vec!["abcd1234".to_string()],
+            ..Default::default()
+        };
 
-        let mut b = AgenticSleepInsights::default();
-        b.rewrite_core = vec![("abcd1234".to_string(), "updated content".to_string())];
+        let b = AgenticSleepInsights {
+            rewrite_core: vec![("abcd1234".to_string(), "updated content".to_string())],
+            ..Default::default()
+        };
 
         let merged = merge_insights(vec![a, b]);
         assert!(
@@ -780,11 +786,15 @@ mod tests {
 
     #[test]
     fn merge_insights_profile_update_last_wins() {
-        let mut a = AgenticSleepInsights::default();
-        a.user_profile_updates = vec![("language".to_string(), "Python".to_string())];
+        let a = AgenticSleepInsights {
+            user_profile_updates: vec![("language".to_string(), "Python".to_string())],
+            ..Default::default()
+        };
 
-        let mut b = AgenticSleepInsights::default();
-        b.user_profile_updates = vec![("language".to_string(), "Rust".to_string())];
+        let b = AgenticSleepInsights {
+            user_profile_updates: vec![("language".to_string(), "Rust".to_string())],
+            ..Default::default()
+        };
 
         let merged = merge_insights(vec![a, b]);
         let lang_entries: Vec<_> = merged
@@ -801,17 +811,21 @@ mod tests {
         // Same Core IDs can appear in multiple batches (Core is replicated into
         // every batch), so the same consolidation can be proposed twice.
         // merge_insights must deduplicate by ids_csv, keeping only the last synthesis.
-        let mut a = AgenticSleepInsights::default();
-        a.consolidate_core = vec![(
-            "abcd1234,ef567890".to_string(),
-            "first synthesis".to_string(),
-        )];
+        let a = AgenticSleepInsights {
+            consolidate_core: vec![(
+                "abcd1234,ef567890".to_string(),
+                "first synthesis".to_string(),
+            )],
+            ..Default::default()
+        };
 
-        let mut b = AgenticSleepInsights::default();
-        b.consolidate_core = vec![(
-            "abcd1234,ef567890".to_string(),
-            "second synthesis".to_string(),
-        )];
+        let b = AgenticSleepInsights {
+            consolidate_core: vec![(
+                "abcd1234,ef567890".to_string(),
+                "second synthesis".to_string(),
+            )],
+            ..Default::default()
+        };
 
         let merged = merge_insights(vec![a, b]);
         assert_eq!(
@@ -829,8 +843,10 @@ mod tests {
 
     #[test]
     fn build_identity_context_includes_personality() {
-        let mut identity = IdentityKernel::default();
-        identity.communication_style = "verbose and philosophical".to_string();
+        let mut identity = IdentityKernel {
+            communication_style: "verbose and philosophical".to_string(),
+            ..Default::default()
+        };
         identity.trait_scores.insert("curiosity".to_string(), 0.9);
 
         let entries: Vec<MemoryEntry> = Vec::new();
@@ -845,8 +861,10 @@ mod tests {
 
     #[test]
     fn specialist_prompt_contains_identity_context() {
-        let mut identity = IdentityKernel::default();
-        identity.communication_style = "warm and precise".to_string();
+        let identity = IdentityKernel {
+            communication_style: "warm and precise".to_string(),
+            ..Default::default()
+        };
 
         let entries: Vec<MemoryEntry> = Vec::new();
         let prompt =

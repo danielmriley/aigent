@@ -106,8 +106,8 @@ mod tests {
             "frustrated confused error failed worried stuck broken terrible awful wrong bad";
         let pos = infer_valence(very_positive);
         let neg = infer_valence(very_negative);
-        assert!(pos <= 1.0 && pos >= -1.0, "positive score {pos} out of [-1,1]");
-        assert!(neg <= 1.0 && neg >= -1.0, "negative score {neg} out of [-1,1]");
+        assert!((-1.0..=1.0).contains(&pos), "positive score {pos} out of [-1,1]");
+        assert!((-1.0..=1.0).contains(&neg), "negative score {neg} out of [-1,1]");
     }
 
     #[test]
