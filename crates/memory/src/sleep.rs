@@ -45,6 +45,11 @@ pub struct SleepSummary {
 pub fn distill(entries: &[MemoryEntry]) -> SleepSummary {
     let mut normalized_count: HashMap<String, usize> = HashMap::new();
     for entry in entries {
+        // Exclude sleep-produced copies from repetition counts — otherwise
+        // each distillation round inflates the count for the original content.
+        if entry.source.starts_with("sleep:") {
+            continue;
+        }
         let key = entry.content.trim().to_lowercase();
         if key.is_empty() {
             continue;
@@ -59,8 +64,11 @@ pub fn distill(entries: &[MemoryEntry]) -> SleepSummary {
         if entry.tier == MemoryTier::Core {
             continue;
         }
-        // Skip sleep bookkeeping entries — they clutter core.
-        if entry.source.starts_with("sleep:cycle") {
+        // Skip ALL sleep-produced entries — re-promoting them causes
+        // geometric growth because each cycle's promoted copies would be
+        // promoted again next cycle.  Sleep-produced entries are already
+        // placed at the correct tier by the agentic or passive pipeline.
+        if entry.source.starts_with("sleep:") {
             continue;
         }
 
