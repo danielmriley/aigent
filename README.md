@@ -6,6 +6,8 @@ Aigent is a persistent, self-improving AI agent written in Rust. It runs as a ba
 
 | Change | Details |
 |---|---|
+| **Tool-result propagation v2** | Rule 9 added to grounding block: LLM is contractually bound by the ===== TOOL RESULT ===== markers. Fallback follow-up prompt cleaned up. TUI now suppresses raw tool-JSON tokens before `ClearStream` fires. Telegram `ClearStream` handler clears streamed output before second pass. |
+| **Prominent date/time in prompt** | `local_time` added to ENVIRONMENT CONTEXT. `Today is <weekday, Month D, YYYY>` injected into the system preamble so the LLM cannot hallucinate the date. |
 | **Non-blocking TUI event loop** | Crossterm key/mouse reading moved to a dedicated OS thread — spinner, tick, and backend events get fair `tokio::select!` scheduling. Eliminates all spinner stutter during streaming or tool calls. |
 | **10-rule truth-seeking grounding** | Rule 10: "After a tool has been called on your behalf, the result appears verbatim in your prompt. NEVER claim the tool result is missing." |
 | **7-point tool continuation instruction** | The synthetic continuation prompt after every tool call is now a numbered CRITICAL INSTRUCTION block — the LLM can no longer dodge tool results. |

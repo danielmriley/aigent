@@ -4,7 +4,7 @@
 //! to keep `runtime.rs` focused on orchestration while this module owns the
 //! prompt layout, grounding rules, and truth-seeking directives.
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use uuid::Uuid;
 
 use aigent_config::AppConfig;
@@ -45,10 +45,13 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     let conversation_block = build_conversation_block(inputs.recent_turns);
     let identity_block = build_identity_block(memory);
     let beliefs_block = build_beliefs_block(memory, config.memory.max_beliefs_in_prompt);
+    let identity = format!("{identity_block}{beliefs_block}");
     let tools_section = build_tools_and_grounding(inputs.tool_specs);
 
+    let today_date = Local::now().format("%A, %B %-d, %Y").to_string();
+
     format!(
-        "You are {name}. Thinking depth: {thought_style}.\n\
+        "You are {name}. Thinking depth: {thought_style}. Today is {today_date}.\n\
          Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
          continuity, and MEMORY CONTEXT for durable background facts.\n\
          Never repeat previous answers unless asked.\n\
@@ -61,10 +64,11 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
          LATEST USER MESSAGE:\n{msg}\n\n\
          ASSISTANT RESPONSE:",
         name = config.agent.name,
+        today_date = today_date,
         relational_block = relational_block,
         follow_ups = follow_up_block,
         proactive_directive = proactive_directive,
-        identity = format!("{}{}", identity_block, beliefs_block),
+        identity = identity,
         tools_section = tools_section,
         env = environment_block,
         conv = conversation_block,
@@ -155,12 +159,14 @@ fn build_environment_block(
         .ok()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let local_ts = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
     let timestamp = Utc::now().to_rfc3339();
     let git_present = std::path::Path::new(".git").exists();
     let stats = memory.stats();
 
     format!(
-        "- utc_time: {timestamp}\n\
+        "- local_time: {local_ts}\n\
+         - utc_time: {timestamp}\n\
          - os: {}\n\
          - arch: {}\n\
          - cwd: {cwd}\n\
@@ -297,7 +303,11 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
          7. Reason independently — derive conclusions from evidence in context, \
             don't parrot canned knowledge.\n\
          8. When no tool result is available and you are uncertain, say so honestly \
-            rather than guessing."
+            rather than guessing.
+         9. After a tool has been called on your behalf, its output is embedded verbatim \
+            in the LATEST USER MESSAGE block below (between the ===== TOOL RESULT ===== markers). \
+            NEVER state that tool results are missing, pending, or not yet in your context. \
+            The markers are your contract: if they are present, the data IS present."
     );
 
     if tool_specs.is_empty() {

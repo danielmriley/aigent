@@ -232,8 +232,10 @@ async fn handle_telegram_input(
             | BackendEvent::SleepProgress(_)
             | BackendEvent::MemoryUpdated
             | BackendEvent::ToolCallStart(_)
-            | BackendEvent::ExternalTurn { .. }
-            | BackendEvent::ClearStream => {}
+            | BackendEvent::ExternalTurn { .. } => {}
+            BackendEvent::ClearStream => {
+                out.clear();
+            }
             BackendEvent::ToolCallEnd(result) => {
                 tools_used.push(result.name.clone());
             }

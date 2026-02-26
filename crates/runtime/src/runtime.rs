@@ -334,6 +334,8 @@ these elements into your responses naturally without explicitly announcing them.
             )
         };
 
+        let identity = format!("{identity_block}{beliefs_block}");
+
         let prompt = format!(
             "You are {name}. Thinking depth: {thought_style}.\n\
              Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
@@ -345,7 +347,7 @@ these elements into your responses naturally without explicitly announcing them.
             relational_block = relational_block,
             follow_ups = follow_up_block,
             proactive_directive = proactive_directive,
-            identity = format!("{}{}", identity_block, beliefs_block),
+            identity = identity,
             tools_section = tools_section,
             env = environment_block,
             conv = conversation_block,

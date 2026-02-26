@@ -14,18 +14,13 @@ use serde::{Deserialize, Serialize};
 /// | `safer`    | Every tool invocation triggers an interactive approval prompt.|
 /// | `balanced` | Read-only tools run freely; write / shell / HTTP require approval. |
 /// | `autonomous` | No approval prompts (still workspace-sandboxed).           |
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalMode {
     Safer,
+    #[default]
     Balanced,
     Autonomous,
-}
-
-impl Default for ApprovalMode {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

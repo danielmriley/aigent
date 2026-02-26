@@ -592,10 +592,8 @@ fn html_to_text(html: &str, max_chars: usize) -> String {
             }
 
             // Drop the tag itself (no output).
-        } else {
-            if skip_depth == 0 {
-                cleaned.push(ch);
-            }
+        } else if skip_depth == 0 {
+            cleaned.push(ch);
         }
     }
 

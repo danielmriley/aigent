@@ -1585,3 +1585,28 @@ New top-level command queries the daemon over the Unix socket and prints:
 - [ ] TUI: ReflectionInsight auto-scrolls the viewport
 - [ ] `aigent status` shows daemon status and sleep schedule
 - [ ] Tool query → agent uses result directly, no "not in context"
+
+---
+
+## 2026-02-26 — Tool-Result Propagation v2 + Date Awareness
+
+### Summary
+
+Surgical hardening pass. No schema migrations. No config changes. No IPC
+protocol changes.
+
+### Changes
+
+| File | Change |
+|---|---|
+| `crates/runtime/src/prompt_builder.rs` | Grounding Rule 9 added. `local_time` added to ENVIRONMENT CONTEXT. `Today is …` injected into system preamble. |
+| `crates/runtime/src/server.rs` | `effective_user` CRITICAL INSTRUCTION tightened to 7 explicit points. Fallback `followup` prompt cleaned and matched to same 7-point format. |
+| `crates/interfaces/tui/src/app.rs` | `pending_stream_suppressed` guard prevents raw JSON tokens rendering before `ClearStream`. `safe_truncate_ui` replaces byte-index slice in tool snippet. |
+| `crates/interfaces/telegram/src/lib.rs` | `ClearStream` now clears `out` so the second-pass stream starts fresh. |
+
+### Verification
+
+- [ ] `cargo clippy --workspace -- -D warnings` — 0 warnings
+- [ ] `cargo test --workspace` — all tests pass
+- [ ] Manual: ask the agent "what time is it?" — verify it gives the correct local time without hedging.
+- [ ] Manual: use `web_search` — verify no raw JSON appears in TUI or Telegram before the answer.

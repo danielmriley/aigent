@@ -779,18 +779,15 @@ async fn handle_connection(
                      ===== TOOL RESULT (retrieved {now}) from '{tool_name}' =====\n\
                      {output}\n\
                      ===== END TOOL RESULT =====\n\n\
-                     CRITICAL INSTRUCTION — read carefully:\n\
-                     1. The TOOL RESULT above is ALREADY in your context right now.\n\
-                     2. Using it, give a complete, natural, helpful final answer immediately.\n\
-                     3. Quote numbers, dates, and facts verbatim from the result.\n\
-                     4. Speak conversationally as yourself.\n\
-                     5. Do NOT say the result is unavailable, pending, \"not yet in memory\", \
-                        or that you need to check further.\n\
-                     6. Do NOT use phrases like \"according to the tool\", \"the search result \
-                        shows\", or \"based on the data retrieved\". Simply state the answer \
-                        as if you know it.\n\
-                     7. If the tool returned an error, explain the error honestly and suggest \
-                        alternatives.",
+                     CRITICAL INSTRUCTION — you MUST follow every point:\n\
+                     1. The TOOL RESULT embedded above is in your context RIGHT NOW between the ===== markers.\n\
+                     2. Synthesise a complete, natural, helpful final answer from it immediately.\n\
+                     3. Quote numbers, dates, names, and facts verbatim from the TOOL RESULT.\n\
+                     4. Speak conversationally as yourself — never use phrases like \"according to the tool\" \
+                        or \"based on the data retrieved\".\n\
+                     5. Do NOT claim the result is unavailable, pending, missing, or \"not yet in your memory\".\n\
+                     6. Do NOT output raw JSON or attempt to call a tool again.\n\
+                     7. If the tool returned an error, state the error honestly and suggest alternatives.",
                     user = user,
                     now = now,
                     tool_name = tool_name,
@@ -858,7 +855,19 @@ async fn handle_connection(
                             // Build a grounded follow-up prompt and re-stream.
                             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
                             let followup = format!(
-                                "{user}\n\n                                 ===== TOOL RESULT (retrieved {now}) from \'{tool_name}\' =====\n                                 {output}\n                                 ===== END TOOL RESULT =====\n\n                                 CRITICAL INSTRUCTION:\n                                 1. The TOOL RESULT above is in your context NOW.\n                                 2. Give a complete, natural answer using it.\n                                 3. Quote numbers and facts verbatim.\n                                 4. Do NOT say the result is unavailable or pending.\n                                 5. Speak conversationally as yourself.",
+                                "{user}\n\n\
+                                 ===== TOOL RESULT (retrieved {now}) from '{tool_name}' =====\n\
+                                 {output}\n\
+                                 ===== END TOOL RESULT =====\n\n\
+                                 CRITICAL INSTRUCTION — you MUST follow every point:\n\
+                                 1. The TOOL RESULT embedded above is in your context RIGHT NOW between the ===== markers.\n\
+                                 2. Synthesise a complete, natural, helpful final answer from it immediately.\n\
+                                 3. Quote numbers, dates, names, and facts verbatim from the TOOL RESULT.\n\
+                                 4. Speak conversationally as yourself — never use phrases like \"according to the tool\" \
+                                    or \"based on the data retrieved\".\n\
+                                 5. Do NOT claim the result is unavailable, pending, missing, or \"not yet in your memory\".\n\
+                                 6. Do NOT output raw JSON or attempt to call a tool again.\n\
+                                 7. If the tool returned an error, state the error honestly and suggest alternatives.",
                                 user = user,
                                 now = now,
                                 tool_name = call.tool,

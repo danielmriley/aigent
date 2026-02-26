@@ -49,7 +49,7 @@ pub enum Provider {
     OpenRouter,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmRouter {
     ollama: OllamaClient,
     openrouter: OpenRouterClient,
@@ -147,15 +147,6 @@ pub async fn list_openrouter_models() -> Result<Vec<String>> {
     };
 
     Ok(models)
-}
-
-impl Default for LlmRouter {
-    fn default() -> Self {
-        Self {
-            ollama: OllamaClient::new(),
-            openrouter: OpenRouterClient::new(),
-        }
-    }
 }
 
 impl LlmRouter {

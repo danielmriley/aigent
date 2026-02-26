@@ -20,8 +20,6 @@
 //! Both layouts are tried on every daemon start; missing dirs are silently
 //! skipped so the daemon works without any WASM tools present.
 
-#![cfg(feature = "wasm")]
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;

@@ -97,6 +97,7 @@ pub struct App {
     pub show_sidebar: bool,
     pub spinner_tick: usize,
     pub pending_stream: String,
+    pub pending_stream_suppressed: bool,
     pub input_wrap_width: usize,
     pub workspace_files: Vec<String>,
     pub file_popup: FilePopup,
@@ -136,6 +137,7 @@ impl App {
             is_sleeping: false,
             active_tool: None,
             pending_stream: String::new(),
+            pending_stream_suppressed: false,
             input_wrap_width: 60,
             workspace_files: collect_workspace_files(Path::new(".")),
             file_popup: FilePopup {
@@ -447,6 +449,14 @@ impl App {
         match event {
             BackendEvent::Token(chunk) => {
                 self.pending_stream.push_str(&chunk);
+                // Suppress rendering if the accumulating stream looks like raw
+                // tool JSON — the fallback path will fire ClearStream shortly.
+                if self.pending_stream_suppressed
+                    || self.pending_stream.trim_start().starts_with('{')
+                {
+                    self.pending_stream_suppressed = true;
+                    return;
+                }
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
                         last.content = format!("[stream]{}", self.pending_stream);
@@ -489,6 +499,7 @@ impl App {
             BackendEvent::Done => {
                 self.is_thinking = false;
                 self.is_sleeping = false;
+                self.pending_stream_suppressed = false;
                 self.state.status = "idle".to_string();
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
@@ -530,11 +541,7 @@ impl App {
                 // Update the last ⚙ message to reflect the outcome.
                 if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| m.role == "⚙") {
                     msg.content = if result.success {
-                        let snip = if result.output.len() > 80 {
-                            format!("{}…", &result.output[..80])
-                        } else {
-                            result.output.clone()
-                        };
+                        let snip = safe_truncate_ui(&result.output, 80);
                         format!("✓ {} — {}", result.name, snip)
                     } else {
                         format!("✗ {} failed", result.name)
@@ -588,6 +595,7 @@ impl App {
             BackendEvent::ClearStream => {
                 // Discard the partially-streamed assistant message (typically
                 // raw tool JSON that leaked before fallback detection kicked in).
+                self.pending_stream_suppressed = false;
                 if let Some(last) = self.state.messages.last() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
                         self.state.messages.pop();
@@ -970,5 +978,17 @@ pub fn extract_first_code_block(message: &str) -> Option<String> {
         None
     } else {
         Some(buf.join("\n"))
+    }
+}
+
+/// Truncate `text` to at most `max_chars` characters, appending `…` when cut.
+/// Safe for multi-byte UTF-8 — counts characters, not bytes.
+fn safe_truncate_ui(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let taken: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{taken}…")
+    } else {
+        taken
     }
 }
