@@ -17,7 +17,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 aigent-config = { path = "../../config" }
-aigent-core = { path = "../../core" }
 aigent-exec = { path = "../../exec" }
 aigent-runtime = { path = "../../runtime" }
 aigent-llm = { path = "../../llm" }

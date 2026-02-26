@@ -116,16 +116,7 @@ fn u8_to_tier(v: u8) -> Option<MemoryTier> {
     }
 }
 
-fn tier_slug(tier: MemoryTier) -> &'static str {
-    match tier {
-        MemoryTier::Episodic => "episodic",
-        MemoryTier::Semantic => "semantic",
-        MemoryTier::Procedural => "procedural",
-        MemoryTier::Reflective => "reflective",
-        MemoryTier::UserProfile => "user-profile",
-        MemoryTier::Core => "core",
-    }
-}
+
 
 // ── MemoryIndex ───────────────────────────────────────────────────────────────
 
@@ -194,7 +185,7 @@ impl MemoryIndex {
             tbl.insert(id_str.as_str(), bytes.as_slice())?;
 
             // Update tier index: append id to the tier's newline-separated list.
-            let slug = tier_slug(entry.tier);
+            let slug = entry.tier.slug();
             let mut tier_tbl = tx.open_table(TIER_TABLE)?;
             let existing = tier_tbl
                 .get(slug)?
@@ -218,7 +209,7 @@ impl MemoryIndex {
     pub fn ids_for_tier(&self, tier: MemoryTier) -> Result<Vec<String>> {
         let tx = self.db.begin_read()?;
         let tbl = tx.open_table(TIER_TABLE)?;
-        let slug = tier_slug(tier);
+        let slug = tier.slug();
         let list = tbl
             .get(slug)?
             .map(|v| v.value().to_string())

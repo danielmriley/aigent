@@ -43,7 +43,6 @@ name = "aigent-app"
 version = "0.1.0"
 dependencies = [
  "aigent-config",
- "aigent-core",
  "aigent-exec",
  "aigent-llm",
  "aigent-memory",
@@ -82,7 +81,6 @@ dependencies = [
 name = "aigent-config"
 version = "0.1.0"
 dependencies = [
- "aigent-core",
  "anyhow",
  "serde",
  "toml",
@@ -91,18 +89,12 @@ dependencies = [
 [[package]]
 name = "aigent-core"
 version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "uuid",
-]
 
 [[package]]
 name = "aigent-exec"
 version = "0.1.0"
 dependencies = [
  "aigent-config",
- "aigent-core",
  "aigent-tools",
  "anyhow",
  "async-trait",
@@ -120,9 +112,7 @@ dependencies = [
 name = "aigent-llm"
 version = "0.1.0"
 dependencies = [
- "aigent-core",
  "anyhow",
- "async-trait",
  "reqwest",
  "serde",
  "serde_json",
@@ -133,7 +123,6 @@ dependencies = [
 name = "aigent-memory"
 version = "0.1.0"
 dependencies = [
- "aigent-core",
  "anyhow",
  "bincode 2.0.1",
  "chrono",
@@ -153,7 +142,6 @@ name = "aigent-runtime"
 version = "0.1.0"
 dependencies = [
  "aigent-config",
- "aigent-core",
  "aigent-exec",
  "aigent-llm",
  "aigent-memory",
@@ -174,7 +162,6 @@ dependencies = [
 name = "aigent-telegram"
 version = "0.1.0"
 dependencies = [
- "aigent-core",
  "aigent-llm",
  "aigent-memory",
  "aigent-runtime",
@@ -191,7 +178,6 @@ dependencies = [
 name = "aigent-tools"
 version = "0.1.0"
 dependencies = [
- "aigent-core",
  "anyhow",
  "async-trait",
  "chrono",

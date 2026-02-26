@@ -17,5 +17,3 @@ notify.workspace = true
 redb.workspace = true
 bincode.workspace = true
 lru.workspace = true
-
-aigent-core = { path = "../core" }

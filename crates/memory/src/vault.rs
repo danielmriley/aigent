@@ -69,7 +69,7 @@ pub fn export_obsidian_vault(
         let note_name = note_name(entry);
         let note_file = notes_dir.join(format!("{note_name}.md"));
         let day = entry.created_at.format("%Y-%m-%d").to_string();
-        let tier_label = tier_slug(entry.tier);
+        let tier_label = entry.tier.slug();
         let topics = extract_topics(&entry.content);
 
         let topic_links = if topics.is_empty() {
@@ -146,7 +146,7 @@ pub fn write_entry_note(entry: &MemoryEntry, vault_root: &Path) -> Result<()> {
     }
 
     let day = entry.created_at.format("%Y-%m-%d").to_string();
-    let tier_label = tier_slug(entry.tier);
+    let tier_label = entry.tier.slug();
     let topics = extract_topics(&entry.content);
 
     let topic_links = if topics.is_empty() {
@@ -196,7 +196,7 @@ fn write_root_index(
         MemoryTier::Reflective,
         MemoryTier::UserProfile,
     ] {
-        let slug = tier_slug(tier);
+        let slug = tier.slug();
         let count = tier_links.get(slug).map(|items| items.len()).unwrap_or(0);
         content.push_str(&format!("- [[tier-{slug}]] ({count})\n"));
     }
@@ -226,7 +226,7 @@ fn write_tier_indexes(tiers_dir: &Path, tier_links: &BTreeMap<String, Vec<String
         MemoryTier::Reflective,
         MemoryTier::UserProfile,
     ] {
-        let slug = tier_slug(tier);
+        let slug = tier.slug();
         let mut content = format!("# {} Memories\n\n", slug.to_uppercase());
         let links = tier_links.get(slug).cloned().unwrap_or_default();
         if links.is_empty() {
@@ -276,19 +276,8 @@ fn write_topics(
 
 fn note_name(entry: &MemoryEntry) -> String {
     let date = entry.created_at.format("%Y%m%d").to_string();
-    let id_short = entry.id.to_string().chars().take(8).collect::<String>();
-    format!("{date}-{}-{id_short}", tier_slug(entry.tier))
-}
-
-fn tier_slug(tier: MemoryTier) -> &'static str {
-    match tier {
-        MemoryTier::Episodic => "episodic",
-        MemoryTier::Semantic => "semantic",
-        MemoryTier::Procedural => "procedural",
-        MemoryTier::Reflective => "reflective",
-        MemoryTier::UserProfile => "user-profile",
-        MemoryTier::Core => "core",
-    }
+    let id_short = entry.id_short();
+    format!("{date}-{}-{id_short}", entry.tier.slug())
 }
 
 fn extract_topics(content: &str) -> Vec<String> {
@@ -393,8 +382,8 @@ fn build_kv_yaml(tier_label: &str, entries: &[&MemoryEntry], now: DateTime<Utc>)
     let mut items_body = String::new();
     items_body.push_str("items:\n");
     for entry in entries {
-        let id_short = &entry.id.to_string()[..8];
-        items_body.push_str(&format!("  - id: {}\n", yaml_quote(id_short)));
+        let id_short = entry.id_short();
+        items_body.push_str(&format!("  - id: {}\n", yaml_quote(&id_short)));
         items_body.push_str(&format!("    confidence: {:.2}\n", entry.confidence));
         items_body.push_str(&format!("    valence: {:.2}\n", entry.valence));
         items_body.push_str(&format!(

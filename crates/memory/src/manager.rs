@@ -163,32 +163,7 @@ impl MemoryManager {
     }
 
     pub fn context_for_prompt_ranked(&self, query: &str, limit: usize) -> Vec<RankedMemoryContext> {
-        let core_entries = self
-            .entries_by_tier(MemoryTier::Core)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let non_core = self
-            .store
-            .all()
-            .iter()
-            .filter(|entry| {
-                entry.tier != MemoryTier::Core
-                    // Skip assistant-turn metadata (old format)
-                    && !entry.source.starts_with("assistant-turn")
-                    // Skip sleep cycle bookkeeping entries — their content
-                    // contains structured text ("promoted 79 items: • [Core]…")
-                    // that the LLM misreads as factual memory counts.
-                    && entry.source != "sleep:cycle"
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut ranked = assemble_context_with_provenance(&non_core, &core_entries, query, limit, None);
-        // Prepend the YAML KV identity block as a pinned high-priority entry so
-        // the agent always knows who it is regardless of retrieval ranking.
-        self.prepend_kv_identity_block(&mut ranked);
-        ranked
+        self.context_for_prompt_ranked_with_embed(query, limit, None)
     }
 
     pub fn stats(&self) -> MemoryStats {

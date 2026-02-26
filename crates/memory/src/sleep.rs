@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
-use crate::schema::{MemoryEntry, MemoryTier};
+use crate::schema::{MemoryEntry, MemoryTier, truncate_str};
 use crate::scorer::{PromotionSignals, is_core_eligible};
 
 // ── Basic promotion types ─────────────────────────────────────────────────────
@@ -180,14 +180,6 @@ pub fn decay_stale_semantic(entries: &[MemoryEntry], max_age_days: i64) -> Vec<U
 
 // ── Agentic sleep ─────────────────────────────────────────────────────────────
 
-/// Truncate `s` to at most `max_chars` Unicode scalar values.
-fn truncate_str(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((i, _)) => &s[..i],
-        None => s,
-    }
-}
-
 /// Structured output from the LLM's nightly reflection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgenticSleepInsights {
@@ -318,7 +310,7 @@ pub fn agentic_sleep_prompt(
         .iter()
         .filter(|e| e.tier == MemoryTier::Core && e.source != "sleep:retired")
         .map(|e| {
-            let id_short: String = e.id.to_string().chars().take(8).collect();
+            let id_short = e.id_short();
             format!(
                 "  [{}] {}",
                 id_short,

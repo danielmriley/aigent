@@ -1,22 +1,9 @@
 use anyhow::Result;
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::process::Command;
 use std::time::Duration;
 use tokio::sync::mpsc;
-
-#[derive(Debug, Clone)]
-pub struct ChatTurn {
-    pub user: String,
-    pub assistant: String,
-}
-
-#[async_trait]
-pub trait LlmClient: Send + Sync {
-    async fn chat(&self, prompt: &str) -> Result<String>;
-    async fn chat_stream(&self, prompt: &str, tx: mpsc::Sender<String>) -> Result<String>;
-}
 
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
@@ -224,16 +211,6 @@ impl LlmRouter {
     }
 }
 
-#[async_trait]
-impl LlmClient for OllamaClient {
-    async fn chat(&self, prompt: &str) -> Result<String> {
-        self.chat_model("llama3.1:8b", prompt).await
-    }
-    async fn chat_stream(&self, prompt: &str, tx: mpsc::Sender<String>) -> Result<String> {
-        self.chat_model_stream("llama3.1:8b", prompt, tx).await
-    }
-}
-
 impl OllamaClient {
     async fn chat_model(&self, model: &str, prompt: &str) -> Result<String> {
         let base_url = std::env::var("OLLAMA_BASE_URL")
@@ -314,17 +291,6 @@ impl OllamaClient {
         }
 
         Ok(full_response)
-    }
-}
-
-#[async_trait]
-impl LlmClient for OpenRouterClient {
-    async fn chat(&self, prompt: &str) -> Result<String> {
-        self.chat_model("openai/gpt-4o-mini", prompt).await
-    }
-    async fn chat_stream(&self, prompt: &str, tx: mpsc::Sender<String>) -> Result<String> {
-        self.chat_model_stream("openai/gpt-4o-mini", prompt, tx)
-            .await
     }
 }
 

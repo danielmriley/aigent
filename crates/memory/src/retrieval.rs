@@ -82,23 +82,6 @@ pub fn assemble_context_with_provenance<'a>(
         .collect()
 }
 
-/// Score a single entry given the current query terms and optional embedding similarity.
-/// Returns a `RankedMemoryContext` with the entry **cloned** — use `score_entry_ref`
-/// when you want to defer cloning.
-pub fn score_entry(
-    entry: &MemoryEntry,
-    query_terms: &BTreeSet<String>,
-    now: chrono::DateTime<Utc>,
-    embedding_cos_sim: Option<f32>,
-) -> RankedMemoryContext {
-    let ctx = score_entry_ref(entry, query_terms, now, embedding_cos_sim);
-    RankedMemoryContext {
-        entry: entry.clone(),
-        score: ctx.score,
-        rationale: ctx.rationale,
-    }
-}
-
 /// Score-only helper: computes score and rationale without cloning the entry.
 /// Used by `assemble_context_with_provenance` to rank by reference before
 /// deciding which entries to clone into the final output.
@@ -136,17 +119,6 @@ pub(crate) fn score_entry_ref(
 pub(crate) struct ScoreOnly {
     pub score: f32,
     pub rationale: String,
-}
-
-/// Legacy helper: assemble without provenance metadata.
-pub fn assemble_context(
-    matches: &[MemoryEntry],
-    core_entries: &[MemoryEntry],
-) -> Vec<MemoryEntry> {
-    assemble_context_with_provenance(matches, core_entries, "", 12, None)
-        .into_iter()
-        .map(|item| item.entry)
-        .collect()
 }
 
 // ── Tier priority ─────────────────────────────────────────────────────────────

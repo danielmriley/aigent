@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 
 use uuid::Uuid;
 
@@ -8,21 +7,18 @@ use crate::schema::MemoryEntry;
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     entries: Vec<MemoryEntry>,
-    seen_ids: HashSet<String>,
     /// Maps entry UUID → index in `entries` for O(1) lookup.
     by_id: HashMap<Uuid, usize>,
 }
 
 impl MemoryStore {
     pub fn insert(&mut self, entry: MemoryEntry) -> bool {
-        let entry_id = entry.id.to_string();
-        if self.seen_ids.contains(&entry_id) {
+        if self.by_id.contains_key(&entry.id) {
             return false;
         }
 
         let idx = self.entries.len();
         self.by_id.insert(entry.id, idx);
-        self.seen_ids.insert(entry_id);
         self.entries.push(entry);
         true
     }
@@ -38,7 +34,6 @@ impl MemoryStore {
 
     pub fn clear(&mut self) {
         self.entries.clear();
-        self.seen_ids.clear();
         self.by_id.clear();
     }
 
@@ -48,8 +43,7 @@ impl MemoryStore {
     {
         let before = self.entries.len();
         self.entries.retain(|entry| keep(entry));
-        // Rebuild both lookup structures after retain.
-        self.seen_ids = self.entries.iter().map(|e| e.id.to_string()).collect();
+        // Rebuild lookup structure after retain.
         self.by_id = self.entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
         before.saturating_sub(self.entries.len())
     }
@@ -69,7 +63,6 @@ impl MemoryStore {
         let before = self.entries.len();
         self.entries.retain(|e| e.id != id);
         if self.entries.len() < before {
-            self.seen_ids.remove(&id.to_string());
             self.by_id.remove(&id);
             // Remap positions for entries that shifted.
             self.by_id = self.entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();

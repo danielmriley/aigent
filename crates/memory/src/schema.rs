@@ -35,6 +35,18 @@ impl MemoryTier {
         }
     }
 
+    /// Kebab-case slug used for file names, index keys, and log lines.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Episodic => "episodic",
+            Self::Semantic => "semantic",
+            Self::Procedural => "procedural",
+            Self::Reflective => "reflective",
+            Self::UserProfile => "user-profile",
+            Self::Core => "core",
+        }
+    }
+
     /// Parse a tier from its label (case-insensitive).
     ///
     /// Accepts the canonical label names as well as common abbreviations
@@ -71,4 +83,20 @@ pub struct MemoryEntry {
     /// Populated when an embedding backend is configured on [`crate::MemoryManager`].
     #[serde(skip)]
     pub embedding: Option<Vec<f32>>,
+}
+
+impl MemoryEntry {
+    /// First 8 characters of the UUID, used as a compact display identifier.
+    pub fn id_short(&self) -> String {
+        self.id.to_string()[..8].to_string()
+    }
+}
+
+/// Truncate `s` to at most `max_chars` Unicode scalar values, returning a
+/// sub-slice.  Shared helper used by sleep and multi-sleep prompt builders.
+pub fn truncate_str(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }

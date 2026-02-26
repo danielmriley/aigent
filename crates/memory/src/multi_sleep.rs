@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crate::identity::IdentityKernel;
-use crate::schema::{MemoryEntry, MemoryTier};
+use crate::schema::{MemoryEntry, MemoryTier, truncate_str};
 use crate::sleep::AgenticSleepInsights;
 
 // ── Identity context ──────────────────────────────────────────────────────────
@@ -544,14 +544,6 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Truncate a string to at most `max_chars` Unicode scalar values.
-fn truncate_str(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((i, _)) => &s[..i],
-        None => s,
-    }
-}
-
 fn format_memory_block(entries: &[MemoryEntry]) -> String {
     let mut recent: Vec<&MemoryEntry> = entries
         .iter()
@@ -587,7 +579,7 @@ fn format_core_block(entries: &[MemoryEntry]) -> String {
         .iter()
         .filter(|e| e.tier == MemoryTier::Core && e.source != "sleep:retired")
         .map(|e| {
-            let id_short: String = e.id.to_string().chars().take(8).collect();
+            let id_short = e.id_short();
             format!(
                 "  [{}] {}",
                 id_short,

@@ -17,7 +17,6 @@ uuid.workspace = true
 reqwest.workspace = true
 
 aigent-config = { path = "../config" }
-aigent-core = { path = "../core" }
 aigent-exec = { path = "../exec" }
 aigent-llm = { path = "../llm" }
 aigent-memory = { path = "../memory" }
