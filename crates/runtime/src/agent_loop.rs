@@ -96,3 +96,155 @@ impl LlmToolCall {
             .collect()
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn stringify_string_value() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::from([("key".into(), json!("value"))]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args["key"], "value");
+    }
+
+    #[test]
+    fn stringify_number_value() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::from([("count".into(), json!(42))]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args["count"], "42");
+    }
+
+    #[test]
+    fn stringify_float_value() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::from([("score".into(), json!(2.72))]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args["score"], "2.72");
+    }
+
+    #[test]
+    fn stringify_bool_value() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::from([("flag".into(), json!(true))]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args["flag"], "true");
+    }
+
+    #[test]
+    fn stringify_null_value() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::from([("empty".into(), json!(null))]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args["empty"], "");
+    }
+
+    #[test]
+    fn stringify_array_value_uses_json() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::from([("items".into(), json!(["a", "b"]))]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args["items"], "[\"a\",\"b\"]");
+    }
+
+    #[test]
+    fn stringify_object_value_uses_json() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::from([("nested".into(), json!({"x": 1}))]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args["nested"], "{\"x\":1}");
+    }
+
+    #[test]
+    fn stringify_empty_args() {
+        let call = LlmToolCall {
+            tool: "test".into(),
+            args: HashMap::new(),
+        };
+        let args = call.stringify_args();
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn stringify_mixed_types() {
+        let call = LlmToolCall {
+            tool: "mixed".into(),
+            args: HashMap::from([
+                ("name".into(), json!("Alice")),
+                ("age".into(), json!(30)),
+                ("active".into(), json!(true)),
+                ("note".into(), json!(null)),
+            ]),
+        };
+        let args = call.stringify_args();
+        assert_eq!(args.len(), 4);
+        assert_eq!(args["name"], "Alice");
+        assert_eq!(args["age"], "30");
+        assert_eq!(args["active"], "true");
+        assert_eq!(args["note"], "");
+    }
+
+    // ── ReflectionOutput / ProactiveOutput serde ───────────────────────────
+
+    #[test]
+    fn reflection_output_default() {
+        let r = ReflectionOutput::default();
+        assert!(r.beliefs.is_empty());
+        assert!(r.reflections.is_empty());
+    }
+
+    #[test]
+    fn proactive_output_default() {
+        let p = ProactiveOutput::default();
+        assert!(p.action.is_none());
+        assert!(p.message.is_none());
+        assert!(p.urgency.is_none());
+    }
+
+    #[test]
+    fn reflection_belief_default_confidence() {
+        let json = r#"{"claim":"test"}"#;
+        let belief: ReflectionBelief = serde_json::from_str(json).unwrap();
+        assert_eq!(belief.claim, "test");
+        assert!((belief.confidence - 0.65).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn llm_tool_call_serde_roundtrip() {
+        let call = LlmToolCall {
+            tool: "read_file".into(),
+            args: HashMap::from([("path".into(), json!("test.txt"))]),
+        };
+        let json = serde_json::to_string(&call).unwrap();
+        let back: LlmToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.tool, "read_file");
+        assert_eq!(back.args["path"], json!("test.txt"));
+    }
+
+    #[test]
+    fn llm_tool_call_missing_args_defaults_to_empty() {
+        let json = r#"{"tool":"test"}"#;
+        let call: LlmToolCall = serde_json::from_str(json).unwrap();
+        assert_eq!(call.tool, "test");
+        assert!(call.args.is_empty());
+    }
+}

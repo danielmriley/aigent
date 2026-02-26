@@ -75,6 +75,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -83,6 +84,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
+ "tempfile",
  "toml",
 ]
 
@@ -156,6 +159,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

@@ -189,7 +189,7 @@ pub async fn run_unified_daemon(
         let key = config.tools.brave_api_key.trim().to_string();
         if key.is_empty() { None } else { Some(key) }
     };
-    let tool_registry = aigent_exec::default_registry(workspace_root, agent_data_dir, brave_api_key);
+    let tool_registry = aigent_exec::default_registry(workspace_root, agent_data_dir, brave_api_key, &config);
     let tool_executor = ToolExecutor::new(policy);
 
     // Extract sleep scheduling config before `config` is moved into the runtime.

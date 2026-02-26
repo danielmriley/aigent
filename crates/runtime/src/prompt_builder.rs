@@ -362,3 +362,79 @@ pub fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
     let truncated: String = chars.into_iter().take(max_chars).collect();
     format!("{truncated}…")
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_for_prompt ────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_text_unchanged() {
+        assert_eq!(truncate_for_prompt("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate_for_prompt("12345", 5), "12345");
+    }
+
+    #[test]
+    fn truncate_long_text_adds_ellipsis() {
+        let result = truncate_for_prompt("hello world", 5);
+        assert_eq!(result, "hello…");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_for_prompt("", 10), "");
+    }
+
+    #[test]
+    fn truncate_zero_max() {
+        assert_eq!(truncate_for_prompt("hello", 0), "…");
+    }
+
+    #[test]
+    fn truncate_multibyte_characters() {
+        let text = "café résumé";
+        let result = truncate_for_prompt(text, 4);
+        assert_eq!(result, "café…");
+    }
+
+    #[test]
+    fn truncate_emoji() {
+        let text = "🦀🐍🐹🐿️";
+        let result = truncate_for_prompt(text, 2);
+        assert_eq!(result, "🦀🐍…");
+    }
+
+    // ── build_tools_and_grounding ──────────────────────────────────────────
+
+    #[test]
+    fn grounding_rules_present_when_no_tools() {
+        let section = build_tools_and_grounding(&[]);
+        assert!(section.contains("GROUNDING RULES"));
+        assert!(section.contains("perform_gait"));
+        assert!(!section.contains("AVAILABLE TOOLS"));
+    }
+
+    #[test]
+    fn grounding_rules_with_tools_shows_catalogue() {
+        let specs = vec![aigent_tools::ToolSpec {
+            name: "test_tool".to_string(),
+            description: "A test".to_string(),
+            params: vec![aigent_tools::ToolParam {
+                name: "input".to_string(),
+                description: "test input".to_string(),
+                required: true,
+            }],
+        }];
+        let section = build_tools_and_grounding(&specs);
+        assert!(section.contains("AVAILABLE TOOLS"));
+        assert!(section.contains("test_tool"));
+        assert!(section.contains("GROUNDING RULES"));
+    }
+}

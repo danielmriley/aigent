@@ -476,3 +476,157 @@ pub fn extract_json_output<T: serde::de::DeserializeOwned>(response: &str) -> Op
 
     None
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── StructuredOutput defaults ──────────────────────────────────────────
+
+    #[test]
+    fn structured_output_default_all_none() {
+        let out = StructuredOutput::default();
+        assert!(out.action.is_none());
+        assert!(out.rationale.is_none());
+        assert!(out.reply.is_none());
+        assert_eq!(out.params, serde_json::Value::Null);
+    }
+
+    // ── extract_json_output: fenced code block ─────────────────────────────
+
+    #[test]
+    fn extract_fenced_json() {
+        let raw = "Sure!\n```json\n{\"action\":\"record_belief\",\"reply\":\"Got it\"}\n```";
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("record_belief"));
+        assert_eq!(out.reply.as_deref(), Some("Got it"));
+    }
+
+    #[test]
+    fn extract_fenced_json_with_extra_text() {
+        let raw = "Here is the result:\n\n```json\n{\"action\":\"tool_call\",\"params\":{\"name\":\"read\"},\"reply\":\"done\"}\n```\n\nHope that helps!";
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("tool_call"));
+        assert_eq!(out.reply.as_deref(), Some("done"));
+        assert_eq!(out.params["name"], "read");
+    }
+
+    #[test]
+    fn extract_fenced_json_with_leading_newlines() {
+        let raw = "```json\n\n  {\"action\":\"test\"}\n```";
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("test"));
+    }
+
+    // ── extract_json_output: bare JSON ─────────────────────────────────────
+
+    #[test]
+    fn extract_bare_json() {
+        let raw = r#"{"action":"hello","reply":"world"}"#;
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("hello"));
+        assert_eq!(out.reply.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn extract_bare_json_with_surrounding_text() {
+        let raw = "some preamble {\"action\":\"x\"} some epilogue";
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn extract_bare_json_nested_braces() {
+        let raw = r#"{"action":"call","params":{"cmd":"echo {}"},"reply":"ok"}"#;
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("call"));
+        assert_eq!(out.reply.as_deref(), Some("ok"));
+    }
+
+    // ── extract_json_output: failure cases ─────────────────────────────────
+
+    #[test]
+    fn extract_returns_none_for_plain_text() {
+        let raw = "Hello, this is a plain text response with no JSON.";
+        assert!(extract_json_output::<StructuredOutput>(raw).is_none());
+    }
+
+    #[test]
+    fn extract_returns_none_for_empty_string() {
+        assert!(extract_json_output::<StructuredOutput>("").is_none());
+    }
+
+    #[test]
+    fn extract_returns_none_for_malformed_json_in_fence() {
+        let raw = "```json\n{not valid json}\n```";
+        assert!(extract_json_output::<StructuredOutput>(raw).is_none());
+    }
+
+    #[test]
+    fn extract_returns_none_for_lone_braces() {
+        let raw = "Something { that } is not really JSON";
+        assert!(extract_json_output::<StructuredOutput>(raw).is_none());
+    }
+
+    // ── extract_json_output: all StructuredOutput fields ───────────────────
+
+    #[test]
+    fn extract_all_structured_fields() {
+        let raw = r#"```json
+{
+  "action": "record_memory",
+  "params": {"tier": "semantic", "content": "User likes Rust"},
+  "rationale": "Long-term preference worth remembering",
+  "reply": "Noted, you like Rust!"
+}
+```"#;
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("record_memory"));
+        assert_eq!(out.rationale.as_deref(), Some("Long-term preference worth remembering"));
+        assert_eq!(out.reply.as_deref(), Some("Noted, you like Rust!"));
+        assert_eq!(out.params["tier"], "semantic");
+        assert_eq!(out.params["content"], "User likes Rust");
+    }
+
+    // ── Provider enum serde ────────────────────────────────────────────────
+
+    #[test]
+    fn provider_serde_roundtrip() {
+        for provider in [Provider::Ollama, Provider::OpenRouter] {
+            let json = serde_json::to_string(&provider).unwrap();
+            let back: Provider = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, provider);
+        }
+    }
+
+    // ── extract_json_output edge cases ─────────────────────────────────────
+
+    /// When two bare JSON objects appear in one response the bare strategy
+    /// grabs first '{' to last '}', which may span across both objects.
+    /// Fenced blocks don't have this problem, so verify fenced takes
+    /// precedence even when bare objects are also present.
+    #[test]
+    fn extract_fenced_takes_precedence_over_bare() {
+        let raw = r#"Bare: {"action":"wrong","reply":"no"}
+```json
+{"action":"right","reply":"yes"}
+```
+"#;
+        let out = extract_json_output::<StructuredOutput>(raw).unwrap();
+        assert_eq!(out.action.as_deref(), Some("right"));
+        assert_eq!(out.reply.as_deref(), Some("yes"));
+    }
+
+    /// Two bare JSON objects with no fence — the strategy spans first '{' to
+    /// last '}' which combines them into invalid JSON. Ensure we return None
+    /// rather than silently merging.
+    #[test]
+    fn extract_two_bare_objects_returns_none() {
+        let raw = r#"Here: {"action":"a"} and also {"action":"b"}"#;
+        // first '{' to last '}' = `{"action":"a"} and also {"action":"b"}`
+        // which is invalid JSON, so we should get None.
+        assert!(extract_json_output::<StructuredOutput>(raw).is_none());
+    }
+}

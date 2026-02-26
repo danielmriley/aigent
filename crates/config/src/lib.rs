@@ -371,3 +371,322 @@ impl AppConfig {
         !self.onboarding.completed
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    // ── Security-critical defaults ────────────────────────────────────────
+    // These protect against foot-guns. Changing any of these values should
+    // be a deliberate, reviewed decision.
+
+    #[test]
+    fn security_defaults_require_approval_and_deny_shell() {
+        let cfg = AppConfig::default();
+        assert!(
+            cfg.safety.approval_required,
+            "approval_required must default to true"
+        );
+        assert!(
+            !cfg.safety.allow_shell,
+            "allow_shell must default to false"
+        );
+        assert_eq!(
+            cfg.tools.approval_mode,
+            ApprovalMode::Balanced,
+            "approval_mode must default to Balanced"
+        );
+        assert!(
+            cfg.tools.sandbox_enabled,
+            "sandbox_enabled must default to true"
+        );
+    }
+
+    // ── Cosmetic / functional defaults ─────────────────────────────────────
+
+    #[test]
+    fn cosmetic_defaults() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.agent.name, "Aigent");
+        assert_eq!(cfg.llm.provider, "ollama");
+        assert_eq!(cfg.llm.ollama_model, "llama3.1:8b");
+        assert_eq!(cfg.llm.ollama_base_url, "http://localhost:11434");
+        assert_eq!(cfg.memory.backend, "eventlog");
+        assert_eq!(cfg.memory.auto_sleep_minutes, 120);
+        assert_eq!(cfg.telemetry.log_level, "info");
+        assert!(!cfg.onboarding.completed);
+        assert!(!cfg.integrations.telegram_enabled);
+        assert_eq!(cfg.daemon.socket_path, "/tmp/aigent.sock");
+        assert_eq!(cfg.ui.theme, "catppuccin-mocha");
+        assert!(cfg.ui.show_sidebar);
+    }
+
+    #[test]
+    fn default_git_config() {
+        let git = GitConfig::default();
+        assert_eq!(
+            git.trusted_repos,
+            vec!["https://github.com/danielmriley/aigent".to_string()]
+        );
+        assert!(git.trusted_write_paths.is_empty());
+        assert!(git.allow_system_read);
+    }
+
+    #[test]
+    fn default_safety_exempt_tools() {
+        let safety = SafetyConfig::default();
+        assert_eq!(safety.approval_exempt_tools.len(), 4);
+        assert!(safety.approval_exempt_tools.contains(&"web_search".to_string()));
+        assert!(safety.approval_exempt_tools.contains(&"remind_me".to_string()));
+    }
+
+    // ── load_from ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn load_from_missing_file_returns_defaults() {
+        let dir = TempDir::new().unwrap();
+        let cfg = AppConfig::load_from(dir.path().join("nonexistent.toml")).unwrap();
+        assert_eq!(cfg.agent.name, "Aigent");
+        assert_eq!(cfg.llm.provider, "ollama");
+    }
+
+    #[test]
+    fn load_from_valid_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.toml");
+        fs::write(
+            &path,
+            r#"
+[agent]
+name = "TestBot"
+user_name = "Alice"
+workspace_path = "/tmp/ws"
+thinking_level = "deep"
+
+[llm]
+provider = "openrouter"
+ollama_model = "custom:7b"
+openrouter_model = "anthropic/claude-3.5-sonnet"
+
+[tools]
+approval_mode = "autonomous"
+git_auto_commit = true
+
+[onboarding]
+completed = true
+"#,
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.agent.name, "TestBot");
+        assert_eq!(cfg.agent.user_name, "Alice");
+        assert_eq!(cfg.agent.workspace_path, "/tmp/ws");
+        assert_eq!(cfg.agent.thinking_level, "deep");
+        assert_eq!(cfg.llm.provider, "openrouter");
+        assert_eq!(cfg.llm.ollama_model, "custom:7b");
+        assert_eq!(cfg.llm.openrouter_model, "anthropic/claude-3.5-sonnet");
+        assert_eq!(cfg.tools.approval_mode, ApprovalMode::Autonomous);
+        assert!(cfg.tools.git_auto_commit);
+        assert!(cfg.onboarding.completed);
+        // Unspecified sections should have defaults
+        assert_eq!(cfg.memory.backend, "eventlog");
+    }
+
+    #[test]
+    fn load_from_partial_toml_fills_defaults() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("partial.toml");
+        fs::write(
+            &path,
+            r#"
+[agent]
+name = "Partial"
+"#,
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.agent.name, "Partial");
+        // Everything else should be default
+        assert_eq!(cfg.llm.provider, "ollama");
+        assert_eq!(cfg.tools.approval_mode, ApprovalMode::Balanced);
+    }
+
+    #[test]
+    fn load_from_invalid_toml_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bad.toml");
+        fs::write(&path, "this is not valid toml {{{{").unwrap();
+        assert!(AppConfig::load_from(&path).is_err());
+    }
+
+    // ── save_to + roundtrip ────────────────────────────────────────────────
+
+    #[test]
+    fn save_and_reload_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sub/config.toml");
+
+        let mut cfg = AppConfig::default();
+        cfg.agent.name = "RoundTrip".to_string();
+        cfg.llm.provider = "openrouter".to_string();
+        cfg.tools.approval_mode = ApprovalMode::Safer;
+        cfg.memory.timezone = "America/New_York".to_string();
+        cfg.git.trusted_write_paths = vec!["/home/test".to_string()];
+
+        cfg.save_to(&path).unwrap();
+        assert!(path.exists());
+
+        let loaded = AppConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.agent.name, "RoundTrip");
+        assert_eq!(loaded.llm.provider, "openrouter");
+        assert_eq!(loaded.tools.approval_mode, ApprovalMode::Safer);
+        assert_eq!(loaded.memory.timezone, "America/New_York");
+        assert_eq!(loaded.git.trusted_write_paths, vec!["/home/test".to_string()]);
+    }
+
+    #[test]
+    fn save_creates_parent_directories() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a/b/c/config.toml");
+        let cfg = AppConfig::default();
+        cfg.save_to(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    // ── active_model ───────────────────────────────────────────────────────
+
+    #[test]
+    fn active_model_returns_ollama_by_default() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.active_model(), "llama3.1:8b");
+    }
+
+    #[test]
+    fn active_model_returns_openrouter_model_when_provider_is_openrouter() {
+        let mut cfg = AppConfig::default();
+        cfg.llm.provider = "openrouter".to_string();
+        assert_eq!(cfg.active_model(), "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn active_model_case_insensitive() {
+        let mut cfg = AppConfig::default();
+        cfg.llm.provider = "OpenRouter".to_string();
+        assert_eq!(cfg.active_model(), "openai/gpt-4o-mini");
+    }
+
+    // ── needs_onboarding ───────────────────────────────────────────────────
+
+    #[test]
+    fn needs_onboarding_true_by_default() {
+        let cfg = AppConfig::default();
+        assert!(cfg.needs_onboarding());
+    }
+
+    #[test]
+    fn needs_onboarding_false_after_completion() {
+        let mut cfg = AppConfig::default();
+        cfg.onboarding.completed = true;
+        assert!(!cfg.needs_onboarding());
+    }
+
+    // ── ApprovalMode serde ─────────────────────────────────────────────────
+
+    #[test]
+    fn approval_mode_serde_roundtrip() {
+        for (mode, label) in [
+            (ApprovalMode::Safer, "\"safer\""),
+            (ApprovalMode::Balanced, "\"balanced\""),
+            (ApprovalMode::Autonomous, "\"autonomous\""),
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, label);
+            let back: ApprovalMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, mode);
+        }
+    }
+
+    // ── Env var overrides ──────────────────────────────────────────────────
+
+    #[test]
+    fn env_ollama_base_url_forces_ollama_provider() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("env.toml");
+        fs::write(
+            &path,
+            r#"
+[llm]
+provider = "openrouter"
+"#,
+        )
+        .unwrap();
+
+        // Set the env var before loading.
+        // SAFETY: test is single-threaded for this env var.
+        unsafe { env::set_var("OLLAMA_BASE_URL", "http://custom:11434") };
+        let cfg = AppConfig::load_from(&path).unwrap();
+        // Env var forces provider back to "ollama"
+        assert_eq!(cfg.llm.provider, "ollama");
+        unsafe { env::remove_var("OLLAMA_BASE_URL") };
+    }
+
+    #[test]
+    fn env_brave_api_key_overrides_config() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("brave.toml");
+        fs::write(
+            &path,
+            r#"
+[tools]
+brave_api_key = "from-file"
+"#,
+        )
+        .unwrap();
+
+        // SAFETY: test is single-threaded for this env var.
+        unsafe { env::set_var("BRAVE_API_KEY", "from-env") };
+        let cfg = AppConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.tools.brave_api_key, "from-env");
+        unsafe { env::remove_var("BRAVE_API_KEY") };
+    }
+
+    // ── Git config through TOML ────────────────────────────────────────────
+
+    #[test]
+    fn git_config_from_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("git.toml");
+        fs::write(
+            &path,
+            r#"
+[git]
+trusted_repos = ["https://github.com/example/repo"]
+trusted_write_paths = ["/tmp/safe"]
+allow_system_read = false
+"#,
+        )
+        .unwrap();
+
+        let cfg = AppConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.git.trusted_repos, vec!["https://github.com/example/repo"]);
+        assert_eq!(cfg.git.trusted_write_paths, vec!["/tmp/safe"]);
+        assert!(!cfg.git.allow_system_read);
+    }
+
+    // ── Memory config edge values ──────────────────────────────────────────
+
+    #[test]
+    fn memory_config_forgetfulness_defaults() {
+        let mem = MemoryConfig::default();
+        assert_eq!(mem.forget_episodic_after_days, 0); // disabled
+        assert!((mem.forget_min_confidence - 0.3).abs() < f32::EPSILON);
+        assert_eq!(mem.max_beliefs_in_prompt, 5);
+        assert_eq!(mem.proactive_cooldown_minutes, 5);
+    }
+}

@@ -21,3 +21,6 @@ aigent-exec = { path = "../exec" }
 aigent-llm = { path = "../llm" }
 aigent-memory = { path = "../memory" }
 aigent-tools = { path = "../tools" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -137,7 +137,6 @@ unsafe fn apply_linux() -> std::io::Result<()> {
 #[cfg(all(feature = "sandbox", target_os = "linux", target_arch = "x86_64"))]
 unsafe fn install_seccomp_allowlist() -> std::io::Result<()> {
     use std::io;
-    use std::mem;
 
     // BPF socket_filter instruction layout.
     #[repr(C)]
@@ -374,7 +373,11 @@ unsafe fn install_seccomp_allowlist() -> std::io::Result<()> {
         tracing::warn!("sandbox: seccomp syscall filter unavailable; no-new-privs still active");
     }
 
-    mem::forget(prog); // BPF program must outlive the syscall (it's consumed immediately)
+    // `prog` is safe to drop here: the seccomp(2) syscall synchronously
+    // copies the BPF program into kernel memory before returning, so the
+    // userspace Vec is no longer referenced.  Letting it drop normally
+    // avoids a (harmless-in-forked-child) heap leak.
+    drop(prog);
 
     Ok(())
 }
