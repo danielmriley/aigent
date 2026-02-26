@@ -34,6 +34,24 @@ impl MemoryTier {
             Self::Core => "Core",
         }
     }
+
+    /// Parse a tier from its label (case-insensitive).
+    ///
+    /// Accepts the canonical label names as well as common abbreviations
+    /// the LLM might produce (e.g. "user_profile", "user-profile").
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "episodic" => Some(Self::Episodic),
+            "semantic" => Some(Self::Semantic),
+            "procedural" => Some(Self::Procedural),
+            "reflective" => Some(Self::Reflective),
+            "userprofile" | "user_profile" | "user-profile" | "profile" => {
+                Some(Self::UserProfile)
+            }
+            "core" => Some(Self::Core),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

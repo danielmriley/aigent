@@ -225,6 +225,24 @@ pub struct AgenticSleepInsights {
     /// LLM-corrected valence scores for important memories.
     /// Format: `(id_short, valence ∈ [-1.0, 1.0])`.
     pub valence_corrections: Vec<(String, f32)>,
+
+    // ── Phase 2: LLM-driven promotions ─────────────────────────────────
+
+    /// Explicit promotions proposed by the LLM.
+    /// Format: `(entry_id_short, target_tier_label)`.
+    ///
+    /// The LLM reviews existing entries and decides which deserve promotion
+    /// to a higher tier, replacing the heuristic `distill()` scoring.
+    pub llm_promotions: Vec<(String, String)>,
+
+    // ── Phase 4: Free-form memory proposals ────────────────────────────
+
+    /// Arbitrary new memories the LLM wants to create.
+    /// Format: `(tier_label, content, comma_separated_tags)`.
+    ///
+    /// This gives the agent maximal creative freedom to form memories that
+    /// don't fit any predefined insight field.
+    pub free_memories: Vec<(String, String, String)>,
 }
 
 /// Build the agentic sleep reflection prompt.
@@ -378,9 +396,16 @@ RELATIONSHIP: <a milestone or recurring theme in your relationship with {user_na
 STYLE_UPDATE: <one sentence refining your communication style based on recent interaction patterns, or NONE>
 GOAL_ADD: <one new long-term goal to pursue based on patterns you noticed today, or NONE>
 VALENCE: <id_short :: score> (correct the emotional tone of one important memory to a value in [-1.0, 1.0]; use sparingly — only when the emotional significance was clearly wrong or missed, or NONE)
+PROMOTE: <id_short :: target_tier> (promote an existing entry to a higher tier: Semantic, Procedural, Reflective, UserProfile, or Core; use when an entry has proven its lasting value, or NONE)
+PROMOTE: <optionally promote additional entries, or omit>
+MEMORY: <tier :: content :: tags> (create any new memory that doesn't fit the fields above; tier is one of Episodic/Semantic/Procedural/Reflective/UserProfile/Core; tags are comma-separated labels like 'agent_belief,opinion' or 'user_fact,preference' or 'relationship,dynamic'; this is your creative freedom to form any memory you want, or NONE)
+MEMORY: <optionally create additional memories, or omit>
 
 Remember: you are {bot_name} — truth-seeking, proactive, deeply caring about {user_name}. \
-Only retire, rewrite, or consolidate core entries when clearly warranted; when in doubt, use NONE."
+Only retire, rewrite, or consolidate core entries when clearly warranted; when in doubt, use NONE. \
+Use PROMOTE to elevate entries that have proven their lasting value — you decide what matters, \
+not a heuristic. Use MEMORY freely to capture any insight, belief, pattern, or relationship \
+nuance that doesn't fit the structured fields above."
     )
 }
 
@@ -500,6 +525,35 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
                     }
                 }
             }
+        } else if let Some(rest) = strip_key(line, "PROMOTE:") {
+            if !is_none(rest) {
+                // Format: "id_short :: target_tier"
+                if let Some((id_part, tier_part)) = rest.split_once("::") {
+                    let id_short = id_part.trim().to_string();
+                    let tier_label = tier_part.trim().to_string();
+                    if !id_short.is_empty() && !tier_label.is_empty() {
+                        insights.llm_promotions.push((id_short, tier_label));
+                    }
+                }
+            }
+        } else if let Some(rest) = strip_key(line, "MEMORY:") {
+            if !is_none(rest) {
+                // Format: "tier :: content :: tags"
+                // Split on "::" — need at least tier and content; tags are optional.
+                let parts: Vec<&str> = rest.splitn(3, "::").collect();
+                if parts.len() >= 2 {
+                    let tier_label = parts[0].trim().to_string();
+                    let content = parts[1].trim().to_string();
+                    let tags = if parts.len() >= 3 {
+                        parts[2].trim().to_string()
+                    } else {
+                        String::new()
+                    };
+                    if !tier_label.is_empty() && !content.is_empty() {
+                        insights.free_memories.push((tier_label, content, tags));
+                    }
+                }
+            }
         }
     }
 
@@ -519,6 +573,8 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
         style_update = insights.communication_style_update.is_some(),
         goal_additions = insights.long_goal_additions.len(),
         valence_corrections = insights.valence_corrections.len(),
+        llm_promotions = insights.llm_promotions.len(),
+        free_memories = insights.free_memories.len(),
         "agentic sleep insights parsed"
     );
 

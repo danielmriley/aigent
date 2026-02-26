@@ -296,6 +296,21 @@ impl MemoryManager {
         content: String,
         source: String,
     ) -> Result<MemoryEntry> {
+        self.record_inner_tagged(tier, content, source, vec![]).await
+    }
+
+    /// Like [`record_inner`] but attaches semantic `tags` to the entry.
+    ///
+    /// Tags are persisted in the event log and used by
+    /// [`relational_state_block`] for classification instead of keyword
+    /// matching.  The LLM assigns tags during the agentic sleep cycle.
+    async fn record_inner_tagged(
+        &mut self,
+        tier: MemoryTier,
+        content: String,
+        source: String,
+        tags: Vec<String>,
+    ) -> Result<MemoryEntry> {
         let embedding = self.embed_fn.as_ref().and_then(|f| f(&content));
         let entry = MemoryEntry {
             id: Uuid::new_v4(),
@@ -306,7 +321,7 @@ impl MemoryManager {
             valence: 0.0,
             created_at: Utc::now(),
             provenance_hash: "local-dev-placeholder".to_string(),
-            tags: vec![],
+            tags,
             embedding,
         };
 
@@ -611,6 +626,14 @@ impl MemoryManager {
     ///   `[MY_BELIEFS: …]`  — agent's own opinions / worldview stances
     ///   `[OUR_DYNAMIC: …]` — relationship tone, shared history, inside jokes
     ///
+    /// **Routing priority** (highest → lowest):
+    ///   1. **Tag-based** — entries with semantic tags assigned by the LLM
+    ///      during the agentic sleep cycle are routed by tag name.
+    ///   2. **Source-based** — entries from known sources (critic, belief,
+    ///      psychologist, sleep:relationship) are routed by source string.
+    ///   3. **Content-based fallback** — legacy entries without tags are
+    ///      scanned for keywords (preserved for backward compatibility).
+    ///
     /// Returns `None` when all buckets are empty.
     pub fn relational_state_block(&self) -> Option<String> {
         let mut user_facts: Vec<String> = Vec::new();
@@ -621,7 +644,37 @@ impl MemoryManager {
         for entry in self.store.all().iter()
             .filter(|e| e.tier == MemoryTier::UserProfile || e.tier == MemoryTier::Reflective)
         {
-            // Source-based routing is zero-allocation (&str comparisons).
+            // ── Priority 1: Tag-based routing (LLM-assigned) ───────────
+            let has_belief_tag = entry.tags.iter().any(|t| {
+                t == "agent_belief" || t == "perspective" || t == "opinion"
+            });
+            let has_dynamic_tag = entry.tags.iter().any(|t| {
+                t == "relationship" || t == "dynamic"
+            });
+            let has_user_fact_tag = entry.tags.iter().any(|t| {
+                t == "user_fact" || t == "preference"
+            });
+
+            if has_belief_tag {
+                agent_beliefs.push(strip_tag_prefix_lower(
+                    &entry.content,
+                    &["belief:", "my_belief:", "opinion:"],
+                ));
+                continue;
+            }
+            if has_dynamic_tag {
+                relationship_dynamics.push(strip_tag_prefix_lower(
+                    &entry.content,
+                    &["dynamic:", "our_dynamic:", "relationship:"],
+                ));
+                continue;
+            }
+            if has_user_fact_tag {
+                user_facts.push(entry.content.clone());
+                continue;
+            }
+
+            // ── Priority 2: Source-based routing (zero-allocation) ─────
             let src = entry.source.as_str();
             let is_belief_src  = src.contains("critic")  || src.contains("belief");
             let is_dynamic_src = src.contains("psychologist") || src == "sleep:relationship";
@@ -637,10 +690,10 @@ impl MemoryManager {
                     &["dynamic:", "our_dynamic:", "relationship:"],
                 ));
             } else {
-                // Content-based fallback — zero-alloc case-insensitive scan.
-                // "think" and "shared" are intentionally excluded: both are too
-                // broad and produce false positives on ordinary user-fact entries
-                // ("User likes to think carefully", "User shared their name").
+                // ── Priority 3: Content keyword fallback (legacy) ──────
+                // "think" and "shared" are intentionally excluded: both are
+                // too broad and produce false positives on ordinary
+                // user-fact entries.
                 if contains_icase(&entry.content, "belief")
                     || contains_icase(&entry.content, "opinion")
                     || contains_icase(&entry.content, "feel about")
@@ -756,10 +809,12 @@ impl MemoryManager {
     /// then run the standard heuristic distillation on top.
     ///
     /// Pipeline:
-    ///   1. Persist each insight at the appropriate tier (no vault sync per record).
+    ///   1. Persist each insight at the appropriate tier with semantic tags.
     ///   2. Apply Core rewrites / consolidations / retirements.
-    ///   3. Run `run_sleep_cycle()` for heuristic distillation + vault sync.
-    ///   4. Return a `SleepSummary` that covers everything.
+    ///   3. Apply LLM-driven promotions (Phase 2).
+    ///   4. Apply free-form memories (Phase 4).
+    ///   5. Run `run_sleep_cycle()` for heuristic distillation + vault sync.
+    ///   6. Return a `SleepSummary` that covers everything.
     pub async fn apply_agentic_sleep_insights(
         &mut self,
         insights: AgenticSleepInsights,
@@ -767,43 +822,91 @@ impl MemoryManager {
     ) -> Result<SleepSummary> {
         let mut extra_ids: Vec<String> = Vec::new();
 
-        // learned_about_user → UserProfile
+        // learned_about_user → UserProfile (tagged)
         for fact in &insights.learned_about_user {
-            let e = self.record_inner(
+            let e = self.record_inner_tagged(
                 MemoryTier::UserProfile,
                 fact.clone(),
                 "sleep:learned-about-user".to_string(),
+                vec!["user_fact".to_string()],
             ).await?;
             extra_ids.push(e.id.to_string());
         }
 
-        // follow_ups → Reflective (source = "follow-up" so pending_follow_up_ids can find them)
+        // follow_ups → Reflective (tagged)
         for item in &insights.follow_ups {
-            let e = self.record_inner(
+            let e = self.record_inner_tagged(
                 MemoryTier::Reflective,
                 item.clone(),
                 "follow-up".to_string(),
+                vec!["follow_up".to_string()],
             ).await?;
             extra_ids.push(e.id.to_string());
         }
 
-        // reflective_thoughts → Reflective
+        // reflective_thoughts → Reflective (tagged)
         for thought in &insights.reflective_thoughts {
-            let e = self.record_inner(
+            let e = self.record_inner_tagged(
                 MemoryTier::Reflective,
                 thought.clone(),
                 "sleep:reflection".to_string(),
+                vec!["reflection".to_string()],
             ).await?;
             extra_ids.push(e.id.to_string());
         }
 
-        // relationship_milestones → Reflective (source = "sleep:relationship" routes to
-        // OUR_DYNAMIC bucket in relational_state_block via source-based detection)
+        // relationship_milestones → Reflective (tagged with relationship + dynamic)
         for milestone in &insights.relationship_milestones {
-            let e = self.record_inner(
+            let e = self.record_inner_tagged(
                 MemoryTier::Reflective,
                 milestone.clone(),
                 "sleep:relationship".to_string(),
+                vec!["relationship".to_string(), "dynamic".to_string()],
+            ).await?;
+            extra_ids.push(e.id.to_string());
+        }
+
+        // perspectives → Semantic (tagged with agent_belief + perspective)
+        for (topic, view) in &insights.perspectives {
+            let content = format!("{topic}: {view}");
+            let e = self.record_inner_tagged(
+                MemoryTier::Semantic,
+                content,
+                "sleep:perspective".to_string(),
+                vec!["agent_belief".to_string(), "perspective".to_string()],
+            ).await?;
+            extra_ids.push(e.id.to_string());
+        }
+
+        // contradictions → Semantic (tagged)
+        for contradiction in &insights.contradictions {
+            let e = self.record_inner_tagged(
+                MemoryTier::Semantic,
+                contradiction.clone(),
+                "sleep:contradiction".to_string(),
+                vec!["contradiction".to_string()],
+            ).await?;
+            extra_ids.push(e.id.to_string());
+        }
+
+        // tool_insights → Procedural (tagged)
+        for insight_text in &insights.tool_insights {
+            let e = self.record_inner_tagged(
+                MemoryTier::Procedural,
+                insight_text.clone(),
+                "sleep:tool-insight".to_string(),
+                vec!["tool_pattern".to_string()],
+            ).await?;
+            extra_ids.push(e.id.to_string());
+        }
+
+        // synthesis → Semantic (tagged)
+        for synth in &insights.synthesis {
+            let e = self.record_inner_tagged(
+                MemoryTier::Semantic,
+                synth.clone(),
+                "sleep:synthesis".to_string(),
+                vec!["synthesis".to_string()],
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -831,10 +934,11 @@ impl MemoryManager {
                 &self.event_log,
                 &[id_prefix.as_str()],
             ).await?;
-            let e = self.record_inner(
+            let e = self.record_inner_tagged(
                 MemoryTier::Core,
                 new_content.clone(),
                 "sleep:core-rewrite".to_string(),
+                vec!["core_rewrite".to_string()],
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -847,11 +951,84 @@ impl MemoryManager {
                 &self.event_log,
                 &prefixes,
             ).await?;
-            let e = self.record_inner(
+            let e = self.record_inner_tagged(
                 MemoryTier::Core,
                 synthesis.clone(),
                 "sleep:core-consolidation".to_string(),
+                vec!["core_consolidation".to_string()],
             ).await?;
+            extra_ids.push(e.id.to_string());
+        }
+
+        // ── Phase 2: LLM-driven promotions ─────────────────────────────────
+        //
+        // The LLM reviews existing entries and decides which deserve
+        // promotion to a higher tier, replacing the heuristic scoring.
+        for (id_prefix, tier_label) in &insights.llm_promotions {
+            let Some(target_tier) = MemoryTier::from_label(tier_label) else {
+                warn!(tier_label, id_prefix, "LLM promotion: unknown tier label — skipping");
+                continue;
+            };
+            // Find the entry by id_short prefix.
+            let source_entry = self.store.all().iter().find(|e| {
+                e.id.to_string().starts_with(id_prefix.as_str())
+            }).cloned();
+            let Some(entry) = source_entry else {
+                warn!(id_prefix, "LLM promotion: no entry matches id_short — skipping");
+                continue;
+            };
+            // Skip if already at the target tier (or higher).
+            if entry.tier == target_tier {
+                debug!(id_prefix, "LLM promotion: entry already at target tier — skipping");
+                continue;
+            }
+            // Record the promoted copy at the new tier with provenance.
+            let e = self.record_inner_tagged(
+                target_tier,
+                entry.content.clone(),
+                format!("sleep:llm-promoted-from-{:?}", entry.tier),
+                {
+                    let mut tags = entry.tags.clone();
+                    tags.push("llm_promoted".to_string());
+                    tags.dedup();
+                    tags
+                },
+            ).await?;
+            info!(
+                from_tier = ?entry.tier,
+                to_tier = ?target_tier,
+                id = %e.id,
+                "LLM-driven promotion applied"
+            );
+            extra_ids.push(e.id.to_string());
+        }
+
+        // ── Phase 4: Free-form memory proposals ────────────────────────────
+        //
+        // The LLM can create any memory it wants, specifying tier, content,
+        // and tags.  This gives maximal agency over memory formation.
+        for (tier_label, content, tags_csv) in &insights.free_memories {
+            let Some(tier) = MemoryTier::from_label(tier_label) else {
+                warn!(tier_label, "free memory: unknown tier label — skipping");
+                continue;
+            };
+            let tags: Vec<String> = tags_csv
+                .split(',')
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty())
+                .collect();
+            let e = self.record_inner_tagged(
+                tier,
+                content.clone(),
+                "sleep:free-memory".to_string(),
+                tags,
+            ).await?;
+            info!(
+                tier = ?tier,
+                id = %e.id,
+                tag_count = e.tags.len(),
+                "free-form memory recorded"
+            );
             extra_ids.push(e.id.to_string());
         }
 

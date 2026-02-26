@@ -424,6 +424,7 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
     let mut synthesis_seen: std::collections::HashSet<String> = Default::default();
     let mut relationship_seen: std::collections::HashSet<String> = Default::default();
     let mut long_goals_seen: std::collections::HashSet<String> = Default::default();
+    let mut free_memory_seen: std::collections::HashSet<String> = Default::default();
 
     // Accumulators for key-dedup maps (last value wins)
     let mut profile_map: HashMap<String, String> = HashMap::new();
@@ -434,6 +435,8 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
     // the same consolidation can be proposed by multiple batches.  Last synthesis
     // wins; this prevents duplicate consolidation from being applied twice.
     let mut consolidate_map: HashMap<String, String> = HashMap::new();
+    // llm_promotions dedup by id_short — last tier wins across batches.
+    let mut promotion_map: HashMap<String, String> = HashMap::new();
 
     for insight in insights {
         for s in insight.learned_about_user {
@@ -508,6 +511,18 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
             perspective_map.insert(topic, view);
         }
 
+        // llm_promotions: dedup by id_short — last tier wins
+        for (id, tier) in insight.llm_promotions {
+            promotion_map.insert(id, tier);
+        }
+
+        // free_memories: dedup by lowercase content
+        for mem in insight.free_memories {
+            if free_memory_seen.insert(mem.1.to_lowercase()) {
+                merged.free_memories.push(mem);
+            }
+        }
+
         // Scalars: keep last Some
         if insight.personality_reinforcement.is_some() {
             merged.personality_reinforcement = insight.personality_reinforcement;
@@ -522,6 +537,7 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
     merged.user_profile_updates = profile_map.into_iter().collect();
     merged.valence_corrections = valence_map.into_iter().collect();
     merged.perspectives = perspective_map.into_iter().collect();
+    merged.llm_promotions = promotion_map.into_iter().collect();
 
     merged
 }
@@ -623,9 +639,16 @@ PERSPECTIVE: <topic :: your developed view on it based on accumulated experience
 RELATIONSHIP: <a milestone or recurring theme in your relationship with {user_name}, or NONE>\n\
 STYLE_UPDATE: <one sentence refining your communication style based on recent interaction patterns, or NONE>\n\
 GOAL_ADD: <one new long-term goal to pursue based on patterns you noticed today, or NONE>\n\
-VALENCE: <id_short :: score> (correct the emotional tone of one important memory to a value in [-1.0, 1.0]; use sparingly — only when the emotional significance was clearly wrong or missed, or NONE)\n\n\
+VALENCE: <id_short :: score> (correct the emotional tone of one important memory to a value in [-1.0, 1.0]; use sparingly — only when the emotional significance was clearly wrong or missed, or NONE)\n\
+PROMOTE: <id_short :: target_tier> (promote an existing entry to a higher tier: Semantic, Procedural, Reflective, UserProfile, or Core; use when an entry has proven its lasting value, or NONE)\n\
+PROMOTE: <optionally promote additional entries, or omit>\n\
+MEMORY: <tier :: content :: tags> (create any new memory that doesn't fit the fields above; tier is one of Episodic/Semantic/Procedural/Reflective/UserProfile/Core; tags are comma-separated labels like 'agent_belief,opinion' or 'user_fact,preference' or 'relationship,dynamic'; this is your creative freedom to form any memory you want, or NONE)\n\
+MEMORY: <optionally create additional memories, or omit>\n\n\
 Remember: you are {bot_name} — truth-seeking, proactive, deeply caring about {user_name}. \
-Only retire, rewrite, or consolidate core entries when clearly warranted; when in doubt, use NONE."
+Only retire, rewrite, or consolidate core entries when clearly warranted; when in doubt, use NONE. \
+Use PROMOTE to elevate entries that have proven their lasting value — you decide what matters, \
+not a heuristic. Use MEMORY freely to capture any insight, belief, pattern, or relationship \
+nuance that doesn't fit the structured fields above."
     )
 }
 
