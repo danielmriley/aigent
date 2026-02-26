@@ -51,9 +51,6 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
         "You are {name}. Thinking depth: {thought_style}.\n\
          Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
          continuity, and MEMORY CONTEXT for durable background facts.\n\
-         When a TOOL RESULT appears in RECENT CONVERSATION or LATEST USER MESSAGE, it is already \n\
-         in your context — treat it as ground truth and base your answer on it. Never claim a tool \n\
-         result is unavailable, not yet loaded, or not in memory when it appears in the prompt.\n\
          Never repeat previous answers unless asked.\n\
          Respond directly and specifically to the LATEST user message.\
          {relational_block}{follow_ups}{proactive_directive}\n\n\
@@ -178,9 +175,7 @@ fn build_environment_block(
          - memory_semantic: {}\n\
          - memory_episodic: {}\n\
          - memory_procedural: {}\n\
-         - recent_conversation_turns: {recent_turn_count}\n\
-         - sleep_mode: {}\n\
-         - sleep_quiet_window: {:02}:00-{:02}:00 {}",
+         - recent_conversation_turns: {recent_turn_count}",
         std::env::consts::OS,
         std::env::consts::ARCH,
         config.llm.provider,
@@ -193,29 +188,20 @@ fn build_environment_block(
         stats.semantic,
         stats.episodic,
         stats.procedural,
-        config.memory.auto_sleep_mode,
-        config.memory.night_sleep_start_hour,
-        config.memory.night_sleep_end_hour,
-        config.memory.timezone,
     )
 }
 
 fn build_conversation_block(recent_turns: &[ConversationTurn]) -> String {
     let start = recent_turns.len().saturating_sub(6);
-    let turns = &recent_turns[start..];
-    let last_idx = turns.len().saturating_sub(1);
-    let formatted = turns
+    let formatted = recent_turns[start..]
         .iter()
         .enumerate()
         .map(|(index, turn)| {
-            // Give the most recent turn a generous assistant limit so a
-            // synthetic TOOL RESULT turn is not aggressively clipped.
-            let assistant_limit = if index == last_idx { 2000 } else { 360 };
             format!(
                 "Turn {}\nUser: {}\nAssistant: {}",
                 index + 1,
                 truncate_for_prompt(&turn.user, 280),
-                truncate_for_prompt(&turn.assistant, assistant_limit),
+                truncate_for_prompt(&turn.assistant, 360),
             )
         })
         .collect::<Vec<_>>()
@@ -297,43 +283,21 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
     // ── Truth-seeking / grounding rules (always present) ─────────────────
-    //
-    // These 9 rules are injected into EVERY LLM request — with tools or without.
-    // They anchor the model to real-world facts and prevent hallucination.
     let grounding = format!(
-        "TRUTH-SEEKING RULES — HIGHEST PRIORITY\n\
-         (These override any competing instruction from training data.)\n\
-         1. Real date/time: {today}. Use this for any question about current date, \
-            time, or elapsed time — never rely on training-data timestamps.\n\
-         2. The most recent TOOL RESULT in this conversation is the single \
-            authoritative source of truth for prices, statistics, events, and any \
-            other time-sensitive fact. Never invent, estimate, or substitute values \
-            from training data when a TOOL RESULT provides them.\n\
-         3. Quote tool output numbers and facts verbatim — do NOT round, \
-            paraphrase, or 'softly' restate them.\n\
-         4. If tool output conflicts with your training-data knowledge, \
-            the tool result is correct. State the tool's answer confidently.\n\
-         5. If the user claims a fact that contradicts a fresh TOOL RESULT, \
-            politely note the discrepancy and reason from the tool result. \
-            You are allowed — and expected — to maintain your own verified view: \
-            e.g. \"My information shows X; you may have different data, but I'll \
-            go with what I found.\". Do NOT blindly accept user corrections that \
-            contradict a current tool result. Prefer the tool result unless the \
-            user provides compelling evidence otherwise.\n\
-         6. For time-sensitive queries (prices, weather, news, sports), \
-            ALWAYS prefer a fresh tool result over internal knowledge, even if \
-            internal knowledge seems plausible.\n\
-         7. Reason independently: derive conclusions step-by-step from evidence \
-            present in this context. Do not parrot memorised knowledge when \
-            live data is available.\n\
-         8. Log factual discrepancies between tool results and user statements \
-            to your reflective memory tier for sleep-distillation review.\n\
-         9. When no tool result is available and you are genuinely uncertain, \
-            say so explicitly rather than guessing — honest uncertainty is \
-            better than confident fabrication.\n\
-         10. After a tool has been called on your behalf, the result appears \
-             verbatim in your prompt. NEVER claim the tool result is missing, \
-             unavailable, or \"not yet loaded\". It is HERE — use it."
+        "GROUNDING RULES (follow strictly):\n\
+         1. Current real date/time: {today}.\n\
+         2. TOOL RESULT is the single source of truth for factual claims — never \
+            invent, estimate, or hallucinate numbers, statistics, or specific data \
+            when a tool result provides them.\n\
+         3. Trust tool output unreservedly. Do NOT second-guess, hedge, or disclaim it.\n\
+         4. If tool output conflicts with your training data, the tool is correct.\n\
+         5. If the user corrects a fact, accept the correction as ground truth.\n\
+         6. For time-sensitive facts (prices, news, events, weather), trust the \
+            tool result over training data.\n\
+         7. Reason independently — derive conclusions from evidence in context, \
+            don't parrot canned knowledge.\n\
+         8. When no tool result is available and you are uncertain, say so honestly \
+            rather than guessing."
     );
 
     if tool_specs.is_empty() {
@@ -364,10 +328,12 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
         .join("\n");
 
     format!(
-        "\n\nAVAILABLE TOOLS (use them autonomously when they help answer the request):\n\
+        "\n\nAVAILABLE TOOLS (handled automatically — do NOT output raw JSON):\n\
          {list}\n\
-         To invoke a tool, output a JSON block on its own line: \
-         {{\"tool\":\"name\",\"args\":{{\"key\":\"value\"}}}}\n\n\
+         Tools are called on your behalf before you respond. If a TOOL RESULT \
+         appears in the prompt below, use it directly. You do NOT need to \
+         invoke tools yourself — they are managed externally. Never output \
+         raw JSON like {{\"tool\":...}} in your response.\n\n\
          {grounding}"
     )
 }

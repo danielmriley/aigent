@@ -708,7 +708,7 @@ async fn handle_connection(
                 let exec_result = {
                     let s = state.lock().await;
                     s.tool_executor
-                        .execute(&s.tool_registry, &call.tool, &call.args)
+                        .execute(&s.tool_registry, &call.tool, &call.stringify_args())
                         .await
                 };
 
@@ -800,8 +800,17 @@ async fn handle_connection(
                 std::borrow::Cow::Borrowed(&user)
             };
 
+            // When a tool was already executed, suppress the "AVAILABLE TOOLS"
+            // section from the streaming prompt.  Otherwise the LLM sees the
+            // tool-invocation instruction, ignores the injected TOOL RESULT,
+            // and emits raw JSON again instead of a final answer.
+            let effective_specs: &[aigent_tools::ToolSpec] = if tool_result_text.is_some() {
+                &[]  // tool already ran — LLM should just answer
+            } else {
+                &tool_specs
+            };
             let mut reply_result = rt_clone
-                .respond_and_remember_stream(&mut memory, &effective_user, &recent, last_turn_at, chunk_tx, &tool_specs)
+                .respond_and_remember_stream(&mut memory, &effective_user, &recent, last_turn_at, chunk_tx, effective_specs)
                 .await;
 
             // ── Fallback: post-stream tool detection ──────────────────────
@@ -833,7 +842,7 @@ async fn handle_connection(
                             let exec_result = {
                                 let s = state.lock().await;
                                 s.tool_executor
-                                    .execute(&s.tool_registry, &call.tool, &call.args)
+                                    .execute(&s.tool_registry, &call.tool, &call.stringify_args())
                                     .await
                             };
                             let (success, output) = match exec_result {

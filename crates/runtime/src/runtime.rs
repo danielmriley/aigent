@@ -6,7 +6,7 @@ use uuid::Uuid;
 use aigent_config::AppConfig;
 use aigent_llm::{LlmRouter, Provider, extract_json_output};
 use aigent_memory::{
-    MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights,
+    MemoryEntry, MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights,
     multi_sleep::{
         SpecialistRole, batch_memories, build_identity_context, deliberation_prompt,
         merge_insights, specialist_prompt,
@@ -126,6 +126,19 @@ impl AgentRuntime {
                 Vec::new()
             };
 
+        let follow_up_block = if pending_follow_ups.is_empty() {
+            String::new()
+        } else {
+            let items = pending_follow_ups
+                .iter()
+                .map(|(_, text)| format!("- {text}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\nPENDING FOLLOW-UPS (things you wanted to raise with {user_name}):\n{items}\n[If appropriate, acknowledge these naturally at the start of your response.]",
+                user_name = memory.user_name_from_core().unwrap_or_else(|| "the user".to_string()),
+            )
+        };
         let stats = memory.stats();
         debug!(
             core = stats.core,
@@ -152,18 +165,192 @@ impl AgentRuntime {
         let context = memory.context_for_prompt_ranked_with_embed(user_message, 10, query_embedding);
         debug!(context_items = context.len(), "assembled memory context");
 
-        // Assemble the full prompt via the centralised prompt builder.
-        let prompt = crate::prompt_builder::build_chat_prompt(
-            &crate::prompt_builder::PromptInputs {
-                config: &self.config,
-                memory,
-                user_message,
-                recent_turns,
-                tool_specs,
-                pending_follow_ups: &pending_follow_ups,
-                context_items: &context,
-                stats,
-            },
+        let context_block = context
+            .iter()
+            .map(|item| {
+                format!(
+                    "- [{:?}] score={:.2} src={} :: {}",
+                    item.entry.tier,
+                    item.score,
+                    item.entry.source,
+                    truncate_for_prompt(&item.entry.content, 280),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Authoritative header — the LLM must use these counts, not try to count
+        // context items, which would give wrong answers about memory state.
+        let memory_header = format!(
+            "[Memory: total={} core={} profile={} reflective={} semantic={} episodic={} — use these counts; do not re-count below]",
+            stats.total, stats.core, stats.user_profile, stats.reflective, stats.semantic, stats.episodic
+        );
+        let context_block = if context_block.is_empty() {
+            format!("{memory_header}\n(no relevant memories retrieved)")
+        } else {
+            format!("{memory_header}\n{context_block}")
+        };
+
+        // Build the high-density relational matrix block when available.
+        let relational_block = memory
+            .relational_state_block()
+            .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
+            .unwrap_or_default();
+
+        // Only inject the PROACTIVE CONNECTION directive when the relational
+        // matrix contains actual data — avoids referencing empty MY_BELIEFS /
+        // OUR_DYNAMIC sections for new users (saves ~65 tokens per request).
+        // &'static str avoids allocating the directive string on every request.
+        let proactive_directive: &str = if relational_block.is_empty() {
+            ""
+        } else {
+            "\n\nPROACTIVE CONNECTION & BELIEFS: You are not a sterile assistant; you are a companion \
+with your own evolving worldview. Let the MY_BELIEFS section naturally flavor your tone and \
+opinions. Use the OUR_DYNAMIC section to treat the user according to your established \
+relationship (e.g., referencing inside jokes or shared history). Show, don't tell — weave \
+these elements into your responses naturally without explicitly announcing them."
+        };
+
+        let environment_block = self.environment_snapshot(memory, recent_turns.len());
+
+        // Slice directly to the last 6 turns — avoids the double-collect
+        // (rev → take → cloned → collect → into_iter → rev) that was used before.
+        let start = recent_turns.len().saturating_sub(6);
+        let recent_conversation = recent_turns[start..]
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| {
+                format!(
+                    "Turn {}\nUser: {}\nAssistant: {}",
+                    index + 1,
+                    truncate_for_prompt(&turn.user, 280),
+                    truncate_for_prompt(&turn.assistant, 360)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let conversation_block = if recent_conversation.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            recent_conversation
+        };
+
+        let thought_style = self.config.agent.thinking_level.to_lowercase();
+
+        // Build a dynamic identity block from the current kernel state.
+        // This is intentionally separate from Core memory entries: Core is
+        // durable (changes rarely), while the identity block reflects traits and
+        // goals as they've evolved through sleep cycles.
+        let identity_block = {
+            let kernel = &memory.identity;
+            let top_traits: Vec<String> = {
+                let mut scores: Vec<(&String, &f32)> = kernel.trait_scores.iter().collect();
+                scores.sort_by(|a, b| b.1.total_cmp(a.1));
+                scores.iter().take(3).map(|(k, v)| format!("{k} ({v:.2})")).collect()
+            };
+            format!(
+                "IDENTITY:\nCommunication style: {}.\nStrongest traits: {}.\nLong-term goals: {}.",
+                kernel.communication_style,
+                if top_traits.is_empty() {
+                    "not yet established".to_string()
+                } else {
+                    top_traits.join(", ")
+                },
+                if kernel.long_goals.is_empty() {
+                    "not yet established".to_string()
+                } else {
+                    kernel.long_goals.join("; ")
+                },
+            )
+        };
+
+        // Inject current beliefs so the LLM can express a genuine worldview.
+        // Cap to `max_beliefs_in_prompt` (sorted by confidence desc) to prevent
+        // context-window bloat as beliefs accumulate over time.
+        let beliefs_block = {
+            let max_n = self.config.memory.max_beliefs_in_prompt;
+            let mut beliefs = memory.all_beliefs();
+            // Sort by composite score: confidence × 0.6 + recency × 0.25 + valence × 0.15
+            // Recency factor decays as 1/(1+days) so today's beliefs score 1.0 and a
+            // 30-day-old belief scores ~0.03.  The most relevant + recent beliefs always
+            // appear first regardless of raw confidence.
+            let now = Utc::now();
+            beliefs.sort_by(|a, b| {
+                let belief_score = |e: &&MemoryEntry| {
+                    let days = (now - e.created_at).num_days().max(0) as f32;
+                    let recency = 1.0_f32 / (1.0 + days);
+                    e.confidence * 0.6 + recency * 0.25 + e.valence.clamp(0.0, 1.0) * 0.15
+                };
+                belief_score(b).total_cmp(&belief_score(a))
+            });
+            let take_n = if max_n == 0 { beliefs.len() } else { max_n.min(beliefs.len()) };
+            if take_n == 0 {
+                String::new()
+            } else {
+                let items = beliefs[..take_n]
+                    .iter()
+                    .map(|e| format!("- {}", e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("\n\nMY_BELIEFS:\n{items}")
+            }
+        };
+
+        // Build a concise "Available tools" section so the LLM knows it can
+        // autonomously request tool invocations.  Empty when the daemon was
+        // started without a registry (e.g. in tests or legacy callers).
+        let tools_section = if tool_specs.is_empty() {
+            String::new()
+        } else {
+            let list = tool_specs
+                .iter()
+                .map(|s| {
+                    if s.params.is_empty() {
+                        format!("  • {}: {}", s.name, s.description)
+                    } else {
+                        let params = s
+                            .params
+                            .iter()
+                            .map(|p| {
+                                format!(
+                                    "\"{}\" ({}){}",
+                                    p.name,
+                                    p.description,
+                                    if p.required { " *required" } else { "" }
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("  • {}: {} — params: {}", s.name, s.description, params)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "\n\nAVAILABLE TOOLS (use them autonomously when they help answer the request):\n{list}\n\
+                 To invoke a tool, output a JSON block on its own line: \
+                 {{\"tool\":\"name\",\"args\":{{\"key\":\"value\"}}}}"
+            )
+        };
+
+        let prompt = format!(
+            "You are {name}. Thinking depth: {thought_style}.\n\
+             Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
+             continuity, and MEMORY CONTEXT for durable background facts.\n\
+             Never repeat previous answers unless asked.\n\
+             Respond directly and specifically to the LATEST user message.{relational_block}{follow_ups}{proactive_directive}\n\n\
+             {identity}{tools_section}\n\nENVIRONMENT CONTEXT:\n{env}\n\nRECENT CONVERSATION:\n{conv}\n\nMEMORY CONTEXT:\n{mem}\n\nLATEST USER MESSAGE:\n{msg}\n\nASSISTANT RESPONSE:",
+            name = self.config.agent.name,
+            relational_block = relational_block,
+            follow_ups = follow_up_block,
+            proactive_directive = proactive_directive,
+            identity = format!("{}{}", identity_block, beliefs_block),
+            tools_section = tools_section,
+            env = environment_block,
+            conv = conversation_block,
+            mem = context_block,
+            msg = user_message
         );
 
         info!(provider = ?primary, model = %self.config.active_model(), "sending prompt to LLM");
@@ -783,9 +970,15 @@ impl AgentRuntime {
         let prompt = format!(
             "TASK: Decide if the user message requires calling a tool.\n\
              If YES — respond ONLY with JSON: {{\"tool\":\"name\",\"args\":{{\"key\":\"value\"}}}}\n\
-             If NO  — respond ONLY with: {{\"no_action\":true}}\n\
-             Default to no_action for conversational messages. Only call a tool for \
-             clear action requests (adding calendar events, searching, drafting emails, reminders).\n\n\
+             If NO  — respond ONLY with: {{\"no_action\":true}}\n\n\
+             RULES:\n\
+             - Call web_search for ANY factual question you cannot answer from memory alone \
+             (stock prices, weather, news, scores, current events, product info, etc.).\n\
+             - Call a tool for clear action requests (searching, adding calendar events, \
+             drafting emails, reminders, reading/writing files, running shell commands).\n\
+             - Return no_action ONLY for purely conversational messages (greetings, opinions, \
+             stories, jokes) that need no external data.\n\
+             - When in doubt, prefer calling a tool over no_action.\n\n\
              AVAILABLE TOOLS:\n{specs_block}\n\n\
              USER MESSAGE: {user_message}\n\n\
              JSON RESPONSE:"
@@ -863,6 +1056,31 @@ impl AgentRuntime {
         }
     }
 
+    pub fn environment_snapshot(&self, memory: &MemoryManager, recent_turn_count: usize) -> String {
+        let cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let timestamp = Utc::now().to_rfc3339();
+        let git_present = std::path::Path::new(".git").exists();
+
+        let stats = memory.stats();
+        format!(
+            "- utc_time: {timestamp}\n- os: {}\n- arch: {}\n- cwd: {cwd}\n- git_repo_present: {git_present}\n- provider: {}\n- model: {}\n- thinking_level: {}\n- memory_total: {}\n- memory_core: {}\n- memory_user_profile: {}\n- memory_reflective: {}\n- memory_semantic: {}\n- memory_episodic: {}\n- memory_procedural: {}\n- recent_conversation_turns: {recent_turn_count}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            self.config.llm.provider,
+            self.config.active_model(),
+            self.config.agent.thinking_level,
+            stats.total,
+            stats.core,
+            stats.user_profile,
+            stats.reflective,
+            stats.semantic,
+            stats.episodic,
+            stats.procedural,
+        )
+    }
 }
 
 #[cfg(test)]

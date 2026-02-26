@@ -66,6 +66,33 @@ pub struct LlmToolCall {
     /// Name of the tool to invoke (must match a `ToolSpec::name` in the registry).
     pub tool: String,
     /// Key-value arguments to pass to the tool.
+    ///
+    /// Values are `serde_json::Value` because the LLM may emit integers,
+    /// booleans, or strings depending on the parameter type.  Use
+    /// [`stringify_args`] to coerce them to the `HashMap<String, String>`
+    /// that [`ToolExecutor::execute`] expects.
     #[serde(default)]
-    pub args: HashMap<String, String>,
+    pub args: HashMap<String, serde_json::Value>,
+}
+
+impl LlmToolCall {
+    /// Coerce all argument values to strings for passing to the tool executor.
+    ///
+    /// Integers become `"5"`, booleans become `"true"`, strings stay as-is,
+    /// and other JSON types are serialized to their compact JSON representation.
+    pub fn stringify_args(&self) -> HashMap<String, String> {
+        self.args
+            .iter()
+            .map(|(k, v)| {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    serde_json::Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                (k.clone(), s)
+            })
+            .collect()
+    }
 }
