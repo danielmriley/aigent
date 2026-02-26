@@ -99,8 +99,16 @@ pub async fn git_auto_commit(workspace_root: &Path, tool_name: &str, detail: &st
         return Ok(()); // nothing to commit
     }
 
-    // Truncate the detail to keep commit messages readable.
-    let detail_short = &detail[..detail.len().min(72)];
+    // Truncate the detail to keep commit messages readable (UTF-8 safe).
+    let max_detail = 72;
+    let detail_end = if detail.len() > max_detail {
+        let mut end = max_detail;
+        while end > 0 && !detail.is_char_boundary(end) { end -= 1; }
+        end
+    } else {
+        detail.len()
+    };
+    let detail_short = &detail[..detail_end];
     let msg = format!("Aigent tool: {tool_name} — {detail_short}");
 
     let commit = tokio::process::Command::new("git")

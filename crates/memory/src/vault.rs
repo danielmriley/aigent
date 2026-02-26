@@ -193,6 +193,8 @@ fn write_root_index(
         MemoryTier::Semantic,
         MemoryTier::Episodic,
         MemoryTier::Procedural,
+        MemoryTier::Reflective,
+        MemoryTier::UserProfile,
     ] {
         let slug = tier_slug(tier);
         let count = tier_links.get(slug).map(|items| items.len()).unwrap_or(0);
@@ -221,6 +223,8 @@ fn write_tier_indexes(tiers_dir: &Path, tier_links: &BTreeMap<String, Vec<String
         MemoryTier::Semantic,
         MemoryTier::Episodic,
         MemoryTier::Procedural,
+        MemoryTier::Reflective,
+        MemoryTier::UserProfile,
     ] {
         let slug = tier_slug(tier);
         let mut content = format!("# {} Memories\n\n", slug.to_uppercase());
@@ -509,10 +513,9 @@ fn build_narrative_md(
 
 fn first_line_truncated(s: &str, max: usize) -> String {
     let first = s.lines().next().unwrap_or(s);
-    if first.len() > max {
-        format!("{}\u{2026}", &first[..max])
-    } else {
-        first.to_string()
+    match first.char_indices().nth(max) {
+        Some((byte_idx, _)) => format!("{}\u{2026}", &first[..byte_idx]),
+        None => first.to_string(),
     }
 }
 

@@ -6,6 +6,21 @@ use async_trait::async_trait;
 
 use crate::{Tool, ToolOutput, ToolParam, ToolSpec};
 
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+/// Find the largest byte offset ≤ `max` that falls on a UTF-8 character
+/// boundary.  Safe to use as `&s[..truncate_byte_boundary(s, max)]`.
+fn truncate_byte_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
 // ── read_file ────────────────────────────────────────────────────────────────
 
 pub struct ReadFileTool {
@@ -58,7 +73,8 @@ impl Tool for ReadFileTool {
 
         let content = std::fs::read_to_string(&canonical)?;
         let truncated = if content.len() > max_bytes {
-            format!("{}…[truncated at {} bytes]", &content[..max_bytes], max_bytes)
+            let end = truncate_byte_boundary(&content, max_bytes);
+            format!("{}…[truncated at {} bytes]", &content[..end], max_bytes)
         } else {
             content
         };
@@ -512,7 +528,12 @@ async fn fetch_page_excerpt(
 
     // Limit download to 256 KB to avoid pulling huge pages.
     let body = resp.text().await.ok()?;
-    let body = if body.len() > 256_000 { &body[..256_000] } else { &body };
+    let body = if body.len() > 256_000 {
+        let end = truncate_byte_boundary(&body, 256_000);
+        &body[..end]
+    } else {
+        &body
+    };
 
     Some(html_to_text(body, max_chars))
 }
@@ -526,31 +547,28 @@ fn html_to_text(html: &str, max_chars: usize) -> String {
     // Remove script/style/nav/header/footer blocks (case-insensitive via lowering the tag scan).
     let mut cleaned = String::with_capacity(html.len());
     let mut skip_depth: usize = 0;
-    let mut i = 0;
-    let bytes = html.as_bytes();
-    let len = bytes.len();
+    let mut chars = html.chars().peekable();
 
-    while i < len {
-        if bytes[i] == b'<' {
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
             // Peek at the tag name.
-            let tag_start = i;
-            i += 1;
-            let is_close = i < len && bytes[i] == b'/';
-            if is_close { i += 1; }
+            let mut tag_chars = Vec::new();
+            let is_close = chars.peek() == Some(&'/');
+            if is_close { chars.next(); }
 
-            let name_start = i;
-            while i < len && bytes[i] != b'>' && bytes[i] != b' ' && bytes[i] != b'/' {
-                i += 1;
+            // Collect tag name chars until '>', ' ', or '/'
+            while let Some(&c) = chars.peek() {
+                if c == '>' || c == ' ' || c == '/' { break; }
+                tag_chars.push(c);
+                chars.next();
             }
-            let tag_name = std::str::from_utf8(&bytes[name_start..i])
-                .unwrap_or("")
-                .to_ascii_lowercase();
+            let tag_name: String = tag_chars.into_iter().collect::<String>().to_ascii_lowercase();
 
             // Skip to end of tag.
-            while i < len && bytes[i] != b'>' {
-                i += 1;
+            while let Some(&c) = chars.peek() {
+                if c == '>' { chars.next(); break; }
+                chars.next();
             }
-            if i < len { i += 1; } // skip '>'
 
             let strip_tags = ["script", "style", "nav", "header", "footer", "noscript", "svg"];
             if strip_tags.contains(&tag_name.as_str()) {
@@ -574,12 +592,10 @@ fn html_to_text(html: &str, max_chars: usize) -> String {
             }
 
             // Drop the tag itself (no output).
-            let _ = tag_start; // consumed
         } else {
             if skip_depth == 0 {
-                cleaned.push(bytes[i] as char);
+                cleaned.push(ch);
             }
-            i += 1;
         }
     }
 
@@ -622,8 +638,9 @@ fn html_to_text(html: &str, max_chars: usize) -> String {
 
     let trimmed = result.trim().to_string();
     if trimmed.len() > max_chars {
-        // Truncate to a word boundary.
-        let end = trimmed[..max_chars].rfind(' ').unwrap_or(max_chars);
+        // Truncate to a word boundary (safely, respecting char boundaries).
+        let safe_end = truncate_byte_boundary(&trimmed, max_chars);
+        let end = trimmed[..safe_end].rfind(' ').unwrap_or(safe_end);
         format!("{}…", &trimmed[..end])
     } else {
         trimmed
@@ -832,45 +849,132 @@ impl Tool for GitRollbackTool {
 mod tests {
     use super::*;
 
+    // ── truncate_byte_boundary ──────────────────────────────────────────────
+
     #[test]
-    fn html_to_text_strips_tags() {
-        let html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
-        let text = html_to_text(html, 200);
-        assert!(text.contains("Title"));
-        assert!(text.contains("Hello"));
-        assert!(text.contains("world"));
-        assert!(!text.contains("<h1>"));
-        assert!(!text.contains("<b>"));
+    fn truncate_within_ascii() {
+        assert_eq!(truncate_byte_boundary("abcdef", 3), 3);
     }
 
     #[test]
-    fn html_to_text_strips_scripts() {
-        let html = "<p>Before</p><script>var x = 1;</script><p>After</p>";
-        let text = html_to_text(html, 200);
-        assert!(text.contains("Before"));
-        assert!(text.contains("After"));
-        assert!(!text.contains("var x"));
+    fn truncate_beyond_string_len() {
+        assert_eq!(truncate_byte_boundary("abc", 100), 3);
     }
 
     #[test]
-    fn html_to_text_decodes_entities() {
-        let html = "<p>A &amp; B &lt; C &gt; D</p>";
-        let text = html_to_text(html, 200);
-        assert!(text.contains("A & B < C > D"));
+    fn truncate_at_zero() {
+        assert_eq!(truncate_byte_boundary("anything", 0), 0);
     }
 
     #[test]
-    fn html_to_text_respects_max_chars() {
-        let html = "<p>".to_string() + &"a".repeat(5000) + "</p>";
-        let text = html_to_text(&html, 100);
-        assert!(text.len() <= 110); // small tolerance for trailing ellipsis
+    fn truncate_multibyte_char_boundary() {
+        // "café" = c(1) a(1) f(1) é(2) = 5 bytes
+        let s = "café";
+        // max=4 lands inside the 2-byte é; should back up to 3.
+        assert_eq!(truncate_byte_boundary(s, 4), 3);
+        // max=5 lands at end.
+        assert_eq!(truncate_byte_boundary(s, 5), 5);
     }
 
     #[test]
-    fn html_to_text_collapses_whitespace() {
-        let html = "<p>  lots   of    spaces  </p>";
-        let text = html_to_text(html, 200);
-        // Should not have runs of multiple spaces.
-        assert!(!text.contains("  "));
+    fn truncate_emoji_boundary() {
+        // "hi🎉" = h(1) i(1) 🎉(4) = 6 bytes
+        let s = "hi🎉";
+        for mid in 3..6 {
+            // All should back up to byte 2 (after 'i').
+            assert_eq!(truncate_byte_boundary(s, mid), 2, "mid={mid}");
+        }
+        assert_eq!(truncate_byte_boundary(s, 6), 6);
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_byte_boundary("", 10), 0);
+    }
+
+    // ── html_to_text ────────────────────────────────────────────────────────
+
+    #[test]
+    fn html_strips_tags() {
+        let out = html_to_text("<p>hello</p>", 1000);
+        assert!(out.contains("hello"), "got: {out}");
+        assert!(!out.contains("<p>"));
+    }
+
+    #[test]
+    fn html_strips_script_blocks() {
+        let out = html_to_text(
+            "<p>before</p><script>alert('xss');</script><p>after</p>",
+            1000,
+        );
+        assert!(out.contains("before"));
+        assert!(out.contains("after"));
+        assert!(!out.contains("alert"));
+    }
+
+    #[test]
+    fn html_strips_style_blocks() {
+        let out = html_to_text(
+            "<style>body{color:red}</style><p>text</p>",
+            1000,
+        );
+        assert!(out.contains("text"));
+        assert!(!out.contains("color:red"));
+    }
+
+    #[test]
+    fn html_decodes_entities() {
+        let out = html_to_text("&amp; &lt; &gt; &quot; &#39; &nbsp;", 1000);
+        assert!(out.contains("&"), "got: {out}");
+        assert!(out.contains("<"), "got: {out}");
+        assert!(out.contains(">"), "got: {out}");
+    }
+
+    #[test]
+    fn html_collapses_whitespace() {
+        let out = html_to_text("<p>  lots   of   spaces  </p>", 1000);
+        // Should not contain runs of multiple spaces.
+        assert!(!out.contains("  "), "got: {out}");
+    }
+
+    #[test]
+    fn html_respects_max_chars() {
+        let big = "<p>".to_owned() + &"a".repeat(500) + "</p>";
+        let out = html_to_text(&big, 100);
+        // Output should be ≤ 100 chars + trailing ellipsis.
+        assert!(out.len() <= 104, "len={}: {}", out.len(), out);
+    }
+
+    #[test]
+    fn html_handles_non_ascii_content() {
+        let out = html_to_text("<p>café résumé naïve</p>", 1000);
+        assert!(out.contains("café"), "got: {out}");
+        assert!(out.contains("résumé"), "got: {out}");
+        assert!(out.contains("naïve"), "got: {out}");
+    }
+
+    #[test]
+    fn html_handles_cjk_content() {
+        let out = html_to_text("<div>日本語テスト</div>", 1000);
+        assert!(out.contains("日本語テスト"), "got: {out}");
+    }
+
+    #[test]
+    fn html_handles_emoji_content() {
+        let out = html_to_text("<p>hello 🌍🎉</p>", 1000);
+        assert!(out.contains("🌍"), "got: {out}");
+        assert!(out.contains("🎉"), "got: {out}");
+    }
+
+    #[test]
+    fn html_empty_input() {
+        let out = html_to_text("", 1000);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn html_plain_text_passthrough() {
+        let out = html_to_text("just plain text", 1000);
+        assert_eq!(out, "just plain text");
     }
 }

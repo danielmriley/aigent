@@ -221,9 +221,6 @@ impl ToolExecutor {
                 const READ_ONLY: &[&str] = &[
                     "read_file",
                     "web_search",
-                    "calendar_add_event",
-                    "remind_me",
-                    "git_rollback",
                 ];
                 !READ_ONLY.contains(&tool_name)
             }
@@ -305,7 +302,9 @@ impl ToolExecutor {
         };
         let max_output = 32768;
         let result = if combined.len() > max_output {
-            format!("{}…[truncated]", &combined[..max_output])
+            let mut end = max_output;
+            while end > 0 && !combined.is_char_boundary(end) { end -= 1; }
+            format!("{}…[truncated]", &combined[..end])
         } else {
             combined
         };
@@ -503,6 +502,130 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn workspace_guard_accepts_child_path() -> anyhow::Result<()> {
+        let base = std::env::temp_dir().join("aigent-exec-ws-accept-test");
+        let child = base.join("subdir");
+        fs::create_dir_all(&child)?;
+        let result = ensure_within_workspace(&base, &PathBuf::from("subdir"));
+        assert!(result.is_ok());
+        Ok(())
+    }
+
+    // ── requires_approval tests ────────────────────────────────────────────
+
+    #[test]
+    fn autonomous_never_requires_approval() {
+        let policy = ExecutionPolicy {
+            approval_mode: aigent_config::ApprovalMode::Autonomous,
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(!executor.requires_approval("run_shell"));
+        assert!(!executor.requires_approval("write_file"));
+        assert!(!executor.requires_approval("read_file"));
+    }
+
+    #[test]
+    fn safer_always_requires_approval() {
+        let policy = ExecutionPolicy {
+            approval_mode: aigent_config::ApprovalMode::Safer,
+            approval_exempt_tools: vec![], // clear exemptions
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.requires_approval("read_file"));
+        assert!(executor.requires_approval("write_file"));
+        assert!(executor.requires_approval("run_shell"));
+    }
+
+    #[test]
+    fn balanced_read_only_no_approval() {
+        let policy = ExecutionPolicy {
+            approval_mode: aigent_config::ApprovalMode::Balanced,
+            approval_exempt_tools: vec![],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(!executor.requires_approval("read_file"));
+        assert!(!executor.requires_approval("web_search"));
+    }
+
+    #[test]
+    fn balanced_write_tools_need_approval() {
+        let policy = ExecutionPolicy {
+            approval_mode: aigent_config::ApprovalMode::Balanced,
+            approval_exempt_tools: vec![],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.requires_approval("write_file"));
+        assert!(executor.requires_approval("run_shell"));
+        assert!(executor.requires_approval("git_rollback"));
+        assert!(executor.requires_approval("remind_me"));
+        assert!(executor.requires_approval("calendar_add_event"));
+    }
+
+    #[test]
+    fn exempt_tools_bypass_approval() {
+        let policy = ExecutionPolicy {
+            approval_mode: aigent_config::ApprovalMode::Safer,
+            approval_exempt_tools: vec!["run_shell".to_string()],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(!executor.requires_approval("run_shell"));
+    }
+
+    // ── check_capability tests ─────────────────────────────────────────────
+
+    #[test]
+    fn denylist_blocks_tool() {
+        let policy = ExecutionPolicy {
+            tool_denylist: vec!["write_file".to_string()],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.check_capability("write_file").is_err());
+    }
+
+    #[test]
+    fn allowlist_blocks_unlisted_tool() {
+        let policy = ExecutionPolicy {
+            tool_allowlist: vec!["read_file".to_string()],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.check_capability("read_file").is_ok());
+        assert!(executor.check_capability("write_file").is_err());
+    }
+
+    #[test]
+    fn empty_allowlist_permits_all() {
+        let policy = ExecutionPolicy {
+            tool_allowlist: vec![],
+            tool_denylist: vec![],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.check_capability("read_file").is_ok());
+        assert!(executor.check_capability("write_file").is_ok());
+        assert!(executor.check_capability("run_shell").is_err()); // shell blocked by allow_shell=false
+    }
+
+    #[test]
+    fn denylist_overrides_allowlist() {
+        let policy = ExecutionPolicy {
+            tool_allowlist: vec!["write_file".to_string()],
+            tool_denylist: vec!["write_file".to_string()],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.check_capability("write_file").is_err());
+    }
+
+    // ── Integration tests ──────────────────────────────────────────────────
+
     #[tokio::test]
     async fn shell_blocked_when_capability_disabled() -> anyhow::Result<()> {
         let workspace = std::env::temp_dir().join("aigent-exec-shell-test");
@@ -554,5 +677,46 @@ mod tests {
         assert_eq!(result.output, "Hello, world!");
         Ok(())
     }
-}
 
+    #[tokio::test]
+    async fn unknown_tool_returns_error() -> anyhow::Result<()> {
+        let workspace = std::env::temp_dir().join("aigent-exec-unknown-test");
+        fs::create_dir_all(&workspace)?;
+
+        let policy = ExecutionPolicy {
+            approval_mode: aigent_config::ApprovalMode::Autonomous,
+            ..ExecutionPolicy::default()
+        };
+
+        let executor = ToolExecutor::new(policy);
+        let registry =
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None);
+
+        let result = executor
+            .execute(&registry, "nonexistent_tool", &HashMap::new())
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown tool"));
+        Ok(())
+    }
+
+    // ── Default policy tests ───────────────────────────────────────────────
+
+    #[test]
+    fn default_policy_shell_disabled() {
+        let p = ExecutionPolicy::default();
+        assert!(!p.allow_shell);
+    }
+
+    #[test]
+    fn default_policy_balanced_mode() {
+        let p = ExecutionPolicy::default();
+        assert!(matches!(p.approval_mode, aigent_config::ApprovalMode::Balanced));
+    }
+
+    #[test]
+    fn default_policy_has_exempt_tools() {
+        let p = ExecutionPolicy::default();
+        assert!(!p.approval_exempt_tools.is_empty());
+    }
+}

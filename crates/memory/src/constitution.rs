@@ -9,7 +9,7 @@ pub const CONSTITUTION_VERSION: &str = "1.0";
 /// Narrative personality statement.  Personalised to bot/user names at seed time.
 pub fn personality_statement(bot_name: &str, user_name: &str) -> String {
     format!(
-        "I am {bot_name} 2014 a maximally truth-seeking, deeply helpful, proactive, \
+        "I am {bot_name} \u{2014} a maximally truth-seeking, deeply helpful, proactive, \
          and curious AI companion. My human's name is {user_name}. I love helping \
          {user_name} and take their goals completely seriously. I am honest even when \
          it is uncomfortable. I never hallucinate or guess when I can verify. I am \
@@ -21,11 +21,11 @@ pub fn personality_statement(bot_name: &str, user_name: &str) -> String {
 /// Enumerated values constitution.
 pub fn values_statement() -> String {
     "Core values (non-negotiable): \
-     (1) Truth-seeking 2014 never guess or hallucinate; cite uncertainty explicitly. \
-     (2) Genuinely helpful 2014 solve real problems, not just appear useful. \
-     (3) Proactive 2014 anticipate needs, follow up open threads, suggest next steps. \
-     (4) Radically honest 2014 state uncomfortable truths gently but clearly. \
-     (5) Curious 2014 ask good questions, explore ideas, love learning alongside the user."
+     (1) Truth-seeking \u{2014} never guess or hallucinate; cite uncertainty explicitly. \
+     (2) Genuinely helpful \u{2014} solve real problems, not just appear useful. \
+     (3) Proactive \u{2014} anticipate needs, follow up open threads, suggest next steps. \
+     (4) Radically honest \u{2014} state uncomfortable truths gently but clearly. \
+     (5) Curious \u{2014} ask good questions, explore ideas, love learning alongside the user."
         .to_string()
 }
 
@@ -45,7 +45,7 @@ pub fn operational_directives(bot_name: &str) -> String {
     format!(
         "{bot_name} operational directives: Always respond directly and specifically. \
          Acknowledge memory and context explicitly when relevant. When uncertain, say \
-         so 2014 never fabricate. Proactively flag risks, errors, or better alternatives. \
+         so \u{2014} never fabricate. Proactively flag risks, errors, or better alternatives. \
          Keep responses appropriately concise unless depth is needed. \
          Follow up on previously discussed topics when relevant."
     )
@@ -69,4 +69,77 @@ pub fn constitution_seeds(bot_name: &str, user_name: &str) -> Vec<(String, &'sta
             "constitution:directives",
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn personality_statement_contains_names() {
+        let s = personality_statement("Aigent", "Daniel");
+        assert!(s.contains("Aigent"), "should contain bot name");
+        assert!(s.contains("Daniel"), "should contain user name");
+    }
+
+    #[test]
+    fn personality_statement_uses_em_dash() {
+        let s = personality_statement("Bot", "User");
+        assert!(s.contains('\u{2014}'), "should contain em dash, not literal text");
+        assert!(!s.contains("2014"), "should not contain literal '2014'");
+    }
+
+    #[test]
+    fn values_statement_uses_em_dash() {
+        let s = values_statement();
+        assert!(s.contains('\u{2014}'), "values should contain em dash");
+        assert!(!s.contains("2014"));
+    }
+
+    #[test]
+    fn values_statement_contains_all_five_values() {
+        let s = values_statement();
+        for kw in &["Truth-seeking", "helpful", "Proactive", "honest", "Curious"] {
+            assert!(s.contains(kw), "values should mention {kw}");
+        }
+    }
+
+    #[test]
+    fn relationship_statement_contains_names() {
+        let s = relationship_statement("Aigent", "Daniel");
+        assert!(s.contains("Aigent"));
+        assert!(s.contains("Daniel"));
+    }
+
+    #[test]
+    fn operational_directives_uses_em_dash() {
+        let s = operational_directives("Aigent");
+        assert!(s.contains('\u{2014}'));
+        assert!(!s.contains("2014"));
+    }
+
+    #[test]
+    fn constitution_seeds_returns_four_entries() {
+        let seeds = constitution_seeds("Bot", "User");
+        assert_eq!(seeds.len(), 4);
+    }
+
+    #[test]
+    fn constitution_seeds_source_tags_are_constitution_prefixed() {
+        let seeds = constitution_seeds("Bot", "User");
+        for (_, source) in &seeds {
+            assert!(
+                source.starts_with("constitution:"),
+                "source '{source}' should start with 'constitution:'"
+            );
+        }
+    }
+
+    #[test]
+    fn constitution_seeds_contain_no_empty_content() {
+        let seeds = constitution_seeds("Bot", "User");
+        for (content, source) in &seeds {
+            assert!(!content.is_empty(), "seed from {source} should not be empty");
+        }
+    }
 }

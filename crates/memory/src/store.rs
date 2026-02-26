@@ -94,3 +94,140 @@ impl MemoryStore {
         false
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use super::MemoryStore;
+    use crate::schema::{MemoryEntry, MemoryTier};
+
+    fn make_entry(tier: MemoryTier, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: Uuid::new_v4(),
+            tier,
+            content: content.to_string(),
+            source: "test".to_string(),
+            confidence: 0.8,
+            valence: 0.0,
+            created_at: Utc::now(),
+            provenance_hash: "test-hash".to_string(),
+            tags: vec![],
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn insert_and_retrieve() {
+        let mut store = MemoryStore::default();
+        let entry = make_entry(MemoryTier::Episodic, "hello");
+        let id = entry.id;
+        assert!(store.insert(entry));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(id).unwrap().content, "hello");
+    }
+
+    #[test]
+    fn insert_deduplicates_by_id() {
+        let mut store = MemoryStore::default();
+        let entry = make_entry(MemoryTier::Episodic, "hello");
+        let dup = entry.clone();
+        assert!(store.insert(entry));
+        assert!(!store.insert(dup));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn remove_deletes_and_updates_index() {
+        let mut store = MemoryStore::default();
+        let e1 = make_entry(MemoryTier::Episodic, "first");
+        let e2 = make_entry(MemoryTier::Core, "second");
+        let id1 = e1.id;
+        let id2 = e2.id;
+        store.insert(e1);
+        store.insert(e2);
+        assert_eq!(store.len(), 2);
+        assert!(store.remove(id1));
+        assert_eq!(store.len(), 1);
+        assert!(store.get(id1).is_none());
+        assert_eq!(store.get(id2).unwrap().content, "second");
+    }
+
+    #[test]
+    fn remove_nonexistent_returns_false() {
+        let mut store = MemoryStore::default();
+        assert!(!store.remove(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn retain_filters_and_rebuilds_index() {
+        let mut store = MemoryStore::default();
+        let e1 = make_entry(MemoryTier::Episodic, "ephemeral");
+        let e2 = make_entry(MemoryTier::Core, "keep");
+        let id2 = e2.id;
+        store.insert(e1);
+        store.insert(e2);
+        let removed = store.retain(|e| e.tier == MemoryTier::Core);
+        assert_eq!(removed, 1);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get(id2).unwrap().content, "keep");
+    }
+
+    #[test]
+    fn clear_empties_everything() {
+        let mut store = MemoryStore::default();
+        store.insert(make_entry(MemoryTier::Episodic, "a"));
+        store.insert(make_entry(MemoryTier::Core, "b"));
+        store.clear();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+    }
+
+    #[test]
+    fn update_valence_by_id_short() {
+        let mut store = MemoryStore::default();
+        let entry = make_entry(MemoryTier::Episodic, "test");
+        let id_str = entry.id.to_string();
+        let short = &id_str[..8];
+        store.insert(entry);
+        assert!(store.update_valence_by_id_short(short, 0.75));
+        assert_eq!(store.all()[0].valence, 0.75);
+    }
+
+    #[test]
+    fn update_valence_clamps_to_range() {
+        let mut store = MemoryStore::default();
+        let entry = make_entry(MemoryTier::Episodic, "test");
+        let id_str = entry.id.to_string();
+        let short = &id_str[..8];
+        store.insert(entry);
+        store.update_valence_by_id_short(short, 5.0);
+        assert_eq!(store.all()[0].valence, 1.0);
+        store.update_valence_by_id_short(short, -3.0);
+        assert_eq!(store.all()[0].valence, -1.0);
+    }
+
+    #[test]
+    fn update_valence_returns_false_for_missing() {
+        let mut store = MemoryStore::default();
+        assert!(!store.update_valence_by_id_short("nonexistent", 0.5));
+    }
+
+    #[test]
+    fn get_after_multiple_removes_has_correct_indices() {
+        let mut store = MemoryStore::default();
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let e = make_entry(MemoryTier::Episodic, &format!("entry-{i}"));
+            ids.push(e.id);
+            store.insert(e);
+        }
+        store.remove(ids[1]);
+        store.remove(ids[3]);
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.get(ids[0]).unwrap().content, "entry-0");
+        assert_eq!(store.get(ids[2]).unwrap().content, "entry-2");
+        assert_eq!(store.get(ids[4]).unwrap().content, "entry-4");
+    }
+}

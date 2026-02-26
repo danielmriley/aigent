@@ -444,39 +444,23 @@ impl MemoryManager {
     /// Record a belief as a Core entry with `source = "belief"` and
     /// `tags = ["belief"]`.  Stored in the event log so it survives restarts
     /// and is excluded from sleep-cycle pruning.
+    ///
+    /// Routes through [`record_inner_tagged`] so beliefs are subject to the
+    /// same consistency firewall as all other Core entries.
     pub async fn record_belief(
         &mut self,
         claim: impl Into<String>,
         confidence: f32,
     ) -> Result<MemoryEntry> {
         let claim: String = claim.into();
-        let embedding = self.embed_fn.as_ref().and_then(|f| f(&claim));
-        let entry = MemoryEntry {
-            id: Uuid::new_v4(),
-            tier: MemoryTier::Core,
-            content: claim.clone(),
-            source: "belief".to_string(),
-            confidence: confidence.clamp(0.0, 1.0),
-            valence: 0.0,
-            created_at: Utc::now(),
-            provenance_hash: "local-dev-placeholder".to_string(),
-            tags: vec!["belief".to_string()],
-            embedding,
-        };
-        let _ = self.store.insert(entry.clone());
-        if let Some(idx) = &mut self.index {
-            if let Err(e) = idx.insert(&entry) {
-                warn!(error = ?e, "belief index insert failed");
-            }
-        }
-        if let Some(event_log) = &self.event_log {
-            let event = MemoryRecordEvent {
-                event_id: Uuid::new_v4(),
-                occurred_at: Utc::now(),
-                entry: entry.clone(),
-            };
-            event_log.append(&event).await?;
-        }
+        let mut entry = self.record_inner_tagged(
+            MemoryTier::Core,
+            claim,
+            "belief".to_string(),
+            vec!["belief".to_string()],
+        ).await?;
+        // Override confidence with the caller-supplied value.
+        entry.confidence = confidence.clamp(0.0, 1.0);
         info!(claim = %entry.content, confidence, "belief recorded");
         Ok(entry)
     }

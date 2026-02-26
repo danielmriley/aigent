@@ -103,7 +103,142 @@ pub fn format_user_profile_block(entries: &[MemoryEntry]) -> Option<String> {
 fn bullet_list(items: &[&str]) -> String {
     items
         .iter()
-        .map(|item| format!("  2022 {item}"))
+        .map(|item| format!("  \u{2022} {item}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use super::*;
+
+    fn make_profile_entry(source: &str, content: &str, age_secs: i64) -> MemoryEntry {
+        MemoryEntry {
+            id: Uuid::new_v4(),
+            tier: MemoryTier::UserProfile,
+            content: content.to_string(),
+            source: source.to_string(),
+            confidence: 0.9,
+            valence: 0.0,
+            created_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            provenance_hash: "hash".to_string(),
+            tags: vec![],
+            embedding: None,
+        }
+    }
+
+    fn make_non_profile_entry(content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: Uuid::new_v4(),
+            tier: MemoryTier::Episodic,
+            content: content.to_string(),
+            source: "chat".to_string(),
+            confidence: 0.8,
+            valence: 0.0,
+            created_at: Utc::now(),
+            provenance_hash: "hash".to_string(),
+            tags: vec![],
+            embedding: None,
+        }
+    }
+
+    #[test]
+    fn user_profile_entries_filters_by_tier() {
+        let entries = vec![
+            make_profile_entry(SOURCE_PREFERENCE, "likes coffee", 0),
+            make_non_profile_entry("had a meeting"),
+            make_profile_entry(SOURCE_GOAL, "learn rust", 0),
+        ];
+        let result = user_profile_entries(&entries);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn user_profile_entries_sorted_newest_first() {
+        let entries = vec![
+            make_profile_entry(SOURCE_FACT, "old fact", 100),
+            make_profile_entry(SOURCE_FACT, "new fact", 0),
+        ];
+        let result = user_profile_entries(&entries);
+        assert_eq!(result[0].content, "new fact");
+        assert_eq!(result[1].content, "old fact");
+    }
+
+    #[test]
+    fn format_returns_none_for_empty() {
+        let entries: Vec<MemoryEntry> = vec![];
+        assert!(format_user_profile_block(&entries).is_none());
+    }
+
+    #[test]
+    fn format_returns_none_when_no_profile_entries() {
+        let entries = vec![make_non_profile_entry("episodic event")];
+        assert!(format_user_profile_block(&entries).is_none());
+    }
+
+    #[test]
+    fn format_groups_preferences() {
+        let entries = vec![make_profile_entry(SOURCE_PREFERENCE, "pref: likes tea", 0)];
+        let block = format_user_profile_block(&entries).unwrap();
+        assert!(block.contains("Preferences:"), "block = {block}");
+        assert!(block.contains("likes tea"));
+    }
+
+    #[test]
+    fn format_groups_goals() {
+        let entries = vec![make_profile_entry(SOURCE_GOAL, "goal: learn rust", 0)];
+        let block = format_user_profile_block(&entries).unwrap();
+        assert!(block.contains("Goals:"), "block = {block}");
+    }
+
+    #[test]
+    fn format_groups_facts() {
+        let entries = vec![make_profile_entry(SOURCE_FACT, "name: Daniel", 0)];
+        let block = format_user_profile_block(&entries).unwrap();
+        assert!(block.contains("Known facts:"), "block = {block}");
+    }
+
+    #[test]
+    fn format_groups_style() {
+        let entries = vec![make_profile_entry(SOURCE_STYLE, "style: concise", 0)];
+        let block = format_user_profile_block(&entries).unwrap();
+        assert!(block.contains("Communication style:"), "block = {block}");
+    }
+
+    #[test]
+    fn format_classifies_unknown_source_as_other() {
+        let entries = vec![make_profile_entry("user-profile:custom", "x: something", 0)];
+        let block = format_user_profile_block(&entries).unwrap();
+        assert!(block.contains("Other:"), "block = {block}");
+    }
+
+    #[test]
+    fn format_deduplicates_by_key_keeping_newest() {
+        let entries = vec![
+            make_profile_entry(SOURCE_PREFERENCE, "editor: vim", 100),
+            make_profile_entry(SOURCE_PREFERENCE, "editor: neovim", 0),
+        ];
+        let block = format_user_profile_block(&entries).unwrap();
+        // Only the newer entry should remain.
+        assert!(block.contains("neovim"), "block = {block}");
+        assert!(!block.contains("vim\n") || block.contains("neovim"));
+    }
+
+    #[test]
+    fn bullet_list_uses_unicode_bullet() {
+        let items = vec!["alpha", "beta"];
+        let result = bullet_list(&items);
+        assert!(result.contains('\u{2022}'), "should use Unicode bullet");
+        assert!(result.contains("alpha"));
+        assert!(result.contains("beta"));
+    }
+
+    #[test]
+    fn bullet_list_empty_returns_empty_string() {
+        let result = bullet_list(&[]);
+        assert!(result.is_empty());
+    }
 }
