@@ -814,6 +814,16 @@ async fn handle_connection(
                     if let Ok(call) = serde_json::from_str::<crate::agent_loop::LlmToolCall>(trimmed) {
                         if !call.tool.is_empty() {
                             warn!(tool = %call.tool, "fallback: streamed reply was tool JSON — executing post-hoc");
+                            // Tell clients to discard the raw tool-JSON tokens
+                            // that leaked during the first (failed) stream pass.
+                            {
+                                let mut guard = writer.lock().await;
+                                let _ = send_event(
+                                    &mut guard,
+                                    ServerEvent::Backend(BackendEvent::ClearStream),
+                                ).await;
+                            }
+                            let _ = event_tx.send(BackendEvent::ClearStream);
                             let info = crate::events::ToolCallInfo {
                                 name: call.tool.clone(),
                                 args: serde_json::to_string(&call.args).unwrap_or_default(),

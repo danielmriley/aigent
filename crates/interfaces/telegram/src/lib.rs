@@ -63,17 +63,22 @@ pub async fn start_bot(client_ipc: DaemonClient) -> Result<()> {
                 let typing_client = client.clone();
                 let typing_url = base_url.clone();
                 tokio::spawn(async move {
-                    // Immediate first ping.
+                    // Immediate first ping — user sees typing right away.
                     let _ = send_chat_action(&typing_client, &typing_url, chat_id, "typing").await;
                     let mut interval = tokio::time::interval(Duration::from_secs(4));
-                    interval.tick().await; // consume tick that fires immediately
+                    // Avoid burst-retrying if a tick was missed (e.g. during a slow tool call).
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    interval.tick().await; // consume the immediately-firing first tick
                     let mut cancel = cancel_typing_rx;
                     loop {
                         tokio::select! {
+                            biased;
+                            _ = &mut cancel => break,
                             _ = interval.tick() => {
+                                // Re-send every 4 s so the indicator survives long tool calls,
+                                // reflection passes, and multi-step reasoning.
                                 let _ = send_chat_action(&typing_client, &typing_url, chat_id, "typing").await;
                             }
-                            _ = &mut cancel => break,
                         }
                     }
                 });
@@ -226,7 +231,8 @@ async fn handle_telegram_input(
             | BackendEvent::SleepCycleRunning
             | BackendEvent::MemoryUpdated
             | BackendEvent::ToolCallStart(_)
-            | BackendEvent::ExternalTurn { .. } => {}
+            | BackendEvent::ExternalTurn { .. }
+            | BackendEvent::ClearStream => {}
             BackendEvent::ToolCallEnd(result) => {
                 tools_used.push(result.name.clone());
             }

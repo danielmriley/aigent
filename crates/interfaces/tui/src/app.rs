@@ -7,26 +7,21 @@ use ignore::WalkBuilder;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::debug;
 use tui_textarea::{Input, Key, TextArea};
 
 use aigent_config::AppConfig;
-use aigent_runtime::{
-    BackendEvent,
-    history::{append_turn, load_recent},
-};
+use aigent_runtime::BackendEvent;
 
 use crate::{
     events::AppEvent,
-    theme::{Theme, ThemeName},
+    theme::Theme,
     widgets::{
         chat::{chat_visual_line_count, draw_chat, message_visual_line_start},
         input::draw_input,
@@ -96,14 +91,11 @@ pub struct App {
     pub backend_rx: mpsc::UnboundedReceiver<BackendEvent>,
     pub focus: Focus,
     pub theme: Theme,
-    pub theme_name: ThemeName,
     pub scroll: usize,
     pub max_scroll: usize,
     pub auto_follow: bool,
     pub show_sidebar: bool,
-    /// Wall-clock epoch used to compute spinner frame index — immune to
-    /// event-loop starvation from rapid backend events.
-    pub spinner_epoch: Instant,
+    pub spinner_tick: usize,
     pub pending_stream: String,
     pub input_wrap_width: usize,
     pub workspace_files: Vec<String>,
@@ -121,25 +113,7 @@ impl App {
                 bot_name: config.agent.name.clone(),
                 sessions: vec!["default".to_string()],
                 current_session: 0,
-                messages: {
-                    let mut msgs = Vec::new();
-                    if let Ok(records) = load_recent(200) {
-                        for r in records {
-                            let rendered = if r.role == "assistant" {
-                                use crate::widgets::markdown::render_markdown_lines;
-                                Some(render_markdown_lines(&r.content))
-                            } else {
-                                None
-                            };
-                            msgs.push(Message {
-                                role: r.role,
-                                content: r.content,
-                                rendered_md: rendered,
-                            });
-                        }
-                    }
-                    msgs
-                },
+                messages: Vec::new(),
                 status: format!(
                     "model={} provider={}",
                     config.active_model(),
@@ -152,13 +126,12 @@ impl App {
             textarea,
             backend_rx,
             focus: Focus::Input,
-            theme: Theme::from_config(&config.ui.theme),
-            theme_name: ThemeName::from_config(&config.ui.theme),
+            theme: Theme::default(),
             scroll: 0,
             max_scroll: 0,
             auto_follow: true,
-            show_sidebar: config.ui.show_sidebar,
-            spinner_epoch: Instant::now(),
+            show_sidebar: true,
+            spinner_tick: 0,
             is_thinking: false,
             is_sleeping: false,
             active_tool: None,
@@ -200,7 +173,6 @@ impl App {
     }
 
     pub fn push_user_message(&mut self, text: String) {
-        let _ = append_turn("user", &text);
         self.state.messages.push(Message {
             role: "user".to_string(),
             content: text,
@@ -223,6 +195,7 @@ impl App {
     pub fn update(&mut self, event: AppEvent) -> Option<UiCommand> {
         match event {
             AppEvent::Tick => {
+                self.spinner_tick = self.spinner_tick.wrapping_add(1);
                 self.refresh_file_popup();
                 None
             }
@@ -257,17 +230,6 @@ impl App {
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
                     self.command_palette.visible = !self.command_palette.visible;
-                    return None;
-                }
-                // Ctrl+T — cycle colour theme.
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
-                    let next = match self.theme_name {
-                        ThemeName::CatppuccinMocha => ThemeName::TokyoNight,
-                        ThemeName::TokyoNight => ThemeName::Nord,
-                        ThemeName::Nord => ThemeName::CatppuccinMocha,
-                    };
-                    self.theme_name = next;
-                    self.theme = Theme::from_name(next);
                     return None;
                 }
 
@@ -368,20 +330,6 @@ impl App {
                                 (current + 1).min(self.state.messages.len().saturating_sub(1)),
                             );
                             self.auto_follow = false;
-                        }
-                        KeyCode::Enter => {
-                            // Toggle expand/collapse on tool messages (⚙).
-                            // Re-selecting the same message collapses it;
-                            // selecting a different one expands only the new one.
-                            if let Some(idx) = self.state.selected_message {
-                                if let Some(msg) = self.state.messages.get(idx) {
-                                    if msg.role == "⚙" && msg.content.contains('\0') {
-                                        // Toggle: deselect to collapse, keep selection
-                                        // to expand.  The chat widget shows detail only
-                                        // when the message is the current selection.
-                                    }
-                                }
-                            }
                         }
                         KeyCode::Char('c') => {
                             if let Some(code) = self.selected_code_block() {
@@ -497,8 +445,6 @@ impl App {
     fn apply_backend(&mut self, event: BackendEvent) {
         match event {
             BackendEvent::Token(chunk) => {
-                self.is_thinking = true;
-                self.auto_follow = true;
                 self.pending_stream.push_str(&chunk);
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
@@ -506,6 +452,8 @@ impl App {
                         return;
                     }
                 }
+                // New stream message started — ensure viewport follows.
+                self.auto_follow = true;
                 self.state.messages.push(Message {
                     role: "assistant".to_string(),
                     content: format!("[stream]{}", self.pending_stream),
@@ -515,7 +463,6 @@ impl App {
             BackendEvent::Thinking => {
                 self.is_thinking = true;
                 self.is_sleeping = false;
-                self.auto_follow = true;
                 self.state.status = "thinking".to_string();
             }
             BackendEvent::SleepCycleRunning => {
@@ -526,7 +473,6 @@ impl App {
             BackendEvent::Done => {
                 self.is_thinking = false;
                 self.is_sleeping = false;
-                self.auto_follow = true;
                 self.state.status = "idle".to_string();
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
@@ -534,11 +480,9 @@ impl App {
                         last.rendered_md = Some(render_markdown_lines(&last.content));
                     }
                 }
-                let content = self.pending_stream.clone();
-                if !content.is_empty() {
-                    let _ = append_turn("assistant", &content);
-                }
                 self.pending_stream.clear();
+                // Markdown rendering may expand the message height; re-follow.
+                self.auto_follow = true;
             }
             BackendEvent::Error(err) => {
                 self.is_thinking = false;
@@ -554,7 +498,6 @@ impl App {
                 self.state.status = "memory updated".to_string();
             }
             BackendEvent::ToolCallStart(info) => {
-                self.is_thinking = true;
                 self.active_tool = Some(info.name.clone());
                 self.state.status = format!("\u{1f527} {}", info.name);
                 // Show as a dimmed inline transcript entry so the user can
@@ -568,31 +511,26 @@ impl App {
             }
             BackendEvent::ToolCallEnd(result) => {
                 self.active_tool = None;
-                self.auto_follow = true;
-                // Keep is_thinking=true — the LLM streaming response follows.
                 // Update the last ⚙ message to reflect the outcome.
-                // The summary is shown inline; the full output is stashed
-                // after a NUL byte so chat.rs can expand it on selection.
                 if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| m.role == "⚙") {
-                    let snip: String = result.output.chars().take(80).collect();
-                    let ellipsis = if result.output.chars().count() > 80 { "…" } else { "" };
-                    let summary = if result.success {
-                        format!("✓ {} — {}{}", result.name, snip, ellipsis)
+                    msg.content = if result.success {
+                        let snip = if result.output.len() > 80 {
+                            format!("{}…", &result.output[..80])
+                        } else {
+                            result.output.clone()
+                        };
+                        format!("✓ {} — {}", result.name, snip)
                     } else {
-                        format!("✗ {} failed — {}{}", result.name, snip, ellipsis)
+                        format!("✗ {} failed", result.name)
                     };
-                    // Stash full output behind NUL for expandable detail.
-                    if result.output.chars().count() > 80 {
-                        msg.content = format!("{}\0{}", summary, result.output);
-                    } else {
-                        msg.content = summary;
-                    }
                 }
                 self.state.status = if result.success {
                     "tool complete".to_string()
                 } else {
                     "tool failed".to_string()
                 };
+                // Scroll down to show the updated tool result.
+                self.auto_follow = true;
             }
             BackendEvent::ExternalTurn { source, content } => {
                 self.state.messages.push(Message {
@@ -604,28 +542,22 @@ impl App {
                 self.auto_follow = true;
             }
             BackendEvent::ReflectionInsight(insight) => {
-                self.auto_follow = true;
-                // UTF-8 safe: use char iterator, not byte slice, to avoid panics.
-                let char_count = insight.chars().count();
-                let display: String = insight.chars().take(80).collect();
-                let display = if char_count > 80 {
-                    format!("{}…", display)
+                // Trim to a single line for the status bar; long insights are
+                // truncated with an ellipsis so the header stays compact.
+                let display = if insight.len() > 80 {
+                    format!("{}…", &insight[..80])
                 } else {
-                    display
+                    insight.clone()
                 };
-                self.state.status = format!("💡 {}", display);
+                self.state.status = format!("\u{1f4a1} {}", display);
             }
             BackendEvent::BeliefAdded { claim, confidence } => {
-                self.auto_follow = true;
-                // UTF-8 safe truncation.
-                let char_count = claim.chars().count();
-                let truncated: String = claim.chars().take(70).collect();
-                let display = if char_count > 70 {
-                    format!("{}…", truncated)
+                let display = if claim.len() > 70 {
+                    format!("{}…", &claim[..70])
                 } else {
-                    truncated
+                    claim.clone()
                 };
-                self.state.status = format!("🧠 belief ({:.2}): {}", confidence, display);
+                self.state.status = format!("belief ({:.2}): {}", confidence, display);
             }
             BackendEvent::ProactiveMessage { content } => {
                 let rendered = render_markdown_lines(&content);
@@ -636,6 +568,16 @@ impl App {
                 });
                 self.pending_stream.clear();
                 self.auto_follow = true;
+            }
+            BackendEvent::ClearStream => {
+                // Discard the partially-streamed assistant message (typically
+                // raw tool JSON that leaked before fallback detection kicked in).
+                if let Some(last) = self.state.messages.last() {
+                    if last.role == "assistant" && last.content.starts_with("[stream]") {
+                        self.state.messages.pop();
+                    }
+                }
+                self.pending_stream.clear();
             }
         }
     }
@@ -657,21 +599,15 @@ impl App {
             .split(frame.area());
 
         let status_display = if self.is_thinking || self.is_sleeping {
-            let elapsed_ms = self.spinner_epoch.elapsed().as_millis();
-            let frame_idx = (elapsed_ms / 80) as usize % SPINNER_FRAMES.len();
-            let frame = SPINNER_FRAMES[frame_idx];
+            let frame = SPINNER_FRAMES[self.spinner_tick / 2 % SPINNER_FRAMES.len()];
             format!("{} {}", frame, self.state.status)
         } else {
             self.state.status.clone()
         };
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!(" {} ", self.state.bot_name),
-                Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" • ", Style::default().fg(self.theme.muted)),
-            Span::styled(status_display, Style::default().fg(self.theme.foreground)),
-        ]));
+        let header = Paragraph::new(Line::from(format!(
+            "{} • {} • Ctrl+S sidebar • Esc history",
+            self.state.bot_name, status_display
+        )));
         frame.render_widget(header, outer[0]);
 
         let middle = if self.show_sidebar {
@@ -798,43 +734,9 @@ impl App {
             frame.render_widget(widget, area);
         }
 
-        let key_style = Style::default()
-            .fg(self.theme.accent)
-            .add_modifier(Modifier::BOLD);
-        let sep = Span::styled(" │ ", Style::default().fg(self.theme.muted));
-        let label = Style::default().fg(self.theme.muted);
-        let footer_line = if self.state.history_mode {
-            Line::from(vec![
-                Span::styled("Esc", key_style), Span::styled(" exit ", label),
-                sep.clone(),
-                Span::styled("↑↓", key_style), Span::styled(" navigate ", label),
-                sep.clone(),
-                Span::styled("Enter", key_style), Span::styled(" expand tool ", label),
-                sep.clone(),
-                Span::styled("c", key_style), Span::styled(" copy code ", label),
-                sep.clone(),
-                Span::styled("a", key_style), Span::styled(" apply code ", label),
-            ])
-        } else {
-            Line::from(vec![
-                Span::styled("Enter", key_style), Span::styled(" send ", label),
-                sep.clone(),
-                Span::styled("Alt+Enter", key_style), Span::styled(" newline ", label),
-                sep.clone(),
-                Span::styled("Esc", key_style), Span::styled(" history ", label),
-                sep.clone(),
-                Span::styled("Ctrl+K", key_style), Span::styled(" commands ", label),
-                sep.clone(),
-                Span::styled("@", key_style), Span::styled(" files ", label),
-                sep.clone(),
-                Span::styled("Ctrl+S", key_style), Span::styled(" sidebar ", label),
-                sep.clone(),
-                Span::styled("Ctrl+T", key_style), Span::styled(" theme ", label),
-                sep.clone(),
-                Span::styled("Alt+S", key_style), Span::styled(" select ", label),
-            ])
-        };
-        let footer = Paragraph::new(footer_line);
+        let footer = Paragraph::new(Line::from(
+            "Enter send • Alt+Enter newline • Ctrl+K commands • Alt+S select/copy • @ file picker • history: Esc/Up/Down",
+        ));
         frame.render_widget(footer, outer[3]);
     }
 

@@ -379,14 +379,27 @@ impl WebSearchTool {
         let json: serde_json::Value = resp.json().await?;
 
         let mut parts: Vec<String> = Vec::new();
+        let mut top_url: Option<String> = None;
         if let Some(results) = json["web"]["results"].as_array() {
             for item in results.iter().take(max_results) {
                 let title = item["title"].as_str().unwrap_or("").trim();
                 let url = item["url"].as_str().unwrap_or("").trim();
                 let desc = item["description"].as_str().unwrap_or("").trim();
                 if !title.is_empty() {
+                    if top_url.is_none() && !url.is_empty() {
+                        top_url = Some(url.to_string());
+                    }
                     parts.push(format!("{title}\n  {url}\n  {desc}"));
                 }
+            }
+        }
+
+        // Fetch the top result page to extract actual content (not just
+        // search snippets).  This prevents the LLM from hallucinating data
+        // that wasn't in the search description (e.g. stock prices, scores).
+        if let Some(url) = top_url {
+            if let Some(excerpt) = fetch_page_excerpt(&client, &url, 2000).await {
+                parts.push(format!("\n--- Page content from {url} ---\n{excerpt}"));
             }
         }
 
@@ -427,6 +440,7 @@ impl WebSearchTool {
 
         let abstract_text = json["AbstractText"].as_str().unwrap_or("").trim().to_string();
         let abstract_source = json["AbstractSource"].as_str().unwrap_or("").trim().to_string();
+        let abstract_url = json["AbstractURL"].as_str().unwrap_or("").trim().to_string();
 
         let mut parts: Vec<String> = Vec::new();
         if !abstract_text.is_empty() {
@@ -446,6 +460,13 @@ impl WebSearchTool {
             }
         }
 
+        // Fetch the abstract source page for real content when available.
+        if !abstract_url.is_empty() {
+            if let Some(excerpt) = fetch_page_excerpt(&client, &abstract_url, 2000).await {
+                parts.push(format!("\n--- Page content from {abstract_url} ---\n{excerpt}"));
+            }
+        }
+
         if parts.is_empty() {
             Ok(ToolOutput {
                 success: true,
@@ -457,6 +478,155 @@ impl WebSearchTool {
                 output: parts.join("\n"),
             })
         }
+    }
+}
+
+/// Fetch a web page and extract a plain-text excerpt by stripping HTML tags.
+///
+/// Returns `None` on any error (timeout, non-HTML response, etc.) so the
+/// caller can fall back gracefully to the search snippet data.
+///
+/// `max_chars` limits the returned excerpt to prevent context explosion.
+async fn fetch_page_excerpt(
+    client: &reqwest::Client,
+    url: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let resp = client
+        .get(url)
+        .timeout(std::time::Duration::from_secs(8))
+        .header("Accept", "text/html")
+        .send()
+        .await
+        .ok()?;
+
+    // Only process HTML responses.
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !content_type.contains("text/html") && !content_type.contains("text/plain") {
+        return None;
+    }
+
+    // Limit download to 256 KB to avoid pulling huge pages.
+    let body = resp.text().await.ok()?;
+    let body = if body.len() > 256_000 { &body[..256_000] } else { &body };
+
+    Some(html_to_text(body, max_chars))
+}
+
+/// Minimal HTML-to-text extraction.  Strips tags, collapses whitespace, and
+/// drops `<script>`, `<style>`, `<nav>`, `<header>`, `<footer>` blocks.
+///
+/// This is intentionally simple (no third-party HTML parser dependency).
+/// It produces "good enough" text for the LLM to extract facts from.
+fn html_to_text(html: &str, max_chars: usize) -> String {
+    // Remove script/style/nav/header/footer blocks (case-insensitive via lowering the tag scan).
+    let mut cleaned = String::with_capacity(html.len());
+    let mut skip_depth: usize = 0;
+    let mut i = 0;
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+
+    while i < len {
+        if bytes[i] == b'<' {
+            // Peek at the tag name.
+            let tag_start = i;
+            i += 1;
+            let is_close = i < len && bytes[i] == b'/';
+            if is_close { i += 1; }
+
+            let name_start = i;
+            while i < len && bytes[i] != b'>' && bytes[i] != b' ' && bytes[i] != b'/' {
+                i += 1;
+            }
+            let tag_name = std::str::from_utf8(&bytes[name_start..i])
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            // Skip to end of tag.
+            while i < len && bytes[i] != b'>' {
+                i += 1;
+            }
+            if i < len { i += 1; } // skip '>'
+
+            let strip_tags = ["script", "style", "nav", "header", "footer", "noscript", "svg"];
+            if strip_tags.contains(&tag_name.as_str()) {
+                if is_close {
+                    skip_depth = skip_depth.saturating_sub(1);
+                } else {
+                    skip_depth += 1;
+                }
+                continue;
+            }
+
+            if skip_depth > 0 {
+                continue;
+            }
+
+            // Block-level tags emit a newline to preserve structure.
+            let block_tags = ["p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
+                              "li", "tr", "td", "th", "article", "section", "main"];
+            if block_tags.contains(&tag_name.as_str()) {
+                cleaned.push('\n');
+            }
+
+            // Drop the tag itself (no output).
+            let _ = tag_start; // consumed
+        } else {
+            if skip_depth == 0 {
+                cleaned.push(bytes[i] as char);
+            }
+            i += 1;
+        }
+    }
+
+    // Decode common HTML entities.
+    let cleaned = cleaned
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ");
+
+    // Collapse runs of whitespace into single space, trim blank lines.
+    let mut result = String::with_capacity(cleaned.len().min(max_chars + 64));
+    let mut prev_was_space = true;
+    let mut consecutive_newlines = 0u32;
+    for ch in cleaned.chars() {
+        if ch == '\n' {
+            consecutive_newlines += 1;
+            if consecutive_newlines <= 2 {
+                result.push('\n');
+            }
+            prev_was_space = true;
+        } else if ch.is_whitespace() {
+            if !prev_was_space {
+                result.push(' ');
+                prev_was_space = true;
+            }
+            consecutive_newlines = 0;
+        } else {
+            result.push(ch);
+            prev_was_space = false;
+            consecutive_newlines = 0;
+        }
+        if result.len() >= max_chars {
+            break;
+        }
+    }
+
+    let trimmed = result.trim().to_string();
+    if trimmed.len() > max_chars {
+        // Truncate to a word boundary.
+        let end = trimmed[..max_chars].rfind(' ').unwrap_or(max_chars);
+        format!("{}…", &trimmed[..end])
+    } else {
+        trimmed
     }
 }
 
@@ -655,5 +825,52 @@ impl Tool for GitRollbackTool {
                 output: format!("git revert failed: {stderr}"),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_to_text_strips_tags() {
+        let html = "<html><body><h1>Title</h1><p>Hello <b>world</b></p></body></html>";
+        let text = html_to_text(html, 200);
+        assert!(text.contains("Title"));
+        assert!(text.contains("Hello"));
+        assert!(text.contains("world"));
+        assert!(!text.contains("<h1>"));
+        assert!(!text.contains("<b>"));
+    }
+
+    #[test]
+    fn html_to_text_strips_scripts() {
+        let html = "<p>Before</p><script>var x = 1;</script><p>After</p>";
+        let text = html_to_text(html, 200);
+        assert!(text.contains("Before"));
+        assert!(text.contains("After"));
+        assert!(!text.contains("var x"));
+    }
+
+    #[test]
+    fn html_to_text_decodes_entities() {
+        let html = "<p>A &amp; B &lt; C &gt; D</p>";
+        let text = html_to_text(html, 200);
+        assert!(text.contains("A & B < C > D"));
+    }
+
+    #[test]
+    fn html_to_text_respects_max_chars() {
+        let html = "<p>".to_string() + &"a".repeat(5000) + "</p>";
+        let text = html_to_text(&html, 100);
+        assert!(text.len() <= 110); // small tolerance for trailing ellipsis
+    }
+
+    #[test]
+    fn html_to_text_collapses_whitespace() {
+        let html = "<p>  lots   of    spaces  </p>";
+        let text = html_to_text(html, 200);
+        // Should not have runs of multiple spaces.
+        assert!(!text.contains("  "));
     }
 }
