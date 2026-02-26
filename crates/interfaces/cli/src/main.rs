@@ -1053,22 +1053,29 @@ async fn run_interactive_session(config: &AppConfig, daemon: DaemonClient) -> Re
                     if line == "/sleep" {
                         // Show spinner immediately so the user knows we're working.
                         let _ = backend_tx.send(BackendEvent::SleepCycleRunning);
-                        let tx_clone = backend_tx.clone();
-                        match daemon
-                            .run_sleep_cycle_with_progress(|msg| {
-                                let _ = tx_clone
-                                    .send(BackendEvent::SleepProgress(msg.to_string()));
-                            })
-                            .await
-                        {
-                            Ok(msg) => {
-                                let _ = backend_tx.send(BackendEvent::Token(msg));
-                                let _ = backend_tx.send(BackendEvent::Done);
+                        // Spawn into a background task so the TUI event loop
+                        // keeps running (ticks, redraws, key events).  Without
+                        // this the `tokio::select!` loop in tui.rs is blocked
+                        // for the entire duration of the sleep cycle.
+                        let tx_spawn = backend_tx.clone();
+                        tokio::spawn(async move {
+                            let tx_progress = tx_spawn.clone();
+                            match daemon
+                                .run_sleep_cycle_with_progress(|msg| {
+                                    let _ = tx_progress
+                                        .send(BackendEvent::SleepProgress(msg.to_string()));
+                                })
+                                .await
+                            {
+                                Ok(msg) => {
+                                    let _ = tx_spawn.send(BackendEvent::Token(msg));
+                                    let _ = tx_spawn.send(BackendEvent::Done);
+                                }
+                                Err(err) => {
+                                    let _ = tx_spawn.send(BackendEvent::Error(err.to_string()));
+                                }
                             }
-                            Err(err) => {
-                                let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
-                            }
-                        }
+                        });
                         return Ok(());
                     }
 
