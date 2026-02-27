@@ -151,16 +151,44 @@ impl AgentRuntime {
 
 
     pub fn environment_snapshot(&self, memory: &MemoryManager, recent_turn_count: usize) -> String {
-        let cwd = std::env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let workspace_raw = &self.config.agent.workspace_path;
+        // Canonicalize to resolve any `.` or `..` segments; fall back to raw.
+        let workspace = std::fs::canonicalize(workspace_raw)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| workspace_raw.clone());
+        let local_ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
         let timestamp = Utc::now().to_rfc3339();
-        let git_present = std::path::Path::new(".git").exists();
+        // Check git inside the workspace (where shell commands run), not daemon CWD.
+        let ws_path = std::path::Path::new(&workspace);
+        let git_present = ws_path.join(".git").exists();
+
+        // Auto-detect the aigent source directory (parent of workspace if it
+        // contains Cargo.toml).  This lets the LLM inspect its own source code.
+        let source_line = ws_path
+            .parent()
+            .filter(|p| p.join("Cargo.toml").exists())
+            .map(|p| format!("\n- aigent_source_dir: {} (your source code repo — use read_file with absolute paths or `git -C` to inspect)", p.display()))
+            .unwrap_or_default();
 
         let stats = memory.stats();
         format!(
-            "- utc_time: {timestamp}\n- os: {}\n- arch: {}\n- cwd: {cwd}\n- git_repo_present: {git_present}\n- provider: {}\n- model: {}\n- thinking_level: {}\n- memory_total: {}\n- memory_core: {}\n- memory_user_profile: {}\n- memory_reflective: {}\n- memory_semantic: {}\n- memory_episodic: {}\n- memory_procedural: {}\n- recent_conversation_turns: {recent_turn_count}",
+            "- local_time: {local_ts}\n\
+             - utc_time: {timestamp}\n\
+             - os: {}\n\
+             - arch: {}\n\
+             - workspace: {workspace} (shell commands run here)\n\
+             - git_repo_in_workspace: {git_present}{source_line}\n\
+             - provider: {}\n\
+             - model: {}\n\
+             - thinking_level: {}\n\
+             - memory_total: {}\n\
+             - memory_core: {}\n\
+             - memory_user_profile: {}\n\
+             - memory_reflective: {}\n\
+             - memory_semantic: {}\n\
+             - memory_episodic: {}\n\
+             - memory_procedural: {}\n\
+             - recent_conversation_turns: {recent_turn_count}",
             std::env::consts::OS,
             std::env::consts::ARCH,
             self.config.llm.provider,
