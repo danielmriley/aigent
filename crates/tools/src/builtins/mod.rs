@@ -4,13 +4,11 @@ mod fs;
 mod shell;
 mod web;
 mod calendar;
-mod finance;
 
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use shell::RunShellTool;
 pub use web::{WebSearchTool, FetchPageTool};
 pub use calendar::CalendarAddEventTool;
-pub use finance::FinanceQuoteTool;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};
