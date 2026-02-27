@@ -157,6 +157,7 @@ dependencies = [
  "chrono-tz",
  "dotenvy",
  "futures",
+ "iana-time-zone",
  "reqwest",
  "serde",
  "serde_json",

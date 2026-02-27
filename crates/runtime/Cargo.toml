@@ -17,6 +17,8 @@ tracing.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
 
+iana-time-zone = "0.1"
+
 aigent-config = { path = "../config" }
 aigent-exec = { path = "../exec" }
 aigent-llm = { path = "../llm" }

@@ -1,10 +1,20 @@
 //! Sleep cycle orchestration — agentic and multi-agent consolidation.
+//!
+//! The generation functions (`generate_agentic_sleep_insights`,
+//! `generate_multi_agent_sleep_insights`) are pure — they take read-only
+//! snapshots of memories and identity and return structured insights without
+//! touching `MemoryManager`.  The caller is responsible for applying the
+//! insights via `memory.apply_agentic_sleep_insights(...)` once it
+//! re-acquires mutable access.
 
 use anyhow::Result;
 use tracing::{info, instrument, warn};
 use tokio::sync::mpsc;
 use aigent_llm::{Provider};
-use aigent_memory::{MemoryManager, MemoryTier, SleepSummary, parse_agentic_insights};
+use aigent_memory::{
+    AgenticSleepInsights, IdentityKernel, MemoryEntry, SleepSummary,
+    parse_agentic_insights,
+};
 use aigent_memory::multi_sleep::{
     SpecialistRole, batch_memories, build_identity_context, deliberation_prompt,
     merge_insights, specialist_prompt,
@@ -12,17 +22,35 @@ use aigent_memory::multi_sleep::{
 
 use super::AgentRuntime;
 
+/// The result of a sleep-cycle *generation* pass.
+///
+/// The caller inspects the variant to decide how to apply the result:
+///   - `Insights` → call `memory.apply_agentic_sleep_insights(insights, …)`
+///   - `PassiveFallback` → the LLM was unavailable and we already fell back to
+///     passive distillation inside the MemoryManager, so the summary is final.
+pub enum SleepGenerationResult {
+    /// Structured insights produced by the LLM (single-agent or multi-agent).
+    Insights(AgenticSleepInsights),
+    /// LLM was unavailable — passive heuristic distillation was applied
+    /// directly and this is the resulting summary.
+    PassiveFallback(SleepSummary),
+}
+
 impl AgentRuntime {
-    /// Run an agentic sleep cycle: build a reflection prompt, call the LLM,
-    /// parse the insights, and apply them to memory.
+    /// Generate agentic sleep insights from a read-only memory snapshot.
     ///
-    /// Falls back to passive-only distillation if the LLM call fails.
-    #[instrument(skip(self, memory))]
-    pub async fn run_agentic_sleep_cycle(
+    /// Does **not** mutate `MemoryManager`.  Returns `SleepGenerationResult`
+    /// so the caller can apply insights after re-acquiring mutable access.
+    ///
+    /// Falls back to `PassiveFallback` if the LLM call fails — in that case
+    /// the caller should run `memory.run_sleep_cycle()` itself.
+    #[instrument(skip(self, memories, identity))]
+    pub async fn generate_agentic_sleep_insights(
         &self,
-        memory: &mut MemoryManager,
+        memories: &[MemoryEntry],
+        identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
-    ) -> Result<SleepSummary> {
+    ) -> Result<SleepGenerationResult> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
         } else {
@@ -30,7 +58,10 @@ impl AgentRuntime {
         };
 
         let _ = progress.send("Reflecting on today's memories…".into());
-        let prompt = memory.agentic_sleep_prompt();
+        let (bot_name, user_name) = (&self.config.agent.name, &self.config.agent.user_name);
+        let prompt = aigent_memory::sleep::agentic_sleep_prompt(
+            memories, bot_name, user_name, &identity.trait_scores,
+        );
         info!(prompt_len = prompt.len(), "agentic sleep: sending reflection prompt to LLM");
 
         match self
@@ -46,19 +77,17 @@ impl AgentRuntime {
             Ok((_provider, reply)) => {
                 info!(reply_len = reply.len(), "agentic sleep: LLM reply received");
                 let insights = parse_agentic_insights(&reply);
-                let summary_text = Some(format!(
-                    "Agentic sleep: {} learned, {} follow-ups, {} reflections, {} profile updates",
-                    insights.learned_about_user.len(),
-                    insights.follow_ups.len(),
-                    insights.reflective_thoughts.len(),
-                    insights.user_profile_updates.len(),
-                ));
-                let _ = progress.send("Applying insights to memory…".into());
-                memory.apply_agentic_sleep_insights(insights, summary_text).await
+                let _ = progress.send("Insights generated — ready to apply to memory.".into());
+                Ok(SleepGenerationResult::Insights(insights))
             }
             Err(err) => {
-                warn!(?err, "agentic sleep: LLM unavailable, falling back to passive distillation");
-                memory.run_sleep_cycle().await
+                warn!(?err, "agentic sleep: LLM unavailable — caller should run passive distillation");
+                // Signal to caller that no LLM insights were produced.
+                Ok(SleepGenerationResult::PassiveFallback(SleepSummary {
+                    distilled: String::new(),
+                    promoted_ids: Vec::new(),
+                    promotions: Vec::new(),
+                }))
             }
         }
     }
@@ -96,7 +125,7 @@ impl AgentRuntime {
         }
     }
 
-    /// Full nightly multi-agent memory consolidation.
+    /// Full nightly multi-agent memory consolidation (generation only).
     ///
     /// Pipeline per batch:
     ///   1. Run 4 specialist agents in parallel (tokio::join!)
@@ -107,32 +136,21 @@ impl AgentRuntime {
     ///
     /// After all batches:
     ///   6. Merge all batch AgenticSleepInsights into one
-    ///   7. Apply via memory.apply_agentic_sleep_insights()
+    ///   7. Return `SleepGenerationResult::Insights(merged)`
     ///
-    /// Falls back to run_agentic_sleep_cycle() (single-agent) if the LLM is
-    /// unavailable or any batch fails completely.
-
-    /// Full nightly multi-agent memory consolidation.
+    /// Does **not** mutate `MemoryManager`.  Operates on read-only snapshots
+    /// so the caller can hold the lock only for snapshot-taking and
+    /// insight-application, never across LLM network calls.
     ///
-    /// Pipeline per batch:
-    ///   1. Run 4 specialist agents in parallel (tokio::join!)
-    ///   2. Detect Core ID conflicts between specialist replies
-    ///   3. Run synthesis agent with deliberation prompt
-    ///   4. Parse synthesis reply into AgenticSleepInsights
-    ///   5. Accumulate into running merger
-    ///
-    /// After all batches:
-    ///   6. Merge all batch AgenticSleepInsights into one
-    ///   7. Apply via memory.apply_agentic_sleep_insights()
-    ///
-    /// Falls back to run_agentic_sleep_cycle() (single-agent) if the LLM is
-    /// unavailable or any batch fails completely.
-    #[instrument(skip(self, memory))]
-    pub async fn run_multi_agent_sleep_cycle(
+    /// Falls back to `generate_agentic_sleep_insights()` (single-agent) if
+    /// the LLM is unavailable or all batches fail.
+    #[instrument(skip(self, memories, identity))]
+    pub async fn generate_multi_agent_sleep_insights(
         &self,
-        memory: &mut MemoryManager,
+        memories: &[MemoryEntry],
+        identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
-    ) -> Result<SleepSummary> {
+    ) -> Result<SleepGenerationResult> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
         } else {
@@ -140,7 +158,7 @@ impl AgentRuntime {
         };
 
         let batch_size = self.config.memory.multi_agent_sleep_batch_size;
-        let batches = batch_memories(memory.all(), batch_size);
+        let batches = batch_memories(memories, batch_size);
 
         info!(
             batch_count = batches.len(),
@@ -172,21 +190,21 @@ impl AgentRuntime {
                 batches.len()
             ));
 
-            let identity = memory.identity.clone();
+            let identity_snap = identity.clone();
 
             let arch_prompt =
-                specialist_prompt(SpecialistRole::Archivist, batch, &identity, bot_name, user_name);
+                specialist_prompt(SpecialistRole::Archivist, batch, &identity_snap, bot_name, user_name);
             let psych_prompt = specialist_prompt(
                 SpecialistRole::Psychologist,
                 batch,
-                &identity,
+                &identity_snap,
                 bot_name,
                 user_name,
             );
             let strat_prompt =
-                specialist_prompt(SpecialistRole::Strategist, batch, &identity, bot_name, user_name);
+                specialist_prompt(SpecialistRole::Strategist, batch, &identity_snap, bot_name, user_name);
             let critic_prompt =
-                specialist_prompt(SpecialistRole::Critic, batch, &identity, bot_name, user_name);
+                specialist_prompt(SpecialistRole::Critic, batch, &identity_snap, bot_name, user_name);
 
             // Run all 4 specialists in parallel.
             let (arch_reply, psych_reply, strat_reply, critic_reply) = tokio::join!(
@@ -300,7 +318,7 @@ impl AgentRuntime {
             ];
 
             let identity_ctx =
-                build_identity_context(batch, &identity, bot_name, user_name);
+                build_identity_context(batch, &identity_snap, bot_name, user_name);
             let delib_prompt = deliberation_prompt(
                 &specialist_reports,
                 &conflicting_ids,
@@ -345,7 +363,7 @@ impl AgentRuntime {
         if !any_batch_succeeded {
             warn!("multi-agent sleep: all batches failed — falling back to single-agent sleep");
             let _ = progress.send("All batches failed — falling back to single-agent sleep…".into());
-            return self.run_agentic_sleep_cycle(memory, progress).await;
+            return self.generate_agentic_sleep_insights(memories, identity, progress).await;
         }
 
         let final_insights = merge_insights(all_batch_insights);
@@ -354,31 +372,15 @@ impl AgentRuntime {
             follow_ups = final_insights.follow_ups.len(),
             reflections = final_insights.reflective_thoughts.len(),
             profile_updates = final_insights.user_profile_updates.len(),
-            "multi-agent sleep: applying merged insights"
+            "multi-agent sleep: insights generated — ready to apply"
         );
         let _ = progress.send(format!(
-            "Applying merged insights — {} learned, {} reflections…",
+            "Insights generated — {} learned, {} reflections — ready to apply.",
             final_insights.learned_about_user.len(),
             final_insights.reflective_thoughts.len(),
         ));
 
-        let summary_text = Some(format!(
-            "Multi-agent sleep: {} learned, {} follow-ups, {} reflections, {} profile updates ({} batches)",
-            final_insights.learned_about_user.len(),
-            final_insights.follow_ups.len(),
-            final_insights.reflective_thoughts.len(),
-            final_insights.user_profile_updates.len(),
-            batches.len(),
-        ));
-
-        let result = memory.apply_agentic_sleep_insights(final_insights, summary_text).await?;
-        // Write a sentinel entry so the 22-hour rate-limit survives daemon restarts.
-        let _ = memory.record(
-            MemoryTier::Semantic,
-            "multi-agent sleep cycle completed",
-            "sleep:multi-agent-cycle",
-        ).await;
-        Ok(result)
+        Ok(SleepGenerationResult::Insights(final_insights))
     }
 
 }

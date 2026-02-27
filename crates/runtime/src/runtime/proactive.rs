@@ -2,56 +2,26 @@
 
 use tracing::{debug, info};
 use aigent_llm::{Provider, extract_json_output};
-use aigent_memory::{MemoryManager, MemoryTier};
 use crate::agent_loop::ProactiveOutput;
-use crate::prompt_builder::truncate_for_prompt;
 
 use super::AgentRuntime;
 
 impl AgentRuntime {
-    /// Proactive check run on a background timer.
+    /// Proactive check that operates on pre-built summary strings.
     ///
-    /// Looks at the agent's current beliefs, recent reflections, and current
-    /// context to decide whether there is something worth proactively sharing
-    /// with the user.  Returns `None` when the agent decides to stay silent,
-    /// or `Some(ProactiveOutput)` with the message to deliver.
-    pub async fn run_proactive_check(
+    /// The caller is responsible for building the `beliefs_summary` and
+    /// `reflections_summary` while holding the lock, then releasing the lock
+    /// before calling this method.  This avoids holding the mutex across the
+    /// LLM network call.
+    pub async fn run_proactive_check_from_summaries(
         &self,
-        memory: &mut MemoryManager,
+        beliefs_summary: &str,
+        reflections_summary: &str,
     ) -> Option<ProactiveOutput> {
         let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
             Provider::OpenRouter
         } else {
             Provider::Ollama
-        };
-
-        // Build a brief summary of current beliefs and recent reflections.
-        let beliefs_summary = {
-            let beliefs = memory.all_beliefs();
-            if beliefs.is_empty() {
-                "(none yet)".to_string()
-            } else {
-                beliefs
-                    .iter()
-                    .take(8)
-                    .map(|e| format!("- {}", e.content))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        };
-
-        let recent_reflections = {
-            let ctx = memory.context_for_prompt_ranked_with_embed("recent", 5, None);
-            let reflections: Vec<String> = ctx
-                .iter()
-                .filter(|item| item.entry.tier == MemoryTier::Reflective)
-                .map(|item| format!("- {}", truncate_for_prompt(&item.entry.content, 200)))
-                .collect();
-            if reflections.is_empty() {
-                "(none yet)".to_string()
-            } else {
-                reflections.join("\n")
-            }
         };
 
         let prompt = format!(
@@ -68,7 +38,7 @@ impl AgentRuntime {
              CURRENT_BELIEFS:\n{beliefs}\n\nRECENT_REFLECTIONS:\n{reflections}",
             name = self.config.agent.name,
             beliefs = beliefs_summary,
-            reflections = recent_reflections,
+            reflections = reflections_summary,
         );
 
         let Ok((_provider, raw)) = self

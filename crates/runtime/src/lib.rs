@@ -13,6 +13,6 @@ pub use agent_loop::{LlmToolCall, ProactiveOutput, ReflectionBelief, ReflectionO
 pub use client::DaemonClient;
 pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, SleepStatusPayload, ServerEvent};
 pub use events::{BackendEvent, ToolCallInfo, ToolResult};
-pub use runtime::{AgentRuntime, ConversationTurn};
+pub use runtime::{AgentRuntime, ConversationTurn, SleepGenerationResult};
 pub use server::run_unified_daemon;
 pub use tool_loop::{ToolLoopResult, ToolExecution, run_tool_loop, build_tools_json};

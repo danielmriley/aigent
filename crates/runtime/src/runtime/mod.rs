@@ -6,6 +6,8 @@ mod reflection;
 mod sleep;
 mod tools;
 
+pub use sleep::SleepGenerationResult;
+
 use anyhow::Result;
 
 use aigent_config::AppConfig;

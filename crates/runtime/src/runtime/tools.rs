@@ -221,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_multi_agent_sleep_cycle_returns_summary_without_panicking() -> Result<()> {
-        // This test calls run_multi_agent_sleep_cycle with seeded memory.
+        // This test calls generate_multi_agent_sleep_insights with seeded memory.
         // It degrades gracefully to the single-agent fallback if the LLM is
         // unavailable, and to passive distillation if everything fails.
         // The key invariant: it must not panic in any case.
@@ -238,18 +238,28 @@ mod tests {
             ).await?;
         }
 
+        // Snapshot memories + identity (mirrors the real daemon flow).
+        let memories = memory.all().to_vec();
+        let identity = memory.identity.clone();
+
         // Should complete without panicking regardless of LLM availability.
         let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-        let result = runtime.run_multi_agent_sleep_cycle(&mut memory, &noop_tx).await;
+        let result = runtime
+            .generate_multi_agent_sleep_insights(&memories, &identity, &noop_tx)
+            .await;
         // Accept either Ok or Err — the important thing is no panic.
         match result {
-            Ok(summary) => {
-                // If LLM was available we may have promotions; if not, distill
-                // still produces a summary string.
+            Ok(crate::SleepGenerationResult::Insights(insights)) => {
+                // Apply insights to prove the end-to-end flow doesn't panic.
+                let summary_text = Some("test multi-agent cycle".to_string());
+                let summary = memory.apply_agentic_sleep_insights(insights, summary_text).await?;
                 assert!(
                     !summary.distilled.is_empty() || !summary.promoted_ids.is_empty(),
                     "summary should contain some output"
                 );
+            }
+            Ok(crate::SleepGenerationResult::PassiveFallback(_)) => {
+                // LLM unavailable — passive fallback is fine.
             }
             Err(_) => {
                 // Graceful error is acceptable when LLM is not running in CI.

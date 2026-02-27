@@ -53,6 +53,9 @@ pub(super) fn spawn_compaction_task(
 /// required).  Runs `memory.run_sleep_cycle()` (heuristic only, no LLM) so it
 /// is safe to run at any time.  Skips only if a conversation happened in the
 /// last 5 minutes.
+///
+/// This task is lightweight: it acquires the lock, runs the fast heuristic
+/// pass, and releases the lock.  No `std::mem::take` needed.
 pub(super) fn spawn_passive_distillation(
     state: Arc<Mutex<DaemonState>>,
     shutdown_tx: &watch::Sender<bool>,
@@ -93,36 +96,28 @@ pub(super) fn spawn_passive_distillation(
             }
 
             last_passive_at = std::time::Instant::now();
-            info!("passive distillation starting");
-            // Take memory out while briefly locked, then release the lock
-            // before the (potentially long) distillation call so incoming
-            // connections are never blocked here.
-            let mut memory = {
-                let mut s = state.lock().await;
-                std::mem::take(&mut s.memory)
-            };
-            match memory.run_sleep_cycle().await {
-                Ok(ref summary) if !summary.promoted_ids.is_empty() => {
-                    info!(
-                        promoted = summary.promoted_ids.len(),
-                        "background passive distillation complete"
-                    );
-                }
-                Ok(_) => {
-                    info!("passive distillation complete (no promotions)");
-                }
-                Err(ref err) => warn!(?err, "background passive distillation failed"),
-            }
-            // Lightweight forgetting: prune old low-confidence episodic entries.
-            if forget_after_days > 0 {
-                let pruned = memory.run_forgetting_pass(forget_after_days, forget_min_confidence);
-                if pruned > 0 {
-                    info!(pruned, forget_after_days, "lightweight forgetting applied during sleep");
-                }
-            }
+            info!("passive heuristic distillation: starting");
             {
                 let mut s = state.lock().await;
-                s.memory = memory;
+                match s.memory.run_sleep_cycle().await {
+                    Ok(ref summary) if !summary.promoted_ids.is_empty() => {
+                        info!(
+                            promoted = summary.promoted_ids.len(),
+                            "passive heuristic distillation: complete"
+                        );
+                    }
+                    Ok(_) => {
+                        info!("passive heuristic distillation: complete (no promotions)");
+                    }
+                    Err(ref err) => warn!(?err, "passive heuristic distillation: failed"),
+                }
+                // Lightweight forgetting: prune old low-confidence episodic entries.
+                if forget_after_days > 0 {
+                    let pruned = s.memory.run_forgetting_pass(forget_after_days, forget_min_confidence);
+                    if pruned > 0 {
+                        info!(pruned, forget_after_days, "passive heuristic distillation: forgetting pass applied");
+                    }
+                }
                 s.last_passive_sleep_at = Some(std::time::Instant::now());
             }
         }
@@ -130,8 +125,14 @@ pub(super) fn spawn_passive_distillation(
 }
 
 /// Task B — Nightly multi-agent consolidation (once per night, in quiet
-/// window).  Runs `runtime.run_multi_agent_sleep_cycle()` which calls 4 LLM
-/// specialists plus a synthesis agent.  Gated by:
+/// window).  Runs the multi-agent LLM pipeline which can take several minutes.
+///
+/// **Concurrency-safe**: the lock is held only to snapshot data and to apply
+/// insights afterwards — never across LLM network calls.  Any conversation
+/// that occurs while the LLM is thinking operates on the live
+/// `MemoryManager` undisturbed, and new memories are preserved.
+///
+/// Gated by:
 ///   1. Must be within the quiet window (night_sleep_start_hour..night_sleep_end_hour)
 ///   2. At least 22 hours since the last multi-agent cycle
 ///   3. No conversation in the last 15 minutes
@@ -184,29 +185,82 @@ pub(super) fn spawn_nightly_consolidation(
             }
 
             // All guards passed — run the nightly multi-agent cycle.
-            info!("nightly multi-agent sleep cycle starting");
-            // Clone runtime and take memory, then release lock before the
-            // LLM call so incoming connections are never blocked here.
-            let (rt_clone, mut memory) = {
-                let mut s = state.lock().await;
+            info!("nightly multi-agent LLM consolidation: starting");
+
+            // ── Phase 1: Snapshot — briefly lock to clone read-only data ──
+            let (rt_clone, memories_snapshot, identity_snapshot) = {
+                let s = state.lock().await;
                 let rt = s.runtime.clone();
-                let mem = std::mem::take(&mut s.memory);
-                (rt, mem)
+                let memories = s.memory.all().to_vec();
+                let identity = s.memory.identity.clone();
+                (rt, memories, identity)
             };
+            // Lock is released — a user conversation can proceed normally.
+
+            // ── Phase 2: Generate — long-running LLM calls, no lock held ──
             let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-            let result = rt_clone.run_multi_agent_sleep_cycle(&mut memory, &noop_tx).await;
+            let gen_result = rt_clone
+                .generate_multi_agent_sleep_insights(
+                    &memories_snapshot,
+                    &identity_snapshot,
+                    &noop_tx,
+                )
+                .await;
+
+            // ── Phase 3: Apply — re-acquire lock and merge insights ───────
             {
                 let mut s = state.lock().await;
-                s.memory = memory;
-                match result {
-                    Ok(ref summary) if !summary.distilled.is_empty() => {
-                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
-                        info!(summary = %summary.distilled, "background multi-agent sleep cycle complete");
+                match gen_result {
+                    Ok(crate::SleepGenerationResult::Insights(insights)) => {
+                        let summary_text = Some(format!(
+                            "Nightly multi-agent consolidation: {} learned, {} follow-ups, {} reflections, {} profile updates",
+                            insights.learned_about_user.len(),
+                            insights.follow_ups.len(),
+                            insights.reflective_thoughts.len(),
+                            insights.user_profile_updates.len(),
+                        ));
+                        match s.memory.apply_agentic_sleep_insights(insights, summary_text).await {
+                            Ok(ref summary) if !summary.distilled.is_empty() => {
+                                // Write the sentinel so the 22h rate-limit survives restarts.
+                                let _ = s.memory.record(
+                                    aigent_memory::MemoryTier::Semantic,
+                                    "multi-agent sleep cycle completed",
+                                    "sleep:multi-agent-cycle",
+                                ).await;
+                                s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                                info!(summary = %summary.distilled, "nightly multi-agent LLM consolidation: complete");
+                            }
+                            Ok(_) => {
+                                let _ = s.memory.record(
+                                    aigent_memory::MemoryTier::Semantic,
+                                    "multi-agent sleep cycle completed",
+                                    "sleep:multi-agent-cycle",
+                                ).await;
+                                s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                                info!("nightly multi-agent LLM consolidation: complete (no summary text)");
+                            }
+                            Err(ref err) => {
+                                warn!(?err, "nightly multi-agent LLM consolidation: failed to apply insights");
+                            }
+                        }
                     }
-                    Ok(_) => {
-                        s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                    Ok(crate::SleepGenerationResult::PassiveFallback(_)) => {
+                        // LLM was unavailable — fall back to passive heuristic.
+                        info!("nightly consolidation: LLM unavailable, running passive heuristic distillation as fallback");
+                        match s.memory.run_sleep_cycle().await {
+                            Ok(ref summary) => {
+                                s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
+                                info!(
+                                    promoted = summary.promoted_ids.len(),
+                                    "nightly consolidation: passive fallback complete"
+                                );
+                            }
+                            Err(ref err) => warn!(?err, "nightly consolidation: passive fallback failed"),
+                        }
                     }
-                    Err(ref err) => warn!(?err, "background multi-agent sleep cycle failed"),
+                    Err(ref err) => {
+                        warn!(?err, "nightly multi-agent LLM consolidation: generation failed");
+                    }
                 }
             }
         }
@@ -272,18 +326,52 @@ pub(super) fn spawn_proactive_task(
 
             last_check = std::time::Instant::now();
 
-            let (rt_clone, mut memory) = {
-                let mut s = state.lock().await;
+            // ── Snapshot phase: briefly lock to clone runtime + build prompt data ──
+            let (rt_clone, beliefs_summary, reflections_summary) = {
+                let s = state.lock().await;
                 let rt = s.runtime.clone();
-                let mem = std::mem::take(&mut s.memory);
-                (rt, mem)
+
+                let beliefs = s.memory.all_beliefs();
+                let b_summary = if beliefs.is_empty() {
+                    "(none yet)".to_string()
+                } else {
+                    beliefs
+                        .iter()
+                        .take(8)
+                        .map(|e| format!("- {}", e.content))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+
+                let ctx = s.memory.context_for_prompt_ranked_with_embed("recent", 5, None);
+                let r_summary = {
+                    let reflections: Vec<String> = ctx
+                        .iter()
+                        .filter(|item| item.entry.tier == MemoryTier::Reflective)
+                        .map(|item| {
+                            format!("- {}", crate::prompt_builder::truncate_for_prompt(&item.entry.content, 200))
+                        })
+                        .collect();
+                    if reflections.is_empty() {
+                        "(none yet)".to_string()
+                    } else {
+                        reflections.join("\n")
+                    }
+                };
+
+                (rt, b_summary, r_summary)
             };
+            // Lock released — user conversations proceed normally.
 
-            let outcome = rt_clone.run_proactive_check(&mut memory).await;
+            // ── LLM phase: no lock held ──
+            let outcome = rt_clone.run_proactive_check_from_summaries(
+                &beliefs_summary,
+                &reflections_summary,
+            ).await;
 
+            // ── Apply phase: re-acquire lock to record result ──
             {
                 let mut s = state.lock().await;
-                s.memory = memory;
                 let _ = s.memory.flush_all();
                 if let Some(out) = outcome {
                     if let Some(ref msg) = out.message {

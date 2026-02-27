@@ -245,18 +245,29 @@ pub(super) async fn handle_connection(
                                 let state2 = state.clone();
                                 let event_tx2 = s.event_tx.clone();
                                 tokio::spawn(async move {
-                                    let (rt, mut mem) = {
-                                        let mut s = state2.lock().await;
-                                        (s.runtime.clone(), std::mem::take(&mut s.memory))
+                                    let (rt, memories, identity) = {
+                                        let s = state2.lock().await;
+                                        (s.runtime.clone(), s.memory.all().to_vec(), s.memory.identity.clone())
                                     };
                                     let _ = event_tx2.send(BackendEvent::SleepCycleRunning);
                                     let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-                                    match rt.run_agentic_sleep_cycle(&mut mem, &noop_tx).await {
-                                        Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
+                                    let gen_result = rt.generate_agentic_sleep_insights(&memories, &identity, &noop_tx).await;
+                                    let mut s = state2.lock().await;
+                                    match gen_result {
+                                        Ok(crate::SleepGenerationResult::Insights(insights)) => {
+                                            match s.memory.apply_agentic_sleep_insights(insights, Some("auto-turn sleep".into())).await {
+                                                Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
+                                                Err(ref err) => warn!(?err, "auto-turn sleep apply failed"),
+                                            }
+                                        }
+                                        Ok(crate::SleepGenerationResult::PassiveFallback(_)) => {
+                                            match s.memory.run_sleep_cycle().await {
+                                                Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn passive sleep complete"),
+                                                Err(ref err) => warn!(?err, "auto-turn passive sleep failed"),
+                                            }
+                                        }
                                         Err(ref err) => warn!(?err, "auto-turn sleep failed"),
                                     }
-                                    let mut s = state2.lock().await;
-                                    s.memory = mem;
                                     let _ = s.memory.flush_all();
                                     let _ = event_tx2.send(BackendEvent::MemoryUpdated);
                                 });
@@ -539,18 +550,29 @@ pub(super) async fn handle_connection(
                             let state2 = state.clone();
                             let event_tx2 = s.event_tx.clone();
                             tokio::spawn(async move {
-                                let (rt, mut mem) = {
-                                    let mut s = state2.lock().await;
-                                    (s.runtime.clone(), std::mem::take(&mut s.memory))
+                                let (rt, memories, identity) = {
+                                    let s = state2.lock().await;
+                                    (s.runtime.clone(), s.memory.all().to_vec(), s.memory.identity.clone())
                                 };
                                 let _ = event_tx2.send(BackendEvent::SleepCycleRunning);
                                 let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-                                match rt.run_agentic_sleep_cycle(&mut mem, &noop_tx).await {
-                                    Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
+                                let gen_result = rt.generate_agentic_sleep_insights(&memories, &identity, &noop_tx).await;
+                                let mut s = state2.lock().await;
+                                match gen_result {
+                                    Ok(crate::SleepGenerationResult::Insights(insights)) => {
+                                        match s.memory.apply_agentic_sleep_insights(insights, Some("auto-turn sleep".into())).await {
+                                            Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
+                                            Err(ref err) => warn!(?err, "auto-turn sleep apply failed"),
+                                        }
+                                    }
+                                    Ok(crate::SleepGenerationResult::PassiveFallback(_)) => {
+                                        match s.memory.run_sleep_cycle().await {
+                                            Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn passive sleep complete"),
+                                            Err(ref err) => warn!(?err, "auto-turn passive sleep failed"),
+                                        }
+                                    }
                                     Err(ref err) => warn!(?err, "auto-turn sleep failed"),
                                 }
-                                let mut s = state2.lock().await;
-                                s.memory = mem;
                                 let _ = s.memory.flush_all();
                                 let _ = event_tx2.send(BackendEvent::MemoryUpdated);
                             });
@@ -684,28 +706,21 @@ pub(super) async fn handle_connection(
             send_event(&mut write_half, ServerEvent::Ack("pong".to_string())).await?;
         }
         ClientCommand::RunSleepCycle => {
-            // Take memory out of state and release the lock before the LLM call.
-            // Spawn the cycle in a separate task so we can stream StatusLine
-            // progress events back to the client while it runs.
-            //
+            // Snapshot → generate in background → stream progress → apply.
             // Uses the full multi-agent pipeline (4 specialists + synthesis)
             // which already falls back to single-agent if any LLM call fails.
-            let (runtime, memory) = {
-                let mut s = state.lock().await;
-                let runtime = s.runtime.clone();
-                let memory = std::mem::take(&mut s.memory);
-                (runtime, memory)
+            let (runtime, memories, identity) = {
+                let s = state.lock().await;
+                (s.runtime.clone(), s.memory.all().to_vec(), s.memory.identity.clone())
             };
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
             let (done_tx, mut done_rx) =
-                tokio::sync::oneshot::channel::<(String, aigent_memory::MemoryManager)>();
+                tokio::sync::oneshot::channel::<Result<crate::SleepGenerationResult, anyhow::Error>>();
             tokio::spawn(async move {
-                let mut mem = memory;
-                let msg = match runtime.run_multi_agent_sleep_cycle(&mut mem, &progress_tx).await {
-                    Ok(summary) => format!("sleep cycle complete: {}", summary.distilled),
-                    Err(err) => format!("sleep cycle failed: {err}"),
-                };
-                let _ = done_tx.send((msg, mem));
+                let result = runtime
+                    .generate_multi_agent_sleep_insights(&memories, &identity, &progress_tx)
+                    .await;
+                let _ = done_tx.send(result);
             });
             loop {
                 tokio::select! {
@@ -715,15 +730,40 @@ pub(super) async fn handle_connection(
                         }
                     }
                     result = &mut done_rx => {
-                        let (msg, memory_back) = result.expect("sleep task panicked");
+                        let gen_result = result.expect("sleep task panicked");
                         while let Ok(m) = progress_rx.try_recv() {
                             send_event(&mut write_half, ServerEvent::StatusLine(m)).await?;
                         }
-                        {
+                        let msg = {
                             let mut s = state.lock().await;
-                            s.memory = memory_back;
-                            let _ = s.memory.flush_all();
-                        }
+                            match gen_result {
+                                Ok(crate::SleepGenerationResult::Insights(insights)) => {
+                                    let summary_text = Some("User-triggered sleep cycle".into());
+                                    match s.memory.apply_agentic_sleep_insights(insights, summary_text).await {
+                                        Ok(summary) => {
+                                            let _ = s.memory.record(
+                                                aigent_memory::MemoryTier::Semantic,
+                                                "multi-agent sleep cycle completed",
+                                                "sleep:multi-agent-cycle",
+                                            ).await;
+                                            let _ = s.memory.flush_all();
+                                            format!("sleep cycle complete: {}", summary.distilled)
+                                        }
+                                        Err(err) => format!("sleep cycle apply failed: {err}"),
+                                    }
+                                }
+                                Ok(crate::SleepGenerationResult::PassiveFallback(_)) => {
+                                    match s.memory.run_sleep_cycle().await {
+                                        Ok(summary) => {
+                                            let _ = s.memory.flush_all();
+                                            format!("sleep cycle complete (passive fallback): {}", summary.distilled)
+                                        }
+                                        Err(err) => format!("sleep cycle passive fallback failed: {err}"),
+                                    }
+                                }
+                                Err(err) => format!("sleep cycle failed: {err}"),
+                            }
+                        };
                         send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
                         break;
                     }
@@ -731,22 +771,18 @@ pub(super) async fn handle_connection(
             }
         }
         ClientCommand::RunMultiAgentSleepCycle => {
-            let (runtime, memory) = {
-                let mut s = state.lock().await;
-                let runtime = s.runtime.clone();
-                let memory = std::mem::take(&mut s.memory);
-                (runtime, memory)
+            let (runtime, memories, identity) = {
+                let s = state.lock().await;
+                (s.runtime.clone(), s.memory.all().to_vec(), s.memory.identity.clone())
             };
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
             let (done_tx, mut done_rx) =
-                tokio::sync::oneshot::channel::<(String, aigent_memory::MemoryManager)>();
+                tokio::sync::oneshot::channel::<Result<crate::SleepGenerationResult, anyhow::Error>>();
             tokio::spawn(async move {
-                let mut mem = memory;
-                let msg = match runtime.run_multi_agent_sleep_cycle(&mut mem, &progress_tx).await {
-                    Ok(summary) => format!("multi-agent sleep cycle complete: {}", summary.distilled),
-                    Err(err) => format!("multi-agent sleep cycle failed: {err}"),
-                };
-                let _ = done_tx.send((msg, mem));
+                let result = runtime
+                    .generate_multi_agent_sleep_insights(&memories, &identity, &progress_tx)
+                    .await;
+                let _ = done_tx.send(result);
             });
             loop {
                 tokio::select! {
@@ -756,15 +792,40 @@ pub(super) async fn handle_connection(
                         }
                     }
                     result = &mut done_rx => {
-                        let (msg, memory_back) = result.expect("sleep task panicked");
+                        let gen_result = result.expect("sleep task panicked");
                         while let Ok(m) = progress_rx.try_recv() {
                             send_event(&mut write_half, ServerEvent::StatusLine(m)).await?;
                         }
-                        {
+                        let msg = {
                             let mut s = state.lock().await;
-                            s.memory = memory_back;
-                            let _ = s.memory.flush_all();
-                        }
+                            match gen_result {
+                                Ok(crate::SleepGenerationResult::Insights(insights)) => {
+                                    let summary_text = Some("Multi-agent sleep cycle".into());
+                                    match s.memory.apply_agentic_sleep_insights(insights, summary_text).await {
+                                        Ok(summary) => {
+                                            let _ = s.memory.record(
+                                                aigent_memory::MemoryTier::Semantic,
+                                                "multi-agent sleep cycle completed",
+                                                "sleep:multi-agent-cycle",
+                                            ).await;
+                                            let _ = s.memory.flush_all();
+                                            format!("multi-agent sleep cycle complete: {}", summary.distilled)
+                                        }
+                                        Err(err) => format!("multi-agent sleep cycle apply failed: {err}"),
+                                    }
+                                }
+                                Ok(crate::SleepGenerationResult::PassiveFallback(_)) => {
+                                    match s.memory.run_sleep_cycle().await {
+                                        Ok(summary) => {
+                                            let _ = s.memory.flush_all();
+                                            format!("multi-agent sleep cycle (passive fallback): {}", summary.distilled)
+                                        }
+                                        Err(err) => format!("multi-agent sleep cycle passive fallback failed: {err}"),
+                                    }
+                                }
+                                Err(err) => format!("multi-agent sleep cycle failed: {err}"),
+                            }
+                        };
                         send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
                         break;
                     }
@@ -772,17 +833,45 @@ pub(super) async fn handle_connection(
             }
         }
         ClientCommand::TriggerProactive => {
-            let (rt_clone, mut memory, event_tx_clone) = {
-                let mut s = state.lock().await;
+            // Snapshot beliefs/reflections, release lock, call LLM, re-acquire lock.
+            let (rt_clone, beliefs_summary, reflections_summary, event_tx_clone) = {
+                let s = state.lock().await;
                 let rt = s.runtime.clone();
-                let mem = std::mem::take(&mut s.memory);
                 let tx = s.event_tx.clone();
-                (rt, mem, tx)
+
+                let beliefs = s.memory.all_beliefs();
+                let b_summary = if beliefs.is_empty() {
+                    "(none yet)".to_string()
+                } else {
+                    beliefs
+                        .iter()
+                        .take(8)
+                        .map(|e| format!("- {}", e.content))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let ctx = s.memory.context_for_prompt_ranked_with_embed("recent", 5, None);
+                let r_summary = {
+                    let reflections: Vec<String> = ctx
+                        .iter()
+                        .filter(|item| item.entry.tier == MemoryTier::Reflective)
+                        .map(|item| {
+                            format!("- {}", crate::prompt_builder::truncate_for_prompt(&item.entry.content, 200))
+                        })
+                        .collect();
+                    if reflections.is_empty() {
+                        "(none yet)".to_string()
+                    } else {
+                        reflections.join("\n")
+                    }
+                };
+                (rt, b_summary, r_summary, tx)
             };
-            let outcome = rt_clone.run_proactive_check(&mut memory).await;
+            let outcome = rt_clone
+                .run_proactive_check_from_summaries(&beliefs_summary, &reflections_summary)
+                .await;
             let msg = {
                 let mut s = state.lock().await;
-                s.memory = memory;
                 let _ = s.memory.flush_all();
                 if let Some(out) = outcome {
                     if let Some(ref m) = out.message {
