@@ -145,12 +145,9 @@ impl GaitPolicy {
                 trusted_write_paths.push(canonical_ws);
             }
         }
-        // Always include self-repo path.
-        if let Some(ref self_path) = self_repo_path {
-            if !trusted_write_paths.contains(self_path) {
-                trusted_write_paths.push(self_path.clone());
-            }
-        }
+        // NOTE: self_repo_path is intentionally NOT added to
+        // trusted_write_paths — the agent can read its own source code
+        // but must not modify it.
 
         let trusted_repos: HashSet<String> =
             config.git.trusted_repos.iter().cloned().collect();
@@ -228,6 +225,16 @@ fn assert_inside_trusted(target: &Path, policy: &GaitPolicy) -> Result<()> {
 
 /// Authorise the operation according to the security policy.
 fn authorise(op: &GitOperation, repo_path: &Path, policy: &GaitPolicy) -> Result<()> {
+    // The agent's own source repo is strictly read-only.
+    if let Some(ref self_path) = policy.self_repo_path {
+        if repo_path.starts_with(self_path) && is_mutating_op(op) {
+            bail!(
+                "write operations on the Aigent source repository are not allowed. \
+                 Use repo=\"workspace\" for your own work."
+            );
+        }
+    }
+
     if is_mutating_op(op) {
         assert_inside_trusted(repo_path, policy)
     } else if policy.allow_system_read {
@@ -860,10 +867,10 @@ impl Tool for GaitTool {
             description: "Preferred git tool — safe, powerful, and recommended for all git \
                           operations. Use repo=\"workspace\" for the sandboxed workspace \
                           where you create and edit files on behalf of the user. Use \
-                          repo=\"self\" to inspect or update the Aigent source code itself. \
-                          The workspace has its own git repository (auto-initialised); never \
-                          confuse it with the Aigent project repo. All writes are restricted \
-                          to trusted_write_paths only."
+                          repo=\"self\" to READ the Aigent source code (read-only — \
+                          writes are blocked). The workspace has its own git repository \
+                          (auto-initialised); never confuse it with the Aigent project \
+                          repo. All writes are restricted to trusted_write_paths only."
                 .to_string(),
             params: vec![
                 ToolParam {
@@ -878,8 +885,9 @@ impl Tool for GaitTool {
                     name: "repo".to_string(),
                     description: "Target repository. \"workspace\" = the sandboxed directory \
                                   where you work on user tasks (file edits, projects). \
-                                  \"self\" = the Aigent source code repository. You may also \
-                                  pass an absolute path or a remote URL (clone/ls-remote only)."
+                                  \"self\" = the Aigent source code (read-only: status, log, \
+                                  diff, show, blame only). You may also pass an absolute \
+                                  path or a remote URL (clone/ls-remote only)."
                         .to_string(),
                     required: true,
                 },
