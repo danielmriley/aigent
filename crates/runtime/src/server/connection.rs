@@ -428,7 +428,7 @@ pub(super) async fn handle_connection(
                         "Tool '{}' {}: {}",
                         name,
                         if output.success { "succeeded" } else { "failed" },
-                        &output.output[..output.output.len().min(200)],
+                        safe_truncate(&output.output, 200),
                     );
                     if let Err(err) = state.memory.record(
                         MemoryTier::Procedural,
@@ -465,6 +465,10 @@ pub(super) async fn handle_connection(
         }
         ClientCommand::ReloadConfig => {
             let mut state = state.lock().await;
+            // Re-read .env so a newly written OPENROUTER_API_KEY (or other
+            // secrets saved via onboarding) takes effect immediately without
+            // requiring a daemon restart.
+            let _ = dotenvy::from_path_override(std::path::Path::new(".env"));
             let updated = AppConfig::load_from("config/default.toml")?;
             state.runtime.config = updated;
             send_event(
