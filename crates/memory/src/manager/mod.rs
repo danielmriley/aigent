@@ -1,14 +1,17 @@
 use anyhow::{Result, bail};
 use chrono::Utc;
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-/// A synchronous function that maps a text string to an optional embedding
-/// vector.  Stored as an `Arc` so it can be cloned across structs.
-pub type EmbedFn = Arc<dyn Fn(&str) -> Option<Vec<f32>> + Send + Sync>;
+/// An async function that maps a text string to an optional embedding vector.
+/// Stored as an `Arc` so it can be cloned across structs.  The returned future
+/// is `Send + 'static` so it can be spawned or `.await`ed anywhere.
+pub type EmbedFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<Vec<f32>>> + Send>> + Send + Sync>;
 
 use crate::consistency::{ConsistencyDecision, evaluate_core_update};
 use crate::event_log::{MemoryEventLog, MemoryRecordEvent};
@@ -126,7 +129,7 @@ impl MemoryManager {
         self.vault_path.as_deref()
     }
 
-    /// Configure a synchronous embedding backend.  All new entries recorded
+    /// Configure an async embedding backend.  All new entries recorded
     /// after this call will have their `embedding` field populated.
     pub fn set_embed_fn(&mut self, f: EmbedFn) {
         self.embed_fn = Some(f);
@@ -240,7 +243,10 @@ impl MemoryManager {
         source: String,
         tags: Vec<String>,
     ) -> Result<MemoryEntry> {
-        let embedding = self.embed_fn.as_ref().and_then(|f| f(&content));
+        let embedding = match &self.embed_fn {
+            Some(f) => f(content.clone()).await,
+            None => None,
+        };
         let entry = MemoryEntry {
             id: Uuid::new_v4(),
             tier,
@@ -357,8 +363,8 @@ impl MemoryManager {
 
     // ── Embedding ──────────────────────────────────────────────────────────
 
-    /// Return a clone of the embedding function Arc so async callers can move
-    /// it into `tokio::task::spawn_blocking` without holding a `&MemoryManager`.
+    /// Return a clone of the embedding function Arc so callers can invoke it
+    /// independently without holding a `&MemoryManager`.
     pub fn embed_fn_arc(&self) -> Option<EmbedFn> {
         self.embed_fn.clone()
     }

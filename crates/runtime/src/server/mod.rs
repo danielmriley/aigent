@@ -115,7 +115,7 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
     }
 }
 
-/// Build a synchronous embedding function that calls the Ollama `/api/embeddings`
+/// Build an async embedding function that calls the Ollama `/api/embeddings`
 /// endpoint.  Falls back to `None` silently so the system continues to work
 /// when Ollama is unavailable.
 fn make_ollama_embed_fn(model: &str, base_url: &str) -> EmbedFn {
@@ -124,20 +124,26 @@ fn make_ollama_embed_fn(model: &str, base_url: &str) -> EmbedFn {
     let base_url = std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| base_url.to_string());
     let url = format!("{}/api/embeddings", base_url.trim_end_matches('/'));
 
-    Arc::new(move |text: &str| {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .ok()?;
-        let body = serde_json::json!({ "model": model, "prompt": text });
-        let resp = client.post(&url).json(&body).send().ok()?;
-        let json: serde_json::Value = resp.json().ok()?;
-        let embedding = json["embedding"]
-            .as_array()?
-            .iter()
-            .filter_map(|v| v.as_f64().map(|f| f as f32))
-            .collect::<Vec<f32>>();
-        if embedding.is_empty() { None } else { Some(embedding) }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    Arc::new(move |text: String| {
+        let client = client.clone();
+        let url = url.clone();
+        let model = model.clone();
+        Box::pin(async move {
+            let body = serde_json::json!({ "model": model, "prompt": text });
+            let resp = client.post(&url).json(&body).send().await.ok()?;
+            let json: serde_json::Value = resp.json().await.ok()?;
+            let embedding = json["embedding"]
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect::<Vec<f32>>();
+            if embedding.is_empty() { None } else { Some(embedding) }
+        })
     })
 }
 

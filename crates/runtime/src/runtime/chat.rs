@@ -91,14 +91,9 @@ impl AgentRuntime {
             "memory state before context assembly"
         );
 
-        // Compute the query embedding off the async thread so the Tokio runtime
-        // is never blocked by a synchronous HTTP call to the embedding backend.
+        // Compute the query embedding asynchronously via the embedding backend.
         let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
-            let msg = user_message.to_string();
-            tokio::task::spawn_blocking(move || embed_fn(&msg))
-                .await
-                .ok()
-                .flatten()
+            embed_fn(user_message.to_string()).await
         } else {
             None
         };
