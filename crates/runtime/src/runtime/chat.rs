@@ -44,17 +44,13 @@ impl AgentRuntime {
         // Persist the user turn immediately so it survives a restart.
         memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input").await?;
 
-        // Improvement 1: extract structured profile signals from the user message
-        // immediately, without waiting for the nightly sleep cycle.
-        let profile_signals = crate::micro_profile::extract_inline_profile_signals(user_message);
-        for (key, value, category) in &profile_signals {
-            if let Err(err) = memory.record_user_profile_keyed(key, value, category).await {
-                warn!(?err, key, "micro-profile signal failed");
-            }
-        }
-        if !profile_signals.is_empty() {
-            debug!(count = profile_signals.len(), "micro-profile signals extracted");
-        }
+        // Spawn micro-profile extraction on a blocking thread so it runs in
+        // parallel with the embedding HTTP call below.  The extraction is pure
+        // CPU work (regex matching) and doesn't need the async runtime.
+        let msg_owned = user_message.to_string();
+        let profile_handle = tokio::task::spawn_blocking(move || {
+            crate::micro_profile::extract_inline_profile_signals(&msg_owned)
+        });
 
         // Collect pending follow-ups on the first turn of a new conversation,
         // or when the user is returning after a significant absence (≥4h).
@@ -92,11 +88,26 @@ impl AgentRuntime {
         );
 
         // Compute the query embedding asynchronously via the embedding backend.
+        // This HTTP call runs concurrently with the profile extraction above.
         let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
             embed_fn(user_message.to_string()).await
         } else {
             None
         };
+
+        // Collect profile signals (the spawn_blocking should be done by now)
+        // and persist them.  This happens after the embedding call so the two
+        // ran in parallel, shaving the extraction latency off TTFT.
+        if let Ok(profile_signals) = profile_handle.await {
+            for (key, value, category) in &profile_signals {
+                if let Err(err) = memory.record_user_profile_keyed(key, value, category).await {
+                    warn!(?err, key, "micro-profile signal failed");
+                }
+            }
+            if !profile_signals.is_empty() {
+                debug!(count = profile_signals.len(), "micro-profile signals extracted");
+            }
+        }
 
         // Retrieve ranked context (Core + UserProfile + Reflective always included).
         let context = memory.context_for_prompt_ranked_with_embed(user_message, 10, query_embedding);

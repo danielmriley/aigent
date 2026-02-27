@@ -61,6 +61,10 @@ pub struct MemoryManager {
     /// Maximum entries per tier written into the YAML KV vault summaries.
     /// Defaults to [`KV_TIER_LIMIT`].  Overridden via [`set_kv_tier_limit`].
     kv_tier_limit: usize,
+    /// Cached identity prompt block — invalidated when `identity` changes.
+    cached_identity_block: Option<String>,
+    /// Cached beliefs prompt block — invalidated on `record_belief` / `retract_belief`.
+    cached_beliefs_block: Option<String>,
 }
 
 impl Default for MemoryManager {
@@ -73,6 +77,8 @@ impl Default for MemoryManager {
             embed_fn: None,
             index: None,
             kv_tier_limit: DEFAULT_KV_TIER_LIMIT,
+            cached_identity_block: None,
+            cached_beliefs_block: None,
         }
     }
 }
@@ -89,6 +95,8 @@ impl MemoryManager {
             embed_fn: None,
             index: None,
             kv_tier_limit: KV_TIER_LIMIT,
+            cached_identity_block: None,
+            cached_beliefs_block: None,
         };
 
         let events = manager
@@ -311,6 +319,7 @@ impl MemoryManager {
         ).await?;
         // Override confidence with the caller-supplied value.
         entry.confidence = confidence.clamp(0.0, 1.0);
+        self.invalidate_prompt_caches();
         info!(claim = %entry.content, confidence, "belief recorded");
         Ok(entry)
     }
@@ -330,6 +339,7 @@ impl MemoryManager {
             format!("belief:retracted:{belief_id}"),
         )
         .await?;
+        self.invalidate_prompt_caches();
         info!(%belief_id, "belief retracted");
         Ok(())
     }
@@ -355,6 +365,65 @@ impl MemoryManager {
             .iter()
             .filter(|e| e.source == "belief" && !retracted_ids.contains(&e.id))
             .collect()
+    }
+
+    // ── Prompt block cache ─────────────────────────────────────────────────
+
+    /// Return the cached identity prompt block, or compute and cache it.
+    pub fn cached_identity_block(&mut self) -> &str {
+        if self.cached_identity_block.is_none() {
+            let kernel = &self.identity;
+            let top_traits: Vec<String> = {
+                let mut scores: Vec<(&String, &f32)> = kernel.trait_scores.iter().collect();
+                scores.sort_by(|a, b| b.1.total_cmp(a.1));
+                scores.iter().take(3).map(|(k, v)| format!("{k} ({v:.2})")).collect()
+            };
+            let block = format!(
+                "IDENTITY:\nCommunication style: {}.\nStrongest traits: {}.\nLong-term goals: {}.",
+                kernel.communication_style,
+                if top_traits.is_empty() { "not yet established".to_string() } else { top_traits.join(", ") },
+                if kernel.long_goals.is_empty() { "not yet established".to_string() } else { kernel.long_goals.join("; ") },
+            );
+            self.cached_identity_block = Some(block);
+        }
+        self.cached_identity_block.as_deref().unwrap()
+    }
+
+    /// Return the cached beliefs prompt block, or compute and cache it.
+    /// `max_beliefs`: 0 means unlimited.
+    pub fn cached_beliefs_block(&mut self, max_beliefs: usize) -> &str {
+        if self.cached_beliefs_block.is_none() {
+            let mut beliefs = self.all_beliefs();
+            let block = if beliefs.is_empty() {
+                String::new()
+            } else {
+                let now = chrono::Utc::now();
+                beliefs.sort_by(|a, b| {
+                    let score = |e: &&MemoryEntry| {
+                        let days = (now - e.created_at).num_days().max(0) as f32;
+                        let recency = 1.0_f32 / (1.0 + days);
+                        e.confidence * 0.6 + recency * 0.25 + e.valence.clamp(0.0, 1.0) * 0.15
+                    };
+                    score(b).total_cmp(&score(a))
+                });
+                let take_n = if max_beliefs == 0 { beliefs.len() } else { max_beliefs.min(beliefs.len()) };
+                let items = beliefs[..take_n]
+                    .iter()
+                    .map(|e| format!("- {}", e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("\n\nMY_BELIEFS:\n{items}")
+            };
+            self.cached_beliefs_block = Some(block);
+        }
+        self.cached_beliefs_block.as_deref().unwrap()
+    }
+
+    /// Invalidate all prompt block caches.  Call after sleep cycles,
+    /// belief mutations, or identity kernel updates.
+    pub fn invalidate_prompt_caches(&mut self) {
+        self.cached_identity_block = None;
+        self.cached_beliefs_block = None;
     }
 
     pub fn flush_all(&mut self) -> Result<()> {

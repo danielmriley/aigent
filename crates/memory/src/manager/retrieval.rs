@@ -31,12 +31,8 @@ impl MemoryManager {
         limit: usize,
         query_embedding: Option<Vec<f32>>,
     ) -> Vec<RankedMemoryContext> {
-        let core_entries = self
-            .entries_by_tier(MemoryTier::Core)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let non_core = self
+        let core_entries = self.entries_by_tier(MemoryTier::Core);
+        let non_core: Vec<&MemoryEntry> = self
             .store
             .all()
             .iter()
@@ -45,8 +41,7 @@ impl MemoryManager {
                     && !entry.source.starts_with("assistant-turn")
                     && entry.source != "sleep:cycle"
             })
-            .cloned()
-            .collect::<Vec<_>>();
+            .collect();
         let mut ranked = assemble_context_with_provenance(&non_core, &core_entries, query, limit, query_embedding);
         self.prepend_kv_identity_block(&mut ranked);
         ranked

@@ -67,6 +67,7 @@ impl MemoryManager {
         }
 
         self.sync_vault_projection()?;
+        self.invalidate_prompt_caches();
         info!(promoted = summary.promoted_ids.len(), "sleep cycle complete");
         Ok(summary)
     }

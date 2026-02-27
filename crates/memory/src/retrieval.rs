@@ -36,9 +36,9 @@ pub struct RankedMemoryContext {
 ///
 /// Accepts **slices** to avoid cloning the caller's full memory store before
 /// ranking.  Only the winning `limit` entries are cloned into the output.
-pub fn assemble_context_with_provenance<'a>(
-    matches: &'a [MemoryEntry],
-    core_entries: &'a [MemoryEntry],
+pub fn assemble_context_with_provenance(
+    matches: &[&MemoryEntry],
+    core_entries: &[&MemoryEntry],
     query: &str,
     limit: usize,
     query_embedding: Option<Vec<f32>>,
@@ -48,7 +48,8 @@ pub fn assemble_context_with_provenance<'a>(
     let mut seen_ids = HashSet::new();
     let combined: Vec<&MemoryEntry> = core_entries
         .iter()
-        .chain(matches.iter())
+        .copied()
+        .chain(matches.iter().copied())
         .filter(|e| seen_ids.insert(e.id))
         .collect();
 
@@ -231,8 +232,8 @@ mod tests {
         let semantic = sample_entry(MemoryTier::Semantic, "my name is aigent", 2);
 
         let ranked = assemble_context_with_provenance(
-            &[semantic],
-            std::slice::from_ref(&core),
+            &[&semantic],
+            &[&core],
             "what is your name",
             2,
             None,
@@ -252,7 +253,7 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "some other fact", 1);
 
         let ranked =
-            assemble_context_with_provenance(&[episodic, profile.clone()], &[], "", 2, None);
+            assemble_context_with_provenance(&[&episodic, &profile], &[], "", 2, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(profile.id));
         Ok(())
@@ -268,7 +269,7 @@ mod tests {
         );
 
         let ranked = assemble_context_with_provenance(
-            &[unrelated, relevant.clone()],
+            &[&unrelated, &relevant],
             &[],
             "create milestone project plan",
             2,
@@ -289,7 +290,7 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "user mentioned project X briefly", 1);
 
         let ranked =
-            assemble_context_with_provenance(&[reflective.clone(), episodic], &[], "", 2, None);
+            assemble_context_with_provenance(&[&reflective, &episodic], &[], "", 2, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(reflective.id));
         Ok(())
@@ -310,7 +311,7 @@ mod tests {
         let query_embedding = Some(vec![1.0_f32, 0.0, 0.0]);
 
         let ranked = assemble_context_with_provenance(
-            &[close.clone(), far],
+            &[&close, &far],
             &[],
             "rust async",
             2,
