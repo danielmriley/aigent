@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use tokio::fs;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -105,8 +106,8 @@ pub fn is_mutating_call(action: &str, args: &std::collections::HashMap<String, S
 impl GaitPolicy {
     /// Build from `AppConfig`.  Automatically adds workspace root and Aigent
     /// source directory to the trusted write paths.
-    pub fn from_config(config: &aigent_config::AppConfig) -> Self {
-        let workspace_root = std::fs::canonicalize(&config.agent.workspace_path)
+    pub async fn from_config(config: &aigent_config::AppConfig) -> Self {
+        let workspace_root = fs::canonicalize(&config.agent.workspace_path).await
             .unwrap_or_else(|_| PathBuf::from(&config.agent.workspace_path));
 
         // Detect Aigent source directory: first try AIGENT_SOURCE_DIR env, then
@@ -128,17 +129,17 @@ impl GaitPolicy {
                     None
                 })
             })
-            .and_then(|p| std::fs::canonicalize(p).ok());
+            .and_then(|p| std::fs::canonicalize(p).ok()); // sync: runs once at startup
 
-        let mut trusted_write_paths: Vec<PathBuf> = config
-            .git
-            .trusted_write_paths
-            .iter()
-            .filter_map(|p| std::fs::canonicalize(p).ok())
-            .collect();
+        let mut trusted_write_paths: Vec<PathBuf> = Vec::new();
+        for p in &config.git.trusted_write_paths {
+            if let Ok(c) = fs::canonicalize(p).await {
+                trusted_write_paths.push(c);
+            }
+        }
 
         // Always include workspace root.
-        if let Ok(canonical_ws) = std::fs::canonicalize(&config.agent.workspace_path) {
+        if let Ok(canonical_ws) = fs::canonicalize(&config.agent.workspace_path).await {
             if !trusted_write_paths.contains(&canonical_ws) {
                 trusted_write_paths.push(canonical_ws);
             }
@@ -173,7 +174,7 @@ impl GaitPolicy {
 /// Resolve the `repo` field of a `GitOperation` to a canonical local path.
 /// Returns `Err` for remote URLs that aren't being cloned (those go through
 /// `ls-remote` / `clone` directly).
-pub(super) fn resolve_repo_path(op: &GitOperation, policy: &GaitPolicy) -> Result<PathBuf> {
+pub(super) async fn resolve_repo_path(op: &GitOperation, policy: &GaitPolicy) -> Result<PathBuf> {
     let raw = op.repo.trim();
     if raw.eq_ignore_ascii_case("workspace") {
         // The workspace directory is auto-initialised as a git repo on
@@ -198,7 +199,7 @@ pub(super) fn resolve_repo_path(op: &GitOperation, policy: &GaitPolicy) -> Resul
         );
     }
     // Treat as a local path.
-    std::fs::canonicalize(raw)
+    fs::canonicalize(raw).await
         .map_err(|e| anyhow::anyhow!("cannot resolve repo path '{}': {}", raw, e))
 }
 

@@ -9,7 +9,7 @@ use tracing::info;
 use super::open_repo;
 use super::types::{GitOperation, GaitPolicy, assert_inside_trusted};
 
-pub(super) async fn do_commit(repo_path: &Path, op: &GitOperation) -> Result<String> {
+pub(super) fn do_commit_sync(repo_path: &Path, op: &GitOperation) -> Result<String> {
     let msg = op
         .message
         .as_deref()
@@ -155,7 +155,7 @@ pub(super) async fn do_clone(op: &GitOperation, policy: &GaitPolicy) -> Result<S
                 None => break,
             };
         }
-        let canonical_base = std::fs::canonicalize(&existing)
+        let canonical_base = tokio::fs::canonicalize(&existing).await
             .map_err(|e| anyhow::anyhow!("cannot resolve clone target base '{}': {}", existing.display(), e))?;
         let mut result = canonical_base;
         for part in suffix_parts.into_iter().rev() {
@@ -170,14 +170,14 @@ pub(super) async fn do_clone(op: &GitOperation, policy: &GaitPolicy) -> Result<S
     if !url.starts_with("https://") && !url.starts_with("http://") && !url.starts_with("git@")
         && !policy.allow_system_read
     {
-        let source = std::fs::canonicalize(url)
+        let source = tokio::fs::canonicalize(url).await
             .map_err(|e| anyhow::anyhow!("cannot resolve clone source '{}': {}", url, e))?;
         assert_inside_trusted(&source, policy)?;
     }
 
     // Now that the trust check passed, create parent directories.
     if let Some(parent) = canonical_target.parent() {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
 
     info!(url = %url, target = %canonical_target.display(), "gait: cloning");

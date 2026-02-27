@@ -404,7 +404,7 @@ pub fn ensure_within_workspace(workspace_root: &Path, target: &Path) -> Result<P
 
 // ── Convenience: create a default registry with built-in tools ───────────────
 
-pub fn default_registry(
+pub async fn default_registry(
     workspace_root: PathBuf,
     agent_data_dir: PathBuf,
     brave_api_key: Option<String>,
@@ -423,7 +423,7 @@ pub fn default_registry(
         let mut gait_config = app_config.clone();
         // Ensure workspace_path matches the canonical root passed to the registry.
         gait_config.agent.workspace_path = workspace_root.display().to_string();
-        let policy = gait::GaitPolicy::from_config(&gait_config);
+        let policy = gait::GaitPolicy::from_config(&gait_config).await;
         let gait_tool = gait::GaitTool { policy };
         registry.register(Box::new(gait_tool));
     }
@@ -723,7 +723,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, &aigent_config::AppConfig::default());
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, &aigent_config::AppConfig::default()).await;
 
         let mut args = HashMap::new();
         args.insert("command".to_string(), "echo hi".to_string());
@@ -751,7 +751,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, &aigent_config::AppConfig::default());
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, &aigent_config::AppConfig::default()).await;
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), "hello.txt".to_string());
@@ -774,7 +774,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, &aigent_config::AppConfig::default());
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, &aigent_config::AppConfig::default()).await;
 
         let result = executor
             .execute(&registry, "nonexistent_tool", &HashMap::new())

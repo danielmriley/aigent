@@ -162,7 +162,7 @@ pub(super) async fn do_ls_remote(op: &GitOperation, policy: &GaitPolicy) -> Resu
     // ls-remote is read-only but hits the network.  For local paths, check
     // access according to policy.
     if !url.starts_with("https://") && !url.starts_with("http://") && !url.starts_with("git@") {
-        let path = std::fs::canonicalize(url)?;
+        let path = tokio::fs::canonicalize(url).await?;
         if !policy.allow_system_read {
             assert_inside_trusted(&path, policy)?;
         }

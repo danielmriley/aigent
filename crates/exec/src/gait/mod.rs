@@ -34,24 +34,36 @@ pub async fn perform_gait(op: GitOperation, policy: &GaitPolicy) -> Result<Strin
         "ls-remote" => read::do_ls_remote(&op, policy).await,
         // All other actions need a local repo path
         _ => {
-            let repo_path = types::resolve_repo_path(&op, policy)?;
+            let repo_path = types::resolve_repo_path(&op, policy).await?;
             types::authorise(&op, &repo_path, policy)?;
             match action.as_str() {
-                "status" => read::do_status(&repo_path),
-                "log" => read::do_log(&repo_path, &op),
-                "diff" => read::do_diff(&repo_path, &op),
-                "commit" => write::do_commit(&repo_path, &op).await,
-                "checkout" => write::do_checkout(&repo_path, &op),
-                "branch" => write::do_branch(&repo_path, &op),
-                "reset" => write::do_reset(&repo_path, &op),
-                "show" => read::do_show(&repo_path, &op),
+                // Network operations — already async (use git CLI under the hood).
                 "pull" => write::do_pull(&repo_path, &op).await,
                 "push" => write::do_push(&repo_path, &op).await,
                 "fetch" => read::do_fetch(&repo_path, &op).await,
-                "stash" => write::do_stash(&repo_path, &op),
                 "blame" => read::do_blame(&repo_path, &op).await,
-                "tag" => write::do_tag(&repo_path, &op),
-                other => bail!("unsupported gait action: '{other}'"),
+                // libgit2 operations — synchronous and potentially CPU/IO-heavy.
+                // Offload to a blocking thread to avoid stalling the executor.
+                _ => {
+                    let repo_path = repo_path.clone();
+                    let op = op.clone();
+                    let action = action.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match action.as_str() {
+                            "status" => read::do_status(&repo_path),
+                            "log" => read::do_log(&repo_path, &op),
+                            "diff" => read::do_diff(&repo_path, &op),
+                            "commit" => write::do_commit_sync(&repo_path, &op),
+                            "checkout" => write::do_checkout(&repo_path, &op),
+                            "branch" => write::do_branch(&repo_path, &op),
+                            "reset" => write::do_reset(&repo_path, &op),
+                            "show" => read::do_show(&repo_path, &op),
+                            "stash" => write::do_stash(&repo_path, &op),
+                            "tag" => write::do_tag(&repo_path, &op),
+                            other => bail!("unsupported gait action: '{other}'"),
+                        }
+                    }).await?
+                }
             }
         }
     }
@@ -835,14 +847,14 @@ mod tests {
 
     // ── GaitPolicy::from_config ────────────────────────────────────────────
 
-    #[test]
-    fn gait_policy_from_default_config() {
+    #[tokio::test]
+    async fn gait_policy_from_default_config() {
         let mut config = aigent_config::AppConfig::default();
         // Point workspace to a temp dir so canonicalize works
         let dir = TempDir::new().unwrap();
         config.agent.workspace_path = dir.path().display().to_string();
 
-        let policy = GaitPolicy::from_config(&config);
+        let policy = GaitPolicy::from_config(&config).await;
         assert!(policy.allow_system_read);
         assert!(policy.trusted_repos.contains("https://github.com/danielmriley/aigent"));
         // Workspace root should be in trusted write paths
@@ -850,15 +862,15 @@ mod tests {
         assert!(policy.trusted_write_paths.contains(&canonical_ws));
     }
 
-    #[test]
-    fn gait_policy_safer_mode_disables_system_read() {
+    #[tokio::test]
+    async fn gait_policy_safer_mode_disables_system_read() {
         let mut config = aigent_config::AppConfig::default();
         let dir = TempDir::new().unwrap();
         config.agent.workspace_path = dir.path().display().to_string();
         config.tools.approval_mode = aigent_config::ApprovalMode::Safer;
         config.git.allow_system_read = true; // would be true, but safer overrides
 
-        let policy = GaitPolicy::from_config(&config);
+        let policy = GaitPolicy::from_config(&config).await;
         assert!(!policy.allow_system_read);
     }
 
