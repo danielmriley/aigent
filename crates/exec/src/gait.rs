@@ -181,6 +181,21 @@ impl GaitPolicy {
 fn resolve_repo_path(op: &GitOperation, policy: &GaitPolicy) -> Result<PathBuf> {
     let raw = op.repo.trim();
     if raw.eq_ignore_ascii_case("workspace") {
+        // The workspace_root may be a sandbox directory without .git.
+        // Walk upward to find the nearest directory containing .git so
+        // Read operations like `status` and `log` work naturally.
+        let mut candidate = policy.workspace_root.clone();
+        loop {
+            if candidate.join(".git").exists() {
+                return Ok(candidate);
+            }
+            match candidate.parent() {
+                Some(parent) => candidate = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        // Fall back to the literal workspace root (will yield a clear
+        // "not a git repository" error from libgit2).
         return Ok(policy.workspace_root.clone());
     }
     if raw.eq_ignore_ascii_case("self") {
@@ -855,8 +870,9 @@ impl Tool for GaitTool {
         ToolSpec {
             name: "perform_gait".to_string(),
             description: "Preferred git tool — safe, powerful, and recommended for all git \
-                          operations including self-updates. All writes (including clone) are \
-                          restricted to trusted_write_paths only."
+                          operations including self-updates. Use repo=\"workspace\" for the \
+                          project you are working in, repo=\"self\" for the Aigent source code. \
+                          All writes are restricted to trusted_write_paths only."
                 .to_string(),
             params: vec![
                 ToolParam {

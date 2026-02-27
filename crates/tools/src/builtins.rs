@@ -395,26 +395,28 @@ impl WebSearchTool {
         let json: serde_json::Value = resp.json().await?;
 
         let mut parts: Vec<String> = Vec::new();
-        let mut top_url: Option<String> = None;
+        let mut page_urls: Vec<String> = Vec::new();
         if let Some(results) = json["web"]["results"].as_array() {
             for item in results.iter().take(max_results) {
                 let title = item["title"].as_str().unwrap_or("").trim();
                 let url = item["url"].as_str().unwrap_or("").trim();
                 let desc = item["description"].as_str().unwrap_or("").trim();
                 if !title.is_empty() {
-                    if top_url.is_none() && !url.is_empty() {
-                        top_url = Some(url.to_string());
+                    if page_urls.len() < 3 && !url.is_empty() {
+                        page_urls.push(url.to_string());
                     }
                     parts.push(format!("{title}\n  {url}\n  {desc}"));
                 }
             }
         }
 
-        // Fetch the top result page to extract actual content (not just
-        // search snippets).  This prevents the LLM from hallucinating data
-        // that wasn't in the search description (e.g. stock prices, scores).
-        if let Some(url) = top_url {
-            if let Some(excerpt) = fetch_page_excerpt(&client, &url, 2000).await {
+        // Fetch the top result pages to extract actual content (not just
+        // search snippets).  Multiple pages give the LLM cross-references
+        // for factual queries (stock prices, scores, etc.).
+        // Structured data (JSON-LD, meta tags) is extracted first since it
+        // survives JavaScript-heavy single-page apps.
+        for url in &page_urls {
+            if let Some(excerpt) = fetch_page_excerpt(&client, url, 4000).await {
                 parts.push(format!("\n--- Page content from {url} ---\n{excerpt}"));
             }
         }
@@ -478,7 +480,7 @@ impl WebSearchTool {
 
         // Fetch the abstract source page for real content when available.
         if !abstract_url.is_empty() {
-            if let Some(excerpt) = fetch_page_excerpt(&client, &abstract_url, 2000).await {
+            if let Some(excerpt) = fetch_page_excerpt(&client, &abstract_url, 4000).await {
                 parts.push(format!("\n--- Page content from {abstract_url} ---\n{excerpt}"));
             }
         }
@@ -535,7 +537,26 @@ async fn fetch_page_excerpt(
         &body
     };
 
-    Some(html_to_text(body, max_chars))
+    // Extract structured data first (JSON-LD, meta tags, title) — these
+    // survive JS-heavy SPAs where the body text is empty / boilerplate.
+    let structured = extract_structured_data(body);
+    let plain = html_to_text(body, max_chars);
+
+    if structured.is_empty() {
+        Some(plain)
+    } else if plain.is_empty() {
+        Some(structured)
+    } else {
+        // Budget: give structured data up to 1/3 of max_chars, rest to plain text.
+        let struct_budget = max_chars / 3;
+        let struct_part = if structured.len() > struct_budget {
+            let end = truncate_byte_boundary(&structured, struct_budget);
+            format!("{}…", &structured[..end])
+        } else {
+            structured
+        };
+        Some(format!("{struct_part}\n\n{plain}"))
+    }
 }
 
 /// Minimal HTML-to-text extraction.  Strips tags, collapses whitespace, and
@@ -592,8 +613,10 @@ fn html_to_text(html: &str, max_chars: usize) -> String {
             }
 
             // Drop the tag itself (no output).
-        } else if skip_depth == 0 {
-            cleaned.push(ch);
+        } else {
+            if skip_depth == 0 {
+                cleaned.push(ch);
+            }
         }
     }
 
@@ -643,6 +666,158 @@ fn html_to_text(html: &str, max_chars: usize) -> String {
     } else {
         trimmed
     }
+}
+
+/// Extract structured data from HTML that survives JavaScript-heavy pages.
+///
+/// Pulls out:
+///   - `<title>` — almost always present even in SPAs
+///   - `<meta>` tags: `og:title`, `og:description`, `description`, plus any
+///     tag whose `name` or `property` contains "price", "amount", or "stock"
+///   - `<script type="application/ld+json">` — structured data used by Google
+///     (financial sites often embed stock quotes here)
+///
+/// Returns a compact multi-line summary.  Empty string when nothing is found.
+fn extract_structured_data(html: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    // ── <title> ────────────────────────────────────────────────────────────
+    if let Some(start) = html.to_ascii_lowercase().find("<title") {
+        if let Some(gt) = html[start..].find('>') {
+            let after = start + gt + 1;
+            if let Some(end) = html[after..].find("</") {
+                let title = html[after..after + end].trim();
+                if !title.is_empty() && title.len() < 500 {
+                    lines.push(format!("Title: {title}"));
+                }
+            }
+        }
+    }
+
+    // ── <meta> tags ────────────────────────────────────────────────────────
+    // We scan for `<meta` and extract `name=`/`property=` and `content=`.
+    let lower = html.to_ascii_lowercase();
+    let interesting_attrs = [
+        "og:title", "og:description", "og:type",
+        "description", "twitter:title", "twitter:description",
+    ];
+    let price_keywords = ["price", "amount", "stock", "ticker", "quote"];
+
+    let mut search_from = 0;
+    while let Some(pos) = lower[search_from..].find("<meta") {
+        let abs_pos = search_from + pos;
+        let tag_end = match html[abs_pos..].find('>') {
+            Some(e) => abs_pos + e,
+            None => break,
+        };
+        let tag = &html[abs_pos..=tag_end];
+        let tag_lower = &lower[abs_pos..=tag_end];
+
+        // Extract attribute values from the tag.
+        let attr_val = |attr: &str| -> Option<&str> {
+            let needle = format!("{attr}=\"");
+            tag_lower.find(&needle).and_then(|i| {
+                let start = i + needle.len();
+                tag[start..].find('"').map(|end| tag[start..start + end].trim())
+            })
+        };
+
+        let name = attr_val("name").or_else(|| attr_val("property")).unwrap_or("");
+        let content = attr_val("content").unwrap_or("");
+
+        if !content.is_empty() && content.len() < 500 {
+            let name_lower = name.to_ascii_lowercase();
+            let is_interesting = interesting_attrs.iter().any(|a| name_lower == *a)
+                || price_keywords.iter().any(|kw| name_lower.contains(kw));
+            if is_interesting {
+                lines.push(format!("meta[{name}]: {content}"));
+            }
+        }
+
+        search_from = tag_end + 1;
+    }
+
+    // ── <script type="application/ld+json"> ────────────────────────────────
+    let ld_marker = "application/ld+json";
+    let mut ld_from = 0;
+    while let Some(pos) = lower[ld_from..].find(ld_marker) {
+        let abs_pos = ld_from + pos;
+        // Find the '>' that closes this <script> tag.
+        let script_body_start = match html[abs_pos..].find('>') {
+            Some(e) => abs_pos + e + 1,
+            None => break,
+        };
+        // Find closing </script>.
+        let script_body_end = match lower[script_body_start..].find("</script") {
+            Some(e) => script_body_start + e,
+            None => break,
+        };
+        let json_str = html[script_body_start..script_body_end].trim();
+        if !json_str.is_empty() && json_str.len() < 8000 {
+            // Try to parse and extract a compact summary.
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let summary = summarise_ld_json(&val);
+                if !summary.is_empty() {
+                    lines.push(format!("LD+JSON: {summary}"));
+                }
+            }
+        }
+        ld_from = script_body_end + 1;
+    }
+
+    lines.join("\n")
+}
+
+/// Produce a compact one-line summary of a JSON-LD object, pulling out the
+/// most useful fields for factual queries.
+fn summarise_ld_json(val: &serde_json::Value) -> String {
+    // Handle @graph arrays (common wrapper).
+    if let Some(graph) = val.get("@graph").and_then(|g| g.as_array()) {
+        let summaries: Vec<String> = graph.iter()
+            .filter_map(|item| {
+                let s = summarise_ld_json(item);
+                if s.is_empty() { None } else { Some(s) }
+            })
+            .take(3)
+            .collect();
+        return summaries.join(" | ");
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let type_val = val.get("@type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if !type_val.is_empty() {
+        parts.push(format!("type={type_val}"));
+    }
+    // Pull common fields.
+    for key in &["name", "headline", "description", "tickerSymbol",
+                 "price", "priceCurrency", "lowPrice", "highPrice",
+                 "url", "exchange", "currentPrice", "previousClose",
+                 "openPrice", "dayLow", "dayHigh", "52WeekLow", "52WeekHigh"] {
+        if let Some(v) = val.get(*key) {
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if !text.is_empty() && text.len() < 300 {
+                parts.push(format!("{key}={text}"));
+            }
+        }
+    }
+    // Nested "offers" (e-commerce / financial).
+    if let Some(offers) = val.get("offers") {
+        let offer_summary = summarise_ld_json(offers);
+        if !offer_summary.is_empty() {
+            parts.push(format!("offers({offer_summary})"));
+        }
+    }
+    if parts.len() <= 1 {
+        // Only had @type or nothing — not useful.
+        return String::new();
+    }
+    parts.join("; ")
 }
 
 // ── draft_email ──────────────────────────────────────────────────────────────
