@@ -280,7 +280,7 @@ impl MemoryIndex {
         }
         self.cache.clear();
 
-        let events = event_log.load()?;
+        let events = event_log.load().await?;
         let count = events.len();
         for event in events {
             self.insert(&event.entry)?;

@@ -384,7 +384,7 @@ impl MemoryManager {
         let source = format!("userprofile:{category}:{key}");
         self.store.retain(|e| e.source != source);
         if let Some(event_log) = &self.event_log {
-            let events = event_log.load()?;
+            let events = event_log.load().await?;
             let kept = events
                 .into_iter()
                 .filter(|ev| ev.entry.source != source)
@@ -415,7 +415,7 @@ impl MemoryManager {
         let id_set: HashSet<Uuid> = ids.iter().copied().collect();
         self.store.retain(|e| !id_set.contains(&e.id));
         if let Some(event_log) = &self.event_log {
-            let events = event_log.load()?;
+            let events = event_log.load().await?;
             let kept = events
                 .into_iter()
                 .filter(|ev| !id_set.contains(&ev.entry.id))
@@ -536,10 +536,10 @@ mod tests {
     #[tokio::test]
     async fn persists_and_replays_memory_entries() -> Result<()> {
         let path = std::env::temp_dir().join(format!("aigent-memory-{}.jsonl", Uuid::new_v4()));
-        let mut manager = MemoryManager::with_event_log(&path)?;
+        let mut manager = MemoryManager::with_event_log(&path).await?;
         manager.record(MemoryTier::Episodic, "user asked for road map", "chat").await?;
 
-        let replayed = MemoryManager::with_event_log(&path)?;
+        let replayed = MemoryManager::with_event_log(&path).await?;
         assert_eq!(replayed.all().len(), 1);
         assert_eq!(replayed.all()[0].content, "user asked for road map");
 
@@ -584,7 +584,7 @@ mod tests {
             entry,
         }).await?;
 
-        let replayed = MemoryManager::with_event_log(&path)?;
+        let replayed = MemoryManager::with_event_log(&path).await?;
         assert_eq!(replayed.all().len(), 1);
 
         let _ = fs::remove_file(path);
