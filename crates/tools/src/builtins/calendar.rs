@@ -1,16 +1,19 @@
 //! Calendar event tool.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use fs2::FileExt;
 use serde_json;
 
 use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
 
 /// Appends an event object to `{data_dir}/calendar.json` (a JSON array).
-/// Creates the file if it does not exist.
+/// Creates the file if it does not exist.  Uses advisory file locking to
+/// prevent data loss from concurrent writes.
 pub struct CalendarAddEventTool {
     pub data_dir: PathBuf,
 }
@@ -57,13 +60,20 @@ impl Tool for CalendarAddEventTool {
         std::fs::create_dir_all(&self.data_dir)?;
         let calendar_path = self.data_dir.join("calendar.json");
 
-        // Load existing events array (or start fresh).
-        let mut events: Vec<serde_json::Value> = if calendar_path.exists() {
-            let raw = std::fs::read_to_string(&calendar_path)?;
-            serde_json::from_str(&raw).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // Open (or create) and lock the file to prevent concurrent corruption.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&calendar_path)?;
+        file.lock_exclusive()?;
+
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
+        let mut events: Vec<serde_json::Value> =
+            if raw.trim().is_empty() { Vec::new() }
+            else { serde_json::from_str(&raw).unwrap_or_default() };
 
         let event = serde_json::json!({
             "title": title,
@@ -75,7 +85,10 @@ impl Tool for CalendarAddEventTool {
         events.push(event);
 
         let rendered = serde_json::to_string_pretty(&events)?;
-        std::fs::write(&calendar_path, rendered)?;
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(rendered.as_bytes())?;
+        file.unlock()?;
 
         Ok(ToolOutput {
             success: true,

@@ -17,7 +17,11 @@ impl Tool for RunShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_shell".to_string(),
-            description: "Execute a shell command within the workspace directory.".to_string(),
+            description: "Execute a shell command within the workspace directory. \
+                Each invocation runs in a fresh shell — `cd` does not persist \
+                between calls. Chain commands with `&&` if you need them to \
+                share working directory or state."
+                .to_string(),
             params: vec![
                 ToolParam {
                     name: "command".to_string(),

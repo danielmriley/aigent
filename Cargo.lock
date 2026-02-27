@@ -188,6 +188,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "fs2",
+ "percent-encoding",
  "reqwest",
  "scraper",
  "serde",

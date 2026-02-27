@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use percent_encoding::percent_decode_str;
 use scraper::{Html, Selector};
 
 use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
@@ -124,13 +125,17 @@ impl Tool for FetchPageTool {
 
         let client = build_client()?;
         match fetch_page_text(&client, url, max_chars).await {
-            Some(text) if !text.is_empty() => Ok(ToolOutput {
+            Ok(text) if !text.is_empty() => Ok(ToolOutput {
                 success: true,
                 output: text,
             }),
-            _ => Ok(ToolOutput {
+            Ok(_) => Ok(ToolOutput {
                 success: false,
-                output: format!("Could not extract content from: {url}"),
+                output: format!("Page returned no extractable text: {url}"),
+            }),
+            Err(reason) => Ok(ToolOutput {
+                success: false,
+                output: format!("Could not fetch {url}: {reason}"),
             }),
         }
     }
@@ -272,8 +277,8 @@ async fn search_duckduckgo(
 
 /// DDG sometimes wraps result URLs in redirect links like
 /// `//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...`.
-/// Extract the actual destination URL.
-fn extract_ddg_url(href: &str) -> &str {
+/// Extract and percent-decode the actual destination URL.
+fn extract_ddg_url(href: &str) -> String {
     if let Some(pos) = href.find("uddg=") {
         let start = pos + 5;
         let end = href[start..]
@@ -281,13 +286,13 @@ fn extract_ddg_url(href: &str) -> &str {
             .map(|i| start + i)
             .unwrap_or(href.len());
         let encoded = &href[start..end];
-        // If it's percent-encoded, the caller will see %3A etc. — that's
-        // acceptable for display.  The URL is still functional.
         if !encoded.is_empty() {
-            return encoded;
+            return percent_decode_str(encoded)
+                .decode_utf8_lossy()
+                .into_owned();
         }
     }
-    href
+    href.to_string()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -302,18 +307,34 @@ fn build_client() -> Result<reqwest::Client> {
 }
 
 /// Fetch a URL and return extracted plain-text content.
+///
+/// Returns `Err(reason)` with a human-readable failure reason so the LLM
+/// can decide whether to retry or move on.
 async fn fetch_page_text(
     client: &reqwest::Client,
     url: &str,
     max_chars: usize,
-) -> Option<String> {
+) -> std::result::Result<String, String> {
     let resp = client
         .get(url)
         .timeout(std::time::Duration::from_secs(8))
         .header("Accept", "text/html")
         .send()
         .await
-        .ok()?;
+        .map_err(|e| {
+            if e.is_timeout() {
+                "request timed out after 8s".to_string()
+            } else if e.is_connect() {
+                format!("connection failed: {e}")
+            } else {
+                format!("request error: {e}")
+            }
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
 
     let content_type = resp
         .headers()
@@ -321,10 +342,10 @@ async fn fetch_page_text(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !content_type.contains("text/html") && !content_type.contains("text/plain") {
-        return None;
+        return Err(format!("unsupported content type: {content_type}"));
     }
 
-    let body = resp.text().await.ok()?;
+    let body = resp.text().await.map_err(|e| format!("failed to read body: {e}"))?;
     let body = if body.len() > MAX_DOWNLOAD_BYTES {
         let end = truncate_byte_boundary(&body, MAX_DOWNLOAD_BYTES);
         &body[..end]
@@ -337,13 +358,13 @@ async fn fetch_page_text(
     let plain = html_to_text(body, max_chars);
 
     if structured.is_empty() && plain.is_empty() {
-        return None;
+        return Err("page contained no extractable text".to_string());
     }
 
     if structured.is_empty() {
-        Some(plain)
+        Ok(plain)
     } else if plain.is_empty() {
-        Some(structured)
+        Ok(structured)
     } else {
         // Budget: give structured data up to 1/3 of max_chars, rest to plain text.
         let struct_budget = max_chars / 3;
@@ -353,7 +374,7 @@ async fn fetch_page_text(
         } else {
             structured
         };
-        Some(format!("{struct_part}\n\n{plain}"))
+        Ok(format!("{struct_part}\n\n{plain}"))
     }
 }
 

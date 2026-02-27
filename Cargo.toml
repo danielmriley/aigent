@@ -50,3 +50,5 @@ wasmtime = { version = "25", default-features = false, features = ["cranelift", 
 wasmtime-wasi = { version = "25", default-features = false, features = ["preview1"] }
 git2 = { version = "0.20", features = ["https", "ssh"] }
 scraper = "0.25"
+fs2 = "0.4"
+percent-encoding = "2.3"

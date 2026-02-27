@@ -1,7 +1,7 @@
 //! File system tools: read and write files.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{PathBuf, Component};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -19,6 +19,36 @@ pub(super) fn truncate_byte_boundary(s: &str, max: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+/// Lexically resolve `.` and `..` in a path *without* hitting the filesystem.
+///
+/// This is essential for write-path validation: `canonicalize()` fails when
+/// the file (or its parent directories) don't exist yet, but we still need
+/// to verify that the normalized path stays inside the workspace.
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => { out.pop(); }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Verify that `rel_path` (relative to `root`) does not escape the workspace.
+///
+/// Returns the full normalized path on success.
+fn checked_path(root: &std::path::Path, rel_path: &str) -> Result<PathBuf> {
+    let full = root.join(rel_path);
+    let normalized = normalize_path(&full);
+    let root_normalized = normalize_path(root);
+    if !normalized.starts_with(&root_normalized) {
+        bail!("path escapes workspace boundary: {}", normalized.display());
+    }
+    Ok(normalized)
 }
 
 pub struct ReadFileTool {
@@ -51,25 +81,14 @@ impl Tool for ReadFileTool {
             .get("path")
             .ok_or_else(|| anyhow::anyhow!("missing required param: path"))?;
 
-        let full = self.workspace_root.join(rel_path);
-        let canonical = full
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("cannot resolve path '{}': {}", rel_path, e))?;
-
-        let root_canonical = self.workspace_root.canonicalize()?;
-        if !canonical.starts_with(&root_canonical) {
-            bail!(
-                "path escapes workspace boundary: {}",
-                canonical.display()
-            );
-        }
+        let full = checked_path(&self.workspace_root, rel_path)?;
 
         let max_bytes: usize = args
             .get("max_bytes")
             .and_then(|v| v.parse().ok())
             .unwrap_or(65536);
 
-        let content = std::fs::read_to_string(&canonical)?;
+        let content = std::fs::read_to_string(&full)?;
         let truncated = if content.len() > max_bytes {
             let end = truncate_byte_boundary(&content, max_bytes);
             format!("{}…[truncated at {} bytes]", &content[..end], max_bytes)
@@ -118,30 +137,11 @@ impl Tool for WriteFileTool {
             .get("content")
             .ok_or_else(|| anyhow::anyhow!("missing required param: content"))?;
 
-        let full = self.workspace_root.join(rel_path);
+        let full = checked_path(&self.workspace_root, rel_path)?;
 
-        // Prevent escaping workspace even before file exists (can't canonicalize yet)
-        let root_canonical = self.workspace_root.canonicalize()?;
-        if let Ok(canonical) = full.canonicalize() {
-            if !canonical.starts_with(&root_canonical) {
-                bail!(
-                    "path escapes workspace boundary: {}",
-                    canonical.display()
-                );
-            }
-        } else {
-            // File doesn't exist yet; check parent
-            let parent = full
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("invalid path"))?;
+        // Ensure parent directories exist.
+        if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)?;
-            let parent_canonical = parent.canonicalize()?;
-            if !parent_canonical.starts_with(&root_canonical) {
-                bail!(
-                    "parent escapes workspace boundary: {}",
-                    parent_canonical.display()
-                );
-            }
         }
 
         std::fs::write(&full, content)?;

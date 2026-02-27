@@ -13,4 +13,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 scraper.workspace = true
+fs2.workspace = true
+percent-encoding.workspace = true
 

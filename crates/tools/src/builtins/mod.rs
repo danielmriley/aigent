@@ -11,10 +11,12 @@ pub use web::{WebSearchTool, FetchPageTool};
 pub use calendar::CalendarAddEventTool;
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use fs2::FileExt;
 
 use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
 
@@ -125,12 +127,20 @@ impl Tool for RemindMeTool {
         std::fs::create_dir_all(&self.data_dir)?;
         let reminders_path = self.data_dir.join("reminders.json");
 
-        let mut reminders: Vec<serde_json::Value> = if reminders_path.exists() {
-            let raw = std::fs::read_to_string(&reminders_path)?;
-            serde_json::from_str(&raw).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // Open (or create) and lock the file to prevent concurrent corruption.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&reminders_path)?;
+        file.lock_exclusive()?;
+
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
+        let mut reminders: Vec<serde_json::Value> =
+            if raw.trim().is_empty() { Vec::new() }
+            else { serde_json::from_str(&raw).unwrap_or_default() };
 
         let reminder = serde_json::json!({
             "text": text,
@@ -141,7 +151,10 @@ impl Tool for RemindMeTool {
         reminders.push(reminder);
 
         let rendered = serde_json::to_string_pretty(&reminders)?;
-        std::fs::write(&reminders_path, rendered)?;
+        file.set_len(0)?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(rendered.as_bytes())?;
+        file.unlock()?;
 
         let when_note = args.get("when").filter(|s| !s.is_empty())
             .map(|w| format!(" (when: {w})"))
