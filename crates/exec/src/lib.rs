@@ -1,4 +1,3 @@
-pub mod gait;
 pub mod git;
 pub mod sandbox;
 
@@ -135,7 +134,7 @@ impl ToolExecutor {
         self.check_capability(tool_name)?;
 
         // 3. Approval flow — governed by ApprovalMode
-        if self.requires_approval(tool_name, args) {
+        if self.requires_approval(tool_name) {
             let approved = self.request_approval(tool_name, args).await?;
             if !approved {
                 info!(tool = tool_name, "tool execution denied by user");
@@ -207,7 +206,7 @@ impl ToolExecutor {
     /// | `Autonomous` | Never                                                   |
     /// | `Balanced`   | Write / shell tools and anything not read-only          |
     /// | `Safer`      | Every tool (unless explicitly exempt)                   |
-    fn requires_approval(&self, tool_name: &str, args: &HashMap<String, String>) -> bool {
+    fn requires_approval(&self, tool_name: &str) -> bool {
         // Explicit exempt list always short-circuits.
         if self.policy
             .approval_exempt_tools
@@ -223,18 +222,7 @@ impl ToolExecutor {
                     "read_file",
                     "web_search",
                 ];
-                if READ_ONLY.contains(&tool_name) {
-                    return false;
-                }
-                // Gait: read-only git operations skip approval; writes require it.
-                if tool_name == "perform_gait" {
-                    if let Some(action) = args.get("action") {
-                        return gait::is_mutating_call(&action.to_lowercase(), args);
-                    }
-                    // No action arg → require approval to be safe.
-                    return true;
-                }
-                true
+                !READ_ONLY.contains(&tool_name)
             }
             ApprovalMode::Safer => true,
         }
@@ -404,29 +392,17 @@ pub fn ensure_within_workspace(workspace_root: &Path, target: &Path) -> Result<P
 
 // ── Convenience: create a default registry with built-in tools ───────────────
 
-pub async fn default_registry(
+pub fn default_registry(
     workspace_root: PathBuf,
     agent_data_dir: PathBuf,
     brave_api_key: Option<String>,
-    app_config: &aigent_config::AppConfig,
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
         CalendarAddEventTool, DraftEmailTool, GitRollbackTool, ReadFileTool, RemindMeTool,
-        RunShellTool, WebSearchTool, WriteFileTool,
+        RunShellTool, WebSearchTool, WriteFileTool, FetchPageTool,
     };
 
     let mut registry = ToolRegistry::default();
-
-    // ── Step 0: Native gait (git) tool ─────────────────────────────────────
-    // Registered first so it appears before other tools in listings.
-    {
-        let mut gait_config = app_config.clone();
-        // Ensure workspace_path matches the canonical root passed to the registry.
-        gait_config.agent.workspace_path = workspace_root.display().to_string();
-        let policy = gait::GaitPolicy::from_config(&gait_config).await;
-        let gait_tool = gait::GaitTool { policy };
-        registry.register(Box::new(gait_tool));
-    }
 
     // ── Step 1: WASM-first ─────────────────────────────────────────────────
     // Register compiled WASM guests before native tools.  `ToolRegistry::get`
@@ -473,6 +449,10 @@ pub async fn default_registry(
         (
             "web_search",
             Box::new(WebSearchTool { brave_api_key: brave_api_key.clone() }),
+        ),
+        (
+            "fetch_page",
+            Box::new(FetchPageTool),
         ),
         (
             "draft_email",
@@ -538,11 +518,6 @@ mod tests {
 
     // ── requires_approval tests ────────────────────────────────────────────
 
-    /// Helper — empty args for simple tool-name-only checks.
-    fn no_args() -> HashMap<String, String> {
-        HashMap::new()
-    }
-
     #[test]
     fn autonomous_never_requires_approval() {
         let policy = ExecutionPolicy {
@@ -550,9 +525,9 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(!executor.requires_approval("run_shell", &no_args()));
-        assert!(!executor.requires_approval("write_file", &no_args()));
-        assert!(!executor.requires_approval("read_file", &no_args()));
+        assert!(!executor.requires_approval("run_shell"));
+        assert!(!executor.requires_approval("write_file"));
+        assert!(!executor.requires_approval("read_file"));
     }
 
     #[test]
@@ -563,9 +538,9 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.requires_approval("read_file", &no_args()));
-        assert!(executor.requires_approval("write_file", &no_args()));
-        assert!(executor.requires_approval("run_shell", &no_args()));
+        assert!(executor.requires_approval("read_file"));
+        assert!(executor.requires_approval("write_file"));
+        assert!(executor.requires_approval("run_shell"));
     }
 
     #[test]
@@ -576,8 +551,8 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(!executor.requires_approval("read_file", &no_args()));
-        assert!(!executor.requires_approval("web_search", &no_args()));
+        assert!(!executor.requires_approval("read_file"));
+        assert!(!executor.requires_approval("web_search"));
     }
 
     #[test]
@@ -588,11 +563,11 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.requires_approval("write_file", &no_args()));
-        assert!(executor.requires_approval("run_shell", &no_args()));
-        assert!(executor.requires_approval("git_rollback", &no_args()));
-        assert!(executor.requires_approval("remind_me", &no_args()));
-        assert!(executor.requires_approval("calendar_add_event", &no_args()));
+        assert!(executor.requires_approval("write_file"));
+        assert!(executor.requires_approval("run_shell"));
+        assert!(executor.requires_approval("git_rollback"));
+        assert!(executor.requires_approval("remind_me"));
+        assert!(executor.requires_approval("calendar_add_event"));
     }
 
     #[test]
@@ -603,62 +578,7 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(!executor.requires_approval("run_shell", &no_args()));
-    }
-
-    #[test]
-    fn balanced_gait_read_skips_approval() {
-        let policy = ExecutionPolicy {
-            approval_mode: aigent_config::ApprovalMode::Balanced,
-            approval_exempt_tools: vec![],
-            ..ExecutionPolicy::default()
-        };
-        let executor = ToolExecutor::new(policy);
-        let mut args = HashMap::new();
-        args.insert("action".to_string(), "status".to_string());
-        assert!(!executor.requires_approval("perform_gait", &args));
-        args.insert("action".to_string(), "log".to_string());
-        assert!(!executor.requires_approval("perform_gait", &args));
-        args.insert("action".to_string(), "diff".to_string());
-        assert!(!executor.requires_approval("perform_gait", &args));
-    }
-
-    #[test]
-    fn balanced_gait_write_needs_approval() {
-        let policy = ExecutionPolicy {
-            approval_mode: aigent_config::ApprovalMode::Balanced,
-            approval_exempt_tools: vec![],
-            ..ExecutionPolicy::default()
-        };
-        let executor = ToolExecutor::new(policy);
-        let mut args = HashMap::new();
-        args.insert("action".to_string(), "commit".to_string());
-        assert!(executor.requires_approval("perform_gait", &args));
-        args.insert("action".to_string(), "push".to_string());
-        assert!(executor.requires_approval("perform_gait", &args));
-        args.insert("action".to_string(), "clone".to_string());
-        assert!(executor.requires_approval("perform_gait", &args));
-    }
-
-    #[test]
-    fn balanced_gait_branch_list_skips_approval() {
-        let policy = ExecutionPolicy {
-            approval_mode: aigent_config::ApprovalMode::Balanced,
-            approval_exempt_tools: vec![],
-            ..ExecutionPolicy::default()
-        };
-        let executor = ToolExecutor::new(policy);
-        // branch without a name → list → read-only
-        let mut args = HashMap::new();
-        args.insert("action".to_string(), "branch".to_string());
-        assert!(!executor.requires_approval("perform_gait", &args));
-        // branch with a name → create → write
-        args.insert("branch".to_string(), "new-feature".to_string());
-        assert!(executor.requires_approval("perform_gait", &args));
-        // tag without a name → list → read-only
-        args.remove("branch");
-        args.insert("action".to_string(), "tag".to_string());
-        assert!(!executor.requires_approval("perform_gait", &args));
+        assert!(!executor.requires_approval("run_shell"));
     }
 
     // ── check_capability tests ─────────────────────────────────────────────
@@ -723,7 +643,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, &aigent_config::AppConfig::default()).await;
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None);
 
         let mut args = HashMap::new();
         args.insert("command".to_string(), "echo hi".to_string());
@@ -751,7 +671,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, &aigent_config::AppConfig::default()).await;
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None);
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), "hello.txt".to_string());
@@ -774,7 +694,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, &aigent_config::AppConfig::default()).await;
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None);
 
         let result = executor
             .execute(&registry, "nonexistent_tool", &HashMap::new())

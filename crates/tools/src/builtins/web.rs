@@ -1,25 +1,40 @@
 //! Web search, page fetching, and HTML extraction.
+//!
+//! Two tools are exposed:
+//!
+//! * **`web_search`** — returns titles, URLs, and search-engine snippets.
+//!   Uses Brave Search when an API key is available, otherwise scrapes the
+//!   DuckDuckGo HTML search page.
+//! * **`fetch_page`** — fetches a single URL and returns the extracted
+//!   plain-text content, using `scraper` for robust HTML parsing.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde_json;
-use reqwest;
+use scraper::{Html, Selector};
 
 use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
 use super::fs::truncate_byte_boundary;
 
+// ─── Constants ───────────────────────────────────────────────────────────────
 
-/// Searches the web and returns results.
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+    (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+const MAX_DOWNLOAD_BYTES: usize = 256_000;
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WebSearchTool — search-only, no automatic page fetching
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Searches the web and returns titles, URLs, and snippets.
 ///
 /// When `brave_api_key` is set (or the `BRAVE_API_KEY` env var is non-empty)
 /// the [Brave Search API](https://api.search.brave.com/app/documentation/web-search)
 /// is used, providing higher-quality results.  Otherwise the tool falls back
-/// to the DuckDuckGo Instant Answers API (no key required).
+/// to scraping DuckDuckGo HTML search.
 pub struct WebSearchTool {
-    /// Optional Brave Search API key.  Takes precedence over the env var
-    /// when both are set.  Set to `None` to always use DuckDuckGo.
     pub brave_api_key: Option<String>,
 }
 
@@ -28,7 +43,9 @@ impl Tool for WebSearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_search".to_string(),
-            description: "Search the web (Brave API when configured, DuckDuckGo otherwise).".to_string(),
+            description: "Search the web and return result titles, URLs, and snippets. \
+                Use `fetch_page` on a returned URL to read its full content."
+                .to_string(),
             params: vec![
                 ToolParam {
                     name: "query".to_string(),
@@ -37,7 +54,7 @@ impl Tool for WebSearchTool {
                 },
                 ToolParam {
                     name: "max_results".to_string(),
-                    description: "Maximum related topics to include (default: 5)".to_string(),
+                    description: "Maximum results to return (default: 5)".to_string(),
                     required: false,
                 },
             ],
@@ -53,7 +70,6 @@ impl Tool for WebSearchTool {
             .and_then(|v| v.parse().ok())
             .unwrap_or(5);
 
-        // Resolve the Brave API key: explicit field > env var > fallback to DDG.
         let brave_key: Option<String> = self
             .brave_api_key
             .clone()
@@ -61,153 +77,232 @@ impl Tool for WebSearchTool {
             .or_else(|| std::env::var("BRAVE_API_KEY").ok().filter(|k| !k.trim().is_empty()));
 
         if let Some(ref key) = brave_key {
-            self.search_brave(query, max_results, key).await
+            search_brave(query, max_results, key).await
         } else {
-            self.search_duckduckgo(query, max_results).await
+            search_duckduckgo(query, max_results).await
         }
     }
 }
 
-impl WebSearchTool {
-    async fn search_brave(
-        &self,
-        query: &str,
-        max_results: usize,
-        api_key: &str,
-    ) -> Result<ToolOutput> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("aigent/0.1 (https://github.com/danielmriley/aigent)")
-            .build()?;
+// ═══════════════════════════════════════════════════════════════════════════
+//  FetchPageTool — fetch a single URL and extract text
+// ═══════════════════════════════════════════════════════════════════════════
 
-        let resp = client
-            .get("https://api.search.brave.com/res/v1/web/search")
-            .query(&[("q", query), ("count", &max_results.to_string())])
-            .header("Accept", "application/json")
-            .header("X-Subscription-Token", api_key)
-            .send()
-            .await?;
+/// Fetches a web page and returns extracted plain-text content.
+pub struct FetchPageTool;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Brave Search API error {}: {}", status, body);
-        }
-
-        let json: serde_json::Value = resp.json().await?;
-
-        let mut parts: Vec<String> = Vec::new();
-        let mut page_urls: Vec<String> = Vec::new();
-        if let Some(results) = json["web"]["results"].as_array() {
-            for item in results.iter().take(max_results) {
-                let title = item["title"].as_str().unwrap_or("").trim();
-                let url = item["url"].as_str().unwrap_or("").trim();
-                let desc = item["description"].as_str().unwrap_or("").trim();
-                if !title.is_empty() {
-                    if page_urls.len() < 3 && !url.is_empty() {
-                        page_urls.push(url.to_string());
-                    }
-                    parts.push(format!("{title}\n  {url}\n  {desc}"));
-                }
-            }
-        }
-
-        // Fetch the top result pages to extract actual content (not just
-        // search snippets).  Multiple pages give the LLM cross-references
-        // for factual queries (stock prices, scores, etc.).
-        // Structured data (JSON-LD, meta tags) is extracted first since it
-        // survives JavaScript-heavy single-page apps.
-        for url in &page_urls {
-            if let Some(excerpt) = fetch_page_excerpt(&client, url, 4000).await {
-                parts.push(format!("\n--- Page content from {url} ---\n{excerpt}"));
-            }
-        }
-
-        if parts.is_empty() {
-            Ok(ToolOutput {
-                success: true,
-                output: format!("No Brave Search results for: {query}"),
-            })
-        } else {
-            Ok(ToolOutput {
-                success: true,
-                output: parts.join("\n\n"),
-            })
+#[async_trait]
+impl Tool for FetchPageTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fetch_page".to_string(),
+            description: "Fetch a web page URL and return its extracted text content."
+                .to_string(),
+            params: vec![
+                ToolParam {
+                    name: "url".to_string(),
+                    description: "The URL to fetch".to_string(),
+                    required: true,
+                },
+                ToolParam {
+                    name: "max_chars".to_string(),
+                    description: "Maximum characters to return (default: 8000)".to_string(),
+                    required: false,
+                },
+            ],
         }
     }
 
-    async fn search_duckduckgo(
-        &self,
-        query: &str,
-        max_results: usize,
-    ) -> Result<ToolOutput> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("aigent/0.1 (https://github.com/danielmriley/aigent)")
-            .build()?;
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let url = args
+            .get("url")
+            .ok_or_else(|| anyhow::anyhow!("missing required param: url"))?;
+        let max_chars: usize = args
+            .get("max_chars")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8000);
 
-        let resp = client
-            .get("https://api.duckduckgo.com/")
-            .query(&[
-                ("q", query),
-                ("format", "json"),
-                ("no_html", "1"),
-                ("skip_disambig", "1"),
-            ])
-            .send()
-            .await?;
-        let json: serde_json::Value = resp.json().await?;
-
-        let abstract_text = json["AbstractText"].as_str().unwrap_or("").trim().to_string();
-        let abstract_source = json["AbstractSource"].as_str().unwrap_or("").trim().to_string();
-        let abstract_url = json["AbstractURL"].as_str().unwrap_or("").trim().to_string();
-
-        let mut parts: Vec<String> = Vec::new();
-        if !abstract_text.is_empty() {
-            if abstract_source.is_empty() {
-                parts.push(abstract_text);
-            } else {
-                parts.push(format!("{abstract_text} (source: {abstract_source})"));
-            }
-        }
-
-        if let Some(topics) = json["RelatedTopics"].as_array() {
-            for topic in topics.iter().take(max_results) {
-                let text = topic["Text"].as_str().unwrap_or("").trim();
-                if !text.is_empty() {
-                    parts.push(format!("• {text}"));
-                }
-            }
-        }
-
-        // Fetch the abstract source page for real content when available.
-        if !abstract_url.is_empty() {
-            if let Some(excerpt) = fetch_page_excerpt(&client, &abstract_url, 4000).await {
-                parts.push(format!("\n--- Page content from {abstract_url} ---\n{excerpt}"));
-            }
-        }
-
-        if parts.is_empty() {
-            Ok(ToolOutput {
+        let client = build_client()?;
+        match fetch_page_text(&client, url, max_chars).await {
+            Some(text) if !text.is_empty() => Ok(ToolOutput {
                 success: true,
-                output: format!("No instant-answer results found for: {query}"),
-            })
-        } else {
-            Ok(ToolOutput {
-                success: true,
-                output: parts.join("\n"),
-            })
+                output: text,
+            }),
+            _ => Ok(ToolOutput {
+                success: false,
+                output: format!("Could not extract content from: {url}"),
+            }),
         }
     }
 }
 
-/// Fetch a web page and extract a plain-text excerpt by stripping HTML tags.
-///
-/// Returns `None` on any error (timeout, non-HTML response, etc.) so the
-/// caller can fall back gracefully to the search snippet data.
-///
-/// `max_chars` limits the returned excerpt to prevent context explosion.
-async fn fetch_page_excerpt(
+// ═══════════════════════════════════════════════════════════════════════════
+//  Brave Search
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn search_brave(
+    query: &str,
+    max_results: usize,
+    api_key: &str,
+) -> Result<ToolOutput> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("aigent/0.1 (https://github.com/danielmriley/aigent)")
+        .build()?;
+
+    let resp = client
+        .get("https://api.search.brave.com/res/v1/web/search")
+        .query(&[("q", query), ("count", &max_results.to_string())])
+        .header("Accept", "application/json")
+        .header("X-Subscription-Token", api_key)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Brave Search API error {}: {}", status, body);
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(results) = json["web"]["results"].as_array() {
+        for item in results.iter().take(max_results) {
+            let title = item["title"].as_str().unwrap_or("").trim();
+            let url = item["url"].as_str().unwrap_or("").trim();
+            let desc = item["description"].as_str().unwrap_or("").trim();
+            if !title.is_empty() {
+                parts.push(format!("{title}\n  {url}\n  {desc}"));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        Ok(ToolOutput {
+            success: true,
+            output: format!("No Brave Search results for: {query}"),
+        })
+    } else {
+        Ok(ToolOutput {
+            success: true,
+            output: parts.join("\n\n"),
+        })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DuckDuckGo HTML Search (replaces Instant Answers API)
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn search_duckduckgo(
+    query: &str,
+    max_results: usize,
+) -> Result<ToolOutput> {
+    let client = build_client()?;
+
+    // POST to the DuckDuckGo HTML search endpoint.
+    let resp = client
+        .post("https://html.duckduckgo.com/html/")
+        .form(&[("q", query)])
+        .header("Accept", "text/html")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        anyhow::bail!("DuckDuckGo HTML search error: {}", status);
+    }
+
+    let body = resp.text().await?;
+    let doc = Html::parse_document(&body);
+
+    // DuckDuckGo HTML search results structure:
+    //   <div class="result">
+    //     <a class="result__a" href="...">Title</a>
+    //     <a class="result__snippet">Snippet text</a>
+    //   </div>
+    let result_sel = Selector::parse(".result").unwrap();
+    let link_sel = Selector::parse("a.result__a").unwrap();
+    let snippet_sel = Selector::parse("a.result__snippet, .result__snippet").unwrap();
+
+    let mut parts: Vec<String> = Vec::new();
+    for result in doc.select(&result_sel).take(max_results) {
+        let title = result
+            .select(&link_sel)
+            .next()
+            .map(|el| el.text().collect::<String>())
+            .unwrap_or_default();
+        let title = title.trim();
+
+        // Extract URL from the href attribute.
+        let url = result
+            .select(&link_sel)
+            .next()
+            .and_then(|el| el.value().attr("href"))
+            .unwrap_or("");
+
+        // DDG sometimes wraps URLs in a redirect; extract the real one.
+        let url = extract_ddg_url(url);
+
+        let snippet = result
+            .select(&snippet_sel)
+            .next()
+            .map(|el| el.text().collect::<String>())
+            .unwrap_or_default();
+        let snippet = snippet.trim();
+
+        if !title.is_empty() {
+            parts.push(format!("{title}\n  {url}\n  {snippet}"));
+        }
+    }
+
+    if parts.is_empty() {
+        Ok(ToolOutput {
+            success: true,
+            output: format!("No DuckDuckGo results for: {query}"),
+        })
+    } else {
+        Ok(ToolOutput {
+            success: true,
+            output: parts.join("\n\n"),
+        })
+    }
+}
+
+/// DDG sometimes wraps result URLs in redirect links like
+/// `//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=...`.
+/// Extract the actual destination URL.
+fn extract_ddg_url(href: &str) -> &str {
+    if let Some(pos) = href.find("uddg=") {
+        let start = pos + 5;
+        let end = href[start..]
+            .find('&')
+            .map(|i| start + i)
+            .unwrap_or(href.len());
+        let encoded = &href[start..end];
+        // If it's percent-encoded, the caller will see %3A etc. — that's
+        // acceptable for display.  The URL is still functional.
+        if !encoded.is_empty() {
+            return encoded;
+        }
+    }
+    href
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Page Fetching & Content Extraction (scraper-based)
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn build_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent(USER_AGENT)
+        .build()?)
+}
+
+/// Fetch a URL and return extracted plain-text content.
+async fn fetch_page_text(
     client: &reqwest::Client,
     url: &str,
     max_chars: usize,
@@ -220,7 +315,6 @@ async fn fetch_page_excerpt(
         .await
         .ok()?;
 
-    // Only process HTML responses.
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -230,19 +324,21 @@ async fn fetch_page_excerpt(
         return None;
     }
 
-    // Limit download to 256 KB to avoid pulling huge pages.
     let body = resp.text().await.ok()?;
-    let body = if body.len() > 256_000 {
-        let end = truncate_byte_boundary(&body, 256_000);
+    let body = if body.len() > MAX_DOWNLOAD_BYTES {
+        let end = truncate_byte_boundary(&body, MAX_DOWNLOAD_BYTES);
         &body[..end]
     } else {
         &body
     };
 
-    // Extract structured data first (JSON-LD, meta tags, title) — these
-    // survive JS-heavy SPAs where the body text is empty / boilerplate.
+    // Extract structured data first (survives JS-heavy SPAs).
     let structured = extract_structured_data(body);
     let plain = html_to_text(body, max_chars);
+
+    if structured.is_empty() && plain.is_empty() {
+        return None;
+    }
 
     if structured.is_empty() {
         Some(plain)
@@ -261,69 +357,65 @@ async fn fetch_page_excerpt(
     }
 }
 
-/// Minimal HTML-to-text extraction.  Strips tags, collapses whitespace, and
-/// drops `<script>`, `<style>`, `<nav>`, `<header>`, `<footer>` blocks.
+// ═══════════════════════════════════════════════════════════════════════════
+//  HTML → text via `scraper`
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Parse HTML and extract readable text content.
 ///
-/// This is intentionally simple (no third-party HTML parser dependency).
-/// It produces "good enough" text for the LLM to extract facts from.
+/// Strategy:
+/// 1. Try `<article>` or `<main>` for the content region.
+/// 2. Fall back to `<body>` with `<script>`, `<style>`, `<nav>`, `<header>`,
+///    `<footer>`, `<noscript>`, `<svg>` subtrees stripped.
+/// 3. Collapse whitespace and truncate to `max_chars`.
 pub(super) fn html_to_text(html: &str, max_chars: usize) -> String {
-    // Remove script/style/nav/header/footer blocks (case-insensitive via lowering the tag scan).
-    let mut cleaned = String::with_capacity(html.len());
-    let mut skip_depth: usize = 0;
-    let mut chars = html.chars().peekable();
+    let doc = Html::parse_document(html);
 
-    while let Some(ch) = chars.next() {
-        if ch == '<' {
-            // Peek at the tag name.
-            let mut tag_chars = Vec::new();
-            let is_close = chars.peek() == Some(&'/');
-            if is_close { chars.next(); }
-
-            // Collect tag name chars until '>', ' ', or '/'
-            while let Some(&c) = chars.peek() {
-                if c == '>' || c == ' ' || c == '/' { break; }
-                tag_chars.push(c);
-                chars.next();
-            }
-            let tag_name: String = tag_chars.into_iter().collect::<String>().to_ascii_lowercase();
-
-            // Skip to end of tag.
-            while let Some(&c) = chars.peek() {
-                if c == '>' { chars.next(); break; }
-                chars.next();
-            }
-
-            let strip_tags = ["script", "style", "nav", "header", "footer", "noscript", "svg"];
-            if strip_tags.contains(&tag_name.as_str()) {
-                if is_close {
-                    skip_depth = skip_depth.saturating_sub(1);
-                } else {
-                    skip_depth += 1;
+    // Try focused content regions first.
+    let content_selectors = ["article", "main", "[role=\"main\"]"];
+    for sel_str in &content_selectors {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(el) = doc.select(&sel).next() {
+                let text = extract_text_from_element(&el, max_chars);
+                if text.len() >= 100 {
+                    return text;
                 }
-                continue;
-            }
-
-            if skip_depth > 0 {
-                continue;
-            }
-
-            // Block-level tags emit a newline to preserve structure.
-            let block_tags = ["p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
-                              "li", "tr", "td", "th", "article", "section", "main"];
-            if block_tags.contains(&tag_name.as_str()) {
-                cleaned.push('\n');
-            }
-
-            // Drop the tag itself (no output).
-        } else {
-            if skip_depth == 0 {
-                cleaned.push(ch);
             }
         }
     }
 
-    // Decode common HTML entities.
-    let cleaned = cleaned
+    // Fall back to <body>.
+    if let Ok(body_sel) = Selector::parse("body") {
+        if let Some(body) = doc.select(&body_sel).next() {
+            return extract_text_from_element(&body, max_chars);
+        }
+    }
+
+    // Last resort: extract all text from the document.
+    let raw: String = doc.root_element().text().collect();
+    collapse_whitespace(&raw, max_chars)
+}
+
+/// Recursively extract text from an element, skipping noisy subtrees.
+fn extract_text_from_element(
+    el: &scraper::ElementRef<'_>,
+    max_chars: usize,
+) -> String {
+    let skip_tags: &[&str] = &[
+        "script", "style", "nav", "header", "footer", "noscript", "svg",
+        "aside", "form", "iframe",
+    ];
+    let block_tags: &[&str] = &[
+        "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
+        "li", "tr", "td", "th", "article", "section", "main",
+        "blockquote", "pre", "figcaption", "dt", "dd",
+    ];
+
+    let mut buf = String::with_capacity(max_chars + 256);
+    collect_text(el, &mut buf, skip_tags, block_tags, max_chars);
+
+    // Decode common HTML entities that survive parsing.
+    let decoded = buf
         .replace("&amp;", "&")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
@@ -332,11 +424,51 @@ pub(super) fn html_to_text(html: &str, max_chars: usize) -> String {
         .replace("&apos;", "'")
         .replace("&nbsp;", " ");
 
-    // Collapse runs of whitespace into single space, trim blank lines.
-    let mut result = String::with_capacity(cleaned.len().min(max_chars + 64));
+    collapse_whitespace(&decoded, max_chars)
+}
+
+fn collect_text(
+    node: &scraper::ElementRef<'_>,
+    buf: &mut String,
+    skip_tags: &[&str],
+    block_tags: &[&str],
+    max_chars: usize,
+) {
+    use scraper::Node;
+
+    for child in node.children() {
+        if buf.len() >= max_chars {
+            return;
+        }
+        match child.value() {
+            Node::Text(text) => {
+                buf.push_str(text);
+            }
+            Node::Element(el) => {
+                let tag = el.name();
+                if skip_tags.contains(&tag) {
+                    continue;
+                }
+                if block_tags.contains(&tag) {
+                    buf.push('\n');
+                }
+                if let Some(child_ref) = scraper::ElementRef::wrap(child) {
+                    collect_text(&child_ref, buf, skip_tags, block_tags, max_chars);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collapse runs of whitespace into single spaces / double-newlines and
+/// truncate to `max_chars`.
+fn collapse_whitespace(text: &str, max_chars: usize) -> String {
+    let mut result = String::with_capacity(text.len().min(max_chars + 64));
     let mut prev_was_space = true;
     let mut consecutive_newlines = 0u32;
-    for ch in cleaned.chars() {
+
+    for ch in text.chars() {
         if ch == '\n' {
             consecutive_newlines += 1;
             if consecutive_newlines <= 2 {
@@ -361,7 +493,6 @@ pub(super) fn html_to_text(html: &str, max_chars: usize) -> String {
 
     let trimmed = result.trim().to_string();
     if trimmed.len() > max_chars {
-        // Truncate to a word boundary (safely, respecting char boundaries).
         let safe_end = truncate_byte_boundary(&trimmed, max_chars);
         let end = trimmed[..safe_end].rfind(' ').unwrap_or(safe_end);
         format!("{}…", &trimmed[..end])
@@ -369,6 +500,10 @@ pub(super) fn html_to_text(html: &str, max_chars: usize) -> String {
         trimmed
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Structured data extraction (JSON-LD, meta tags, title)
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Extract structured data from HTML that survives JavaScript-heavy pages.
 ///
@@ -381,101 +516,70 @@ pub(super) fn html_to_text(html: &str, max_chars: usize) -> String {
 ///
 /// Returns a compact multi-line summary.  Empty string when nothing is found.
 fn extract_structured_data(html: &str) -> String {
+    let doc = Html::parse_document(html);
     let mut lines: Vec<String> = Vec::new();
 
     // ── <title> ────────────────────────────────────────────────────────────
-    if let Some(start) = html.to_ascii_lowercase().find("<title") {
-        if let Some(gt) = html[start..].find('>') {
-            let after = start + gt + 1;
-            if let Some(end) = html[after..].find("</") {
-                let title = html[after..after + end].trim();
-                if !title.is_empty() && title.len() < 500 {
-                    lines.push(format!("Title: {title}"));
-                }
+    if let Ok(sel) = Selector::parse("title") {
+        if let Some(el) = doc.select(&sel).next() {
+            let title: String = el.text().collect();
+            let title = title.trim();
+            if !title.is_empty() && title.len() < 500 {
+                lines.push(format!("Title: {title}"));
             }
         }
     }
 
     // ── <meta> tags ────────────────────────────────────────────────────────
-    // We scan for `<meta` and extract `name=`/`property=` and `content=`.
-    let lower = html.to_ascii_lowercase();
     let interesting_attrs = [
         "og:title", "og:description", "og:type",
         "description", "twitter:title", "twitter:description",
     ];
     let price_keywords = ["price", "amount", "stock", "ticker", "quote"];
 
-    let mut search_from = 0;
-    while let Some(pos) = lower[search_from..].find("<meta") {
-        let abs_pos = search_from + pos;
-        let tag_end = match html[abs_pos..].find('>') {
-            Some(e) => abs_pos + e,
-            None => break,
-        };
-        let tag = &html[abs_pos..=tag_end];
-        let tag_lower = &lower[abs_pos..=tag_end];
+    if let Ok(sel) = Selector::parse("meta") {
+        for el in doc.select(&sel) {
+            let name = el.value().attr("name")
+                .or_else(|| el.value().attr("property"))
+                .unwrap_or("");
+            let content = el.value().attr("content").unwrap_or("");
 
-        // Extract attribute values from the tag.
-        let attr_val = |attr: &str| -> Option<&str> {
-            let needle = format!("{attr}=\"");
-            tag_lower.find(&needle).and_then(|i| {
-                let start = i + needle.len();
-                tag[start..].find('"').map(|end| tag[start..start + end].trim())
-            })
-        };
-
-        let name = attr_val("name").or_else(|| attr_val("property")).unwrap_or("");
-        let content = attr_val("content").unwrap_or("");
-
-        if !content.is_empty() && content.len() < 500 {
-            let name_lower = name.to_ascii_lowercase();
-            let is_interesting = interesting_attrs.iter().any(|a| name_lower == *a)
-                || price_keywords.iter().any(|kw| name_lower.contains(kw));
-            if is_interesting {
-                lines.push(format!("meta[{name}]: {content}"));
-            }
-        }
-
-        search_from = tag_end + 1;
-    }
-
-    // ── <script type="application/ld+json"> ────────────────────────────────
-    let ld_marker = "application/ld+json";
-    let mut ld_from = 0;
-    while let Some(pos) = lower[ld_from..].find(ld_marker) {
-        let abs_pos = ld_from + pos;
-        // Find the '>' that closes this <script> tag.
-        let script_body_start = match html[abs_pos..].find('>') {
-            Some(e) => abs_pos + e + 1,
-            None => break,
-        };
-        // Find closing </script>.
-        let script_body_end = match lower[script_body_start..].find("</script") {
-            Some(e) => script_body_start + e,
-            None => break,
-        };
-        let json_str = html[script_body_start..script_body_end].trim();
-        if !json_str.is_empty() && json_str.len() < 8000 {
-            // Try to parse and extract a compact summary.
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                let summary = summarise_ld_json(&val);
-                if !summary.is_empty() {
-                    lines.push(format!("LD+JSON: {summary}"));
+            if !content.is_empty() && content.len() < 500 {
+                let name_lower = name.to_ascii_lowercase();
+                let is_interesting = interesting_attrs.iter().any(|a| name_lower == *a)
+                    || price_keywords.iter().any(|kw| name_lower.contains(kw));
+                if is_interesting {
+                    lines.push(format!("meta[{name}]: {content}"));
                 }
             }
         }
-        ld_from = script_body_end + 1;
+    }
+
+    // ── <script type="application/ld+json"> ────────────────────────────────
+    if let Ok(sel) = Selector::parse("script[type=\"application/ld+json\"]") {
+        for el in doc.select(&sel) {
+            let json_str: String = el.text().collect();
+            let json_str = json_str.trim();
+            if !json_str.is_empty() && json_str.len() < 8000 {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    let summary = summarise_ld_json(&val);
+                    if !summary.is_empty() {
+                        lines.push(format!("LD+JSON: {summary}"));
+                    }
+                }
+            }
+        }
     }
 
     lines.join("\n")
 }
 
-/// Produce a compact one-line summary of a JSON-LD object, pulling out the
-/// most useful fields for factual queries.
+/// Produce a compact one-line summary of a JSON-LD object.
 fn summarise_ld_json(val: &serde_json::Value) -> String {
     // Handle @graph arrays (common wrapper).
     if let Some(graph) = val.get("@graph").and_then(|g| g.as_array()) {
-        let summaries: Vec<String> = graph.iter()
+        let summaries: Vec<String> = graph
+            .iter()
             .filter_map(|item| {
                 let s = summarise_ld_json(item);
                 if s.is_empty() { None } else { Some(s) }
@@ -486,17 +590,19 @@ fn summarise_ld_json(val: &serde_json::Value) -> String {
     }
 
     let mut parts: Vec<String> = Vec::new();
-    let type_val = val.get("@type")
+    let type_val = val
+        .get("@type")
         .and_then(|t| t.as_str())
         .unwrap_or("");
     if !type_val.is_empty() {
         parts.push(format!("type={type_val}"));
     }
-    // Pull common fields.
-    for key in &["name", "headline", "description", "tickerSymbol",
-                 "price", "priceCurrency", "lowPrice", "highPrice",
-                 "url", "exchange", "currentPrice", "previousClose",
-                 "openPrice", "dayLow", "dayHigh", "52WeekLow", "52WeekHigh"] {
+    for key in &[
+        "name", "headline", "description", "tickerSymbol",
+        "price", "priceCurrency", "lowPrice", "highPrice",
+        "url", "exchange", "currentPrice", "previousClose",
+        "openPrice", "dayLow", "dayHigh", "52WeekLow", "52WeekHigh",
+    ] {
         if let Some(v) = val.get(*key) {
             let text = match v {
                 serde_json::Value::String(s) => s.clone(),
@@ -508,7 +614,6 @@ fn summarise_ld_json(val: &serde_json::Value) -> String {
             }
         }
     }
-    // Nested "offers" (e-commerce / financial).
     if let Some(offers) = val.get("offers") {
         let offer_summary = summarise_ld_json(offers);
         if !offer_summary.is_empty() {
@@ -516,7 +621,6 @@ fn summarise_ld_json(val: &serde_json::Value) -> String {
         }
     }
     if parts.len() <= 1 {
-        // Only had @type or nothing — not useful.
         return String::new();
     }
     parts.join("; ")

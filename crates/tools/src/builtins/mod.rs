@@ -7,7 +7,7 @@ mod calendar;
 
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use shell::RunShellTool;
-pub use web::WebSearchTool;
+pub use web::{WebSearchTool, FetchPageTool};
 pub use calendar::CalendarAddEventTool;
 
 use std::collections::HashMap;

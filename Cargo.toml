@@ -49,3 +49,4 @@ libc = "0.2"
 wasmtime = { version = "25", default-features = false, features = ["cranelift", "runtime", "component-model"] }
 wasmtime-wasi = { version = "25", default-features = false, features = ["preview1"] }
 git2 = { version = "0.20", features = ["https", "ssh"] }
+scraper = "0.25"
