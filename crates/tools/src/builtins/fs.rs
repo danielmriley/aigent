@@ -6,7 +6,7 @@ use std::path::{PathBuf, Component};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 
-use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
+use crate::{Tool, ToolSpec, ToolParam, ToolOutput, ToolMetadata, SecurityLevel};
 
 /// Find the largest byte offset ≤ `max` that falls on a UTF-8 character
 /// boundary.  Safe to use as `&s[..truncate_byte_boundary(s, max)]`.
@@ -66,13 +66,21 @@ impl Tool for ReadFileTool {
                     name: "path".to_string(),
                     description: "Relative path from workspace root".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "max_bytes".to_string(),
                     description: "Maximum bytes to read (default: 65536)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: true,
+                group: "filesystem".to_string(),
+                ..Default::default()
+            },
         }
     }
 
@@ -119,13 +127,21 @@ impl Tool for WriteFileTool {
                     name: "path".to_string(),
                     description: "Relative path from workspace root".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "content".to_string(),
                     description: "File content to write".to_string(),
                     required: true,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Medium,
+                read_only: false,
+                group: "filesystem".to_string(),
+                ..Default::default()
+            },
         }
     }
 

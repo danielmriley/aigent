@@ -53,12 +53,24 @@ approval_required = true
 allow_shell = false
 allow_wasm = false
 # Per-tool allow-list (empty = all tools are permitted subject to capability gates).
+# Supports @group syntax:  ["@filesystem", "web_search"]
 tool_allowlist = []
 # Per-tool deny-list (takes precedence over tool_allowlist).
+# Supports @group syntax:  ["@shell"] blocks all tools in the "shell" group.
 tool_denylist = []
 # Tools that bypass interactive approval even when approval_required = true.
 # The four safe built-in tools are exempt by default.
 approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search"]
+# Maximum security level allowed for any tool.  Tools above this level are
+# blocked outright.  Values: "low", "medium", "high".  Default: "high".
+max_security_level = "high"
+
+# ── Per-tool policy overrides ────────────────────────────────────────────────
+# Fine-grained control over individual tools.  Example:
+# [safety.tool_overrides.run_shell]
+# denied = false                    # set true to block this tool entirely
+# approval_mode = "safer"           # override global approval mode
+# max_security_level = "medium"     # per-tool security ceiling
 
 # ── Tool trust & action config ───────────────────────────────────────────────
 [tools]
@@ -89,6 +101,30 @@ git_auto_commit = false
 # Requires the binary to have been compiled with the `sandbox` feature (default).
 # Set to false to disable sandboxing at runtime without recompiling.
 sandbox_enabled = true
+
+# ── Native structured tool calling ───────────────────────────────────────────
+# When true, pass tool definitions as JSON Schema to the LLM and use its native
+# tool-calling interface (Ollama /api/chat tools, OpenRouter tools param).
+# When false, fall back to the legacy text-prompt "maybe_tool_call" path.
+use_native_calling = true
+
+# Maximum number of LLM↔tool round-trips per user turn before the agent stops
+# and returns whatever it has.  Prevents runaway loops.
+max_tool_rounds = 5
+
+# ── Search provider configuration ────────────────────────────────────────────
+# Tavily Search API key. Provides AI-generated answers alongside results.
+# Get a free key at https://tavily.com
+tavily_api_key = ""
+
+# SearXNG base URL. Self-hosted meta-search engine.
+# Example: "http://localhost:8080"
+searxng_base_url = ""
+
+# Ordered list of search providers to try.  The agent tries each in order and
+# returns results from the first that succeeds.
+# Available: "brave", "tavily", "searxng", "duckduckgo"
+search_providers = ["brave", "tavily", "searxng", "duckduckgo"]
 
 
 log_level = "info"

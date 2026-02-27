@@ -95,10 +95,204 @@ pub(super) async fn handle_connection(
             // any LLM call.  This keeps GetStatus / GetMemoryPeek responsive
             // while the turn is being processed.
             //
-            // ── Step 0: optional tool intent check ─────────────────────────
-            // Ask the LLM (without streaming) whether a tool should be called
-            // before the main response.  Runs without holding the state lock;
-            // holds it only for the brief synchronous tool execution below.
+            // ── Path selection: native structured tool calling vs legacy text-based ──
+            let use_native_calling = {
+                let s = state.lock().await;
+                s.runtime.config.tools.use_native_calling
+            };
+
+            if use_native_calling {
+                // ═══════════════════════════════════════════════════════════════
+                // NEW PATH: Native structured tool calling via chat messages API
+                // ═══════════════════════════════════════════════════════════════
+                let (rt_clone, mut memory, recent, _last_turn_at, tool_specs, registry, executor) = {
+                    let mut s = state.lock().await;
+                    let rt = s.runtime.clone();
+                    let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
+                    let lta = s.last_turn_at;
+                    let mem = std::mem::take(&mut s.memory);
+                    let specs = s.tool_registry.list_specs();
+                    let reg = Arc::clone(&s.tool_registry);
+                    let exe = Arc::clone(&s.tool_executor);
+                    (rt, mem, recent, lta, specs, reg, exe)
+                };
+
+                // Persist the user turn and do memory work before calling the LLM.
+                let _: Result<_, _> = memory.record(aigent_memory::MemoryTier::Episodic, user.clone(), "user-input").await;
+
+                // Build the system prompt using the existing prompt builder.
+                let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
+                    embed_fn(user.to_string()).await
+                } else {
+                    None
+                };
+                let context = memory.context_for_prompt_ranked_with_embed(&user, 10, query_embedding);
+                let stats = memory.stats();
+
+                let mut prompt_inputs = crate::prompt_builder::PromptInputs {
+                    config: &rt_clone.config,
+                    memory: &mut memory,
+                    user_message: &user,
+                    recent_turns: &recent,
+                    tool_specs: &[],  // Don't inject tools into the text prompt — they go via API
+                    pending_follow_ups: &[],
+                    context_items: &context,
+                    stats,
+                };
+                let system_prompt = crate::prompt_builder::build_chat_prompt(&mut prompt_inputs);
+
+                // Build the chat messages array.
+                // Include recent conversation turns as proper user/assistant
+                // pairs so the model has multi-turn context — not just the
+                // flattened text summary baked into the system prompt.
+                let mut messages = vec![aigent_llm::ChatMessage::system(&system_prompt)];
+                for turn in &recent {
+                    messages.push(aigent_llm::ChatMessage::user(&turn.user));
+                    messages.push(aigent_llm::ChatMessage::assistant(&turn.assistant));
+                }
+                messages.push(aigent_llm::ChatMessage::user(&user));
+
+                // Build tools JSON from specs
+                let tools_json = if tool_specs.is_empty() {
+                    None
+                } else {
+                    Some(crate::tool_loop::build_tools_json(&tool_specs))
+                };
+
+                let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
+                    aigent_llm::Provider::OpenRouter
+                } else {
+                    aigent_llm::Provider::Ollama
+                };
+
+                // Run the structured tool loop — registry/executor are Arc-cloned
+                // so we do NOT hold the DaemonState lock during LLM calls.
+                let loop_result = {
+                    crate::tool_loop::run_tool_loop(
+                        &rt_clone.llm,
+                        primary,
+                        &rt_clone.config.llm.ollama_model,
+                        &rt_clone.config.llm.openrouter_model,
+                        &mut messages,
+                        tools_json.as_ref(),
+                        &registry,
+                        &executor,
+                        chunk_tx,
+                        Some(&event_tx),
+                    ).await
+                };
+
+                let reply_result: Result<String, anyhow::Error> = match loop_result {
+                    Ok(ref result) => {
+                        // Record tool results to procedural memory
+                        for exec in &result.tool_executions {
+                            let outcome = format!(
+                                "Tool '{}' executed. Output (first 400 chars): {}",
+                                exec.tool_name,
+                                safe_truncate(&exec.output, 400),
+                            );
+                            let _: Result<_, _> = memory.record(
+                                MemoryTier::Procedural,
+                                outcome,
+                                format!("tool-use:{}", exec.tool_name),
+                            ).await;
+                        }
+                        // Record assistant reply
+                        if !result.content.is_empty() {
+                            let _: Result<_, _> = memory.record(
+                                aigent_memory::MemoryTier::Episodic,
+                                crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
+                                format!("assistant-reply:model={}", rt_clone.config.active_model()),
+                            ).await;
+                        }
+                        Ok(result.content.clone())
+                    }
+                    Err(e) => Err(e),
+                };
+
+                // Reflect on the exchange
+                let reflect_events: Vec<BackendEvent> = match reply_result {
+                    Ok(ref reply) => rt_clone
+                        .inline_reflect(&mut memory, &user, reply)
+                        .await
+                        .unwrap_or_default(),
+                    Err(_) => vec![],
+                };
+
+                let _ = streamer.await;
+
+                // Re-acquire lock to restore state
+                let outcome: Result<Vec<BackendEvent>, anyhow::Error> = {
+                    let mut s = state.lock().await;
+                    s.memory = memory;
+                    let _ = s.memory.flush_all();
+
+                    match reply_result {
+                        Ok(reply) => {
+                            s.last_turn_at = Some(Utc::now());
+                            s.recent_turns.push_back(ConversationTurn {
+                                user: user.clone(),
+                                assistant: reply,
+                            });
+                            while s.recent_turns.len() > 8 {
+                                let _ = s.recent_turns.pop_front();
+                            }
+                            s.turn_count += 1;
+
+                            if s.runtime.config.memory.auto_sleep_turn_interval > 0
+                                && s.turn_count % s.runtime.config.memory.auto_sleep_turn_interval == 0
+                            {
+                                let state2 = state.clone();
+                                let event_tx2 = s.event_tx.clone();
+                                tokio::spawn(async move {
+                                    let (rt, mut mem) = {
+                                        let mut s = state2.lock().await;
+                                        (s.runtime.clone(), std::mem::take(&mut s.memory))
+                                    };
+                                    let _ = event_tx2.send(BackendEvent::SleepCycleRunning);
+                                    let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+                                    match rt.run_agentic_sleep_cycle(&mut mem, &noop_tx).await {
+                                        Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
+                                        Err(ref err) => warn!(?err, "auto-turn sleep failed"),
+                                    }
+                                    let mut s = state2.lock().await;
+                                    s.memory = mem;
+                                    let _ = s.memory.flush_all();
+                                    let _ = event_tx2.send(BackendEvent::MemoryUpdated);
+                                });
+                            }
+                            Ok(reflect_events)
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+
+                let mut writer = writer.lock().await;
+                match outcome {
+                    Ok(reflect_events) => {
+                        send_event(&mut writer, ServerEvent::Backend(BackendEvent::MemoryUpdated)).await?;
+                        for ev in reflect_events {
+                            let _ = send_event(&mut writer, ServerEvent::Backend(ev.clone())).await;
+                            let _ = event_tx.send(ev);
+                        }
+                        send_event(&mut writer, ServerEvent::Backend(BackendEvent::Done)).await?;
+                        if is_external {
+                            let _ = event_tx.send(BackendEvent::Done);
+                        }
+                    }
+                    Err(err) => {
+                        send_event(&mut writer, ServerEvent::Backend(BackendEvent::Error(err.to_string()))).await?;
+                        send_event(&mut writer, ServerEvent::Backend(BackendEvent::Done)).await?;
+                        if is_external {
+                            let _ = event_tx.send(BackendEvent::Error(err.to_string()));
+                            let _ = event_tx.send(BackendEvent::Done);
+                        }
+                    }
+                }
+            } else {
+            // ═══════════════════════════════════════════════════════════════════
+            // LEGACY PATH: text-based maybe_tool_call + single execution
+            // ═══════════════════════════════════════════════════════════════════
             let (rt_early, tool_specs) = {
                 let s = state.lock().await;
                 (s.runtime.clone(), s.tool_registry.list_specs())
@@ -399,6 +593,7 @@ pub(super) async fn handle_connection(
                     }
                 }
             }
+            } // end of legacy path else block
         }
         ClientCommand::GetStatus => {
             let state = state.lock().await;

@@ -1,5 +1,13 @@
 package aigent:host;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTE: This WIT interface describes the *aspirational* component-model
+// target for aigent WASM tools.  The current runtime uses WASIP1 stdio
+// JSON (stdin/stdout) rather than WIT imports/exports.  This file is kept
+// in sync with the host capabilities so that a future migration to the
+// component model can adopt it directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
 /// Parameters passed to a tool invocation.
 record tool-param {
   name: string,
@@ -12,10 +20,53 @@ record tool-result {
   output: string,
 }
 
-/// Metadata describing a tool.
+/// Describes a single parameter that a tool accepts.
+record param-spec {
+  name: string,
+  description: string,
+  required: bool,
+  /// JSON Schema type hint: "string", "number", "integer", "boolean",
+  /// "array", or "object".  Omit (or pass none) for the default "string".
+  param-type: option<string>,
+  /// Restrict allowed values to the given set (enum).
+  enum-values: option<list<string>>,
+  /// Default value expressed as a string.  The host will coerce it to the
+  /// appropriate JSON type based on `param-type` when building the schema.
+  default-value: option<string>,
+}
+
+/// Security / grouping metadata for a tool.
+record tool-metadata {
+  /// "low", "medium", or "high".
+  security-level: option<string>,
+  /// True if the tool never mutates external state.
+  read-only: option<bool>,
+  /// Logical group (e.g. "filesystem", "shell", "web").
+  group: option<string>,
+}
+
+/// Metadata describing a tool — name, description, and typed parameters.
 record tool-spec {
   name: string,
   description: string,
+  /// Declared parameters.  The ordering matters: the LLM uses it to
+  /// generate its tool-call JSON.
+  params: list<param-spec>,
+  /// Optional metadata for policy / registry purposes.
+  metadata: option<tool-metadata>,
+}
+
+/// Structured error type for host operations.
+///
+/// Guests can match on `kind` for programmatic error handling without
+/// parsing the human-readable `message`.
+record host-error {
+  /// Machine-readable error kind.
+  /// Common values: "not-found", "permission-denied", "timeout",
+  /// "invalid-argument", "io-error", "network-error", "unknown".
+  kind: string,
+  /// Human-readable description.
+  message: string,
 }
 
 world host {
@@ -24,9 +75,11 @@ world host {
   export get-time-unix-ms: func() -> u64;
 
   // ── filesystem (workspace-bounded) ──────────────────────────
-  export read-file: func(path: string, max-bytes: u32) -> result<string, string>;
-  export write-file: func(path: string, content: string) -> result<_, string>;
-  export list-dir: func(path: string) -> result<list<string>, string>;
+  export read-file: func(path: string, max-bytes: u32) -> result<string, host-error>;
+  export write-file: func(path: string, content: string) -> result<_, host-error>;
+  export list-dir: func(path: string) -> result<list<string>, host-error>;
+  /// Check whether a path exists.
+  export path-exists: func(path: string) -> bool;
 
   // ── shell execution ─────────────────────────────────────────
   export run-shell: func(command: string, timeout-ms: u32) -> tool-result;
@@ -34,21 +87,29 @@ world host {
   // ── key-value store (persistent across invocations) ─────────
   export kv-get: func(key: string) -> option<string>;
   export kv-set: func(key: string, value: string);
+  /// Delete a key from the store.
+  export kv-delete: func(key: string) -> bool;
+  /// List all keys matching a prefix.
+  export kv-list-keys: func(prefix: string) -> list<string>;
 
   // ── HTTP client ─────────────────────────────────────────────
-  export http-get: func(url: string) -> result<string, string>;
-  export http-post: func(url: string, body: string, content-type: string) -> result<string, string>;
+  export http-get: func(url: string) -> result<string, host-error>;
+  export http-post: func(url: string, body: string, content-type: string) -> result<string, host-error>;
+
+  // ── environment ─────────────────────────────────────────────
+  /// Read an environment variable (set by the host).
+  export env-get: func(name: string) -> option<string>;
 
   // ── Git integration ─────────────────────────────────────────
   /// Commit all staged changes in the workspace with a standard message.
   /// Returns the short SHA of the new commit on success.
-  export git-commit: func(message: string) -> result<string, string>;
+  export git-commit: func(message: string) -> result<string, host-error>;
   /// Revert the most recent commit (git revert HEAD --no-edit).
   /// Returns a human-readable summary on success.
-  export git-rollback-last: func() -> result<string, string>;
+  export git-rollback-last: func() -> result<string, host-error>;
   /// Return the one-line summary of the most recent commit, or an error
   /// when the workspace has no commits.
-  export git-log-last: func() -> result<string, string>;
+  export git-log-last: func() -> result<string, host-error>;
 
   // ── gait — safe native git ─────────────────────────────────
   /// A structured git operation request for the gait tool.
@@ -67,12 +128,12 @@ world host {
   }
   /// Preferred git interface — enforces trust boundaries.
   /// Returns rich formatted output suitable for LLM reflection.
-  export perform-gait: func(op: git-operation) -> result<string, string>;
+  export perform-gait: func(op: git-operation) -> result<string, host-error>;
 
   // ── Secrets store ────────────────────────────────────────────
   /// Read a named secret from the workspace .secrets/ directory.
   /// The host validates that the name is a safe filename component.
-  export secret-get: func(name: string) -> result<string, string>;
+  export secret-get: func(name: string) -> result<string, host-error>;
 
   // ── Guest must implement ────────────────────────────────────
   import spec: func() -> tool-spec;

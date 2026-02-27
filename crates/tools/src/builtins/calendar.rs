@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use fs2::FileExt;
 use serde_json;
 
-use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
+use crate::{Tool, ToolSpec, ToolParam, ToolOutput, ToolMetadata, SecurityLevel};
 
 /// Appends an event object to `{data_dir}/calendar.json` (a JSON array).
 /// Creates the file if it does not exist.  Uses advisory file locking to
@@ -29,23 +29,33 @@ impl Tool for CalendarAddEventTool {
                     name: "title".to_string(),
                     description: "Event title".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "date".to_string(),
                     description: "Event date (natural language or ISO-8601)".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "time".to_string(),
                     description: "Event time (e.g. '14:00' or '2pm')".to_string(),
                     required: false,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "description".to_string(),
                     description: "Optional description or notes".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: false,
+                group: "calendar".to_string(),
+                ..Default::default()
+            },
         }
     }
 

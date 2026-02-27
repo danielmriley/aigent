@@ -1,0 +1,23 @@
+{
+  "name": "write_file",
+  "description": "Write content to a file within the workspace. Creates parent directories automatically. Only relative paths from the workspace root are allowed — absolute paths and '..' traversal are rejected.",
+  "params": [
+    {
+      "name": "path",
+      "description": "Relative path from workspace root (e.g. 'src/new_module.rs')",
+      "required": true,
+      "param_type": "string"
+    },
+    {
+      "name": "content",
+      "description": "The full file content to write",
+      "required": true,
+      "param_type": "string"
+    }
+  ],
+  "metadata": {
+    "security_level": "medium",
+    "read_only": false,
+    "group": "filesystem"
+  }
+}

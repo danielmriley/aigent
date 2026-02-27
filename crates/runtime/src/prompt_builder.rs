@@ -376,7 +376,9 @@ mod tests {
                 name: "input".to_string(),
                 description: "test input".to_string(),
                 required: true,
+                    ..Default::default()
             }],
+            metadata: aigent_tools::ToolMetadata::default(),
         }];
         let section = build_tools_and_grounding(&specs);
         assert!(section.contains("AVAILABLE TOOLS"));

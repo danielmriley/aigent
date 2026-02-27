@@ -1,0 +1,24 @@
+{
+  "name": "read_file",
+  "description": "Read the contents of a file within the workspace. Returns the file text, truncated to max_bytes if specified. Only relative paths from the workspace root are allowed.",
+  "params": [
+    {
+      "name": "path",
+      "description": "Relative path from workspace root (e.g. 'src/main.rs', 'README.md')",
+      "required": true,
+      "param_type": "string"
+    },
+    {
+      "name": "max_bytes",
+      "description": "Maximum bytes to read (default: 65536). Use smaller values for large files to avoid overwhelming the LLM context.",
+      "required": false,
+      "param_type": "integer",
+      "default": "65536"
+    }
+  ],
+  "metadata": {
+    "security_level": "low",
+    "read_only": true,
+    "group": "filesystem"
+  }
+}

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
+use crate::{Tool, ToolSpec, ToolParam, ToolOutput, ToolMetadata, SecurityLevel};
 
 pub struct RunShellTool {
     pub workspace_root: PathBuf,
@@ -27,13 +27,21 @@ impl Tool for RunShellTool {
                     name: "command".to_string(),
                     description: "Shell command to execute".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "timeout_secs".to_string(),
                     description: "Max execution time in seconds (default: 30)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::High,
+                read_only: false,
+                group: "shell".to_string(),
+                ..Default::default()
+            },
         }
     }
 

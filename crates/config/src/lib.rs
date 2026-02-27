@@ -150,6 +150,22 @@ pub struct ToolsConfig {
     /// Brave Search REST API instead of DuckDuckGo Instant Answers.
     /// Can also be set via `BRAVE_API_KEY` env var (env takes precedence).
     pub brave_api_key: String,
+    /// Tavily Search API key.  When set, enables the Tavily search provider
+    /// which returns AI-optimized search results with extracted content.
+    /// Can also be set via `TAVILY_API_KEY` env var (env takes precedence).
+    #[serde(default)]
+    pub tavily_api_key: String,
+    /// SearXNG instance base URL (e.g. "http://localhost:8080").
+    /// When set, enables SearXNG as a self-hosted search provider.
+    /// Can also be set via `SEARXNG_BASE_URL` env var (env takes precedence).
+    #[serde(default)]
+    pub searxng_base_url: String,
+    /// Preferred search provider ordering.  The agent tries providers in order
+    /// and uses the first one that has valid credentials configured.
+    /// Options: "brave", "tavily", "searxng", "duckduckgo".
+    /// Default: ["brave", "tavily", "searxng", "duckduckgo"]
+    #[serde(default = "default_search_providers")]
+    pub search_providers: Vec<String>,
     /// Automatically run `git add -A && git commit` after every successful
     /// `write_file` or `run_shell` tool call.  Requires git to be installed
     /// and the workspace to be a git repository (or `git init` to have been
@@ -165,6 +181,16 @@ pub struct ToolsConfig {
     /// be compiled without the `sandbox` feature for a permanent opt-out).
     #[serde(default = "default_sandbox_enabled")]
     pub sandbox_enabled: bool,
+    /// Use native structured tool calling (Ollama `/api/chat` + OpenRouter
+    /// `tools` parameter) instead of the legacy text-based `maybe_tool_call`
+    /// prompt.  Native calling is more reliable and supports parallel tool
+    /// execution.  Set to `false` to fall back to the text-based path.
+    #[serde(default = "default_use_native_calling")]
+    pub use_native_calling: bool,
+    /// Maximum number of tool-call rounds before forcing a text response.
+    /// Prevents infinite tool-calling loops.  Default: 5.
+    #[serde(default = "default_max_tool_rounds")]
+    pub max_tool_rounds: usize,
 }
 
 impl Default for ToolsConfig {
@@ -172,14 +198,36 @@ impl Default for ToolsConfig {
         Self {
             approval_mode: ApprovalMode::Balanced,
             brave_api_key: String::new(),
+            tavily_api_key: String::new(),
+            searxng_base_url: String::new(),
+            search_providers: default_search_providers(),
             git_auto_commit: false,
             sandbox_enabled: true,
+            use_native_calling: true,
+            max_tool_rounds: 5,
         }
     }
 }
 
+fn default_search_providers() -> Vec<String> {
+    vec![
+        "brave".to_string(),
+        "tavily".to_string(),
+        "searxng".to_string(),
+        "duckduckgo".to_string(),
+    ]
+}
+
 fn default_sandbox_enabled() -> bool {
     true
+}
+
+fn default_use_native_calling() -> bool {
+    true
+}
+
+fn default_max_tool_rounds() -> usize {
+    5
 }
 
 // ── Safety config ─────────────────────────────────────────────────────────────
@@ -190,14 +238,40 @@ pub struct SafetyConfig {
     pub approval_required: bool,
     pub allow_shell: bool,
     pub allow_wasm: bool,
-    /// Explicit allow-list of tool names.  Empty (the default) means all tools
-    /// are allowed, subject to `allow_shell` / `allow_wasm` capability gates.
+    /// Explicit allow-list of tool names (supports `@group` syntax, e.g.
+    /// `@filesystem`).  Empty (the default) means all tools are allowed,
+    /// subject to `allow_shell` / `allow_wasm` capability gates.
     pub tool_allowlist: Vec<String>,
-    /// Explicit deny-list of tool names.  Takes precedence over `tool_allowlist`.
+    /// Explicit deny-list of tool names (supports `@group` syntax).
+    /// Takes precedence over `tool_allowlist`.
     pub tool_denylist: Vec<String>,
     /// Tools that bypass the interactive approval flow even when
     /// `approval_required = true`.  Defaults to the four safe built-in tools.
     pub approval_exempt_tools: Vec<String>,
+    /// Maximum security level allowed for any tool execution.
+    /// Tools whose metadata declares a higher level are blocked outright.
+    /// Values: "low", "medium", "high".  Default: "high" (no restriction).
+    #[serde(default = "default_max_security_level")]
+    pub max_security_level: String,
+    /// Per-tool policy overrides keyed by tool name.
+    #[serde(default)]
+    pub tool_overrides: std::collections::HashMap<String, ToolPolicyOverride>,
+}
+
+/// Per-tool policy overrides — allows fine-grained control over individual
+/// tools without changing the global safety settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolPolicyOverride {
+    /// Override the global approval mode for this tool.
+    /// Values: "safer", "balanced", "autonomous".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
+    /// When `true`, this tool is completely blocked regardless of other settings.
+    #[serde(default)]
+    pub denied: bool,
+    /// Override the maximum security level for this specific tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_security_level: Option<String>,
 }
 
 impl Default for SafetyConfig {
@@ -214,8 +288,14 @@ impl Default for SafetyConfig {
                 "draft_email".to_string(),
                 "web_search".to_string(),
             ],
+            max_security_level: "high".to_string(),
+            tool_overrides: std::collections::HashMap::new(),
         }
     }
+}
+
+fn default_max_security_level() -> String {
+    "high".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

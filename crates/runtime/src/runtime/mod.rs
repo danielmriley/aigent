@@ -20,7 +20,7 @@ pub struct ConversationTurn {
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {
     pub config: AppConfig,
-    llm: LlmRouter,
+    pub llm: LlmRouter,
 }
 
 impl AgentRuntime {

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
-use aigent_config::ApprovalMode;
-use aigent_tools::{ToolOutput, ToolRegistry};
+use aigent_config::{ApprovalMode, ToolPolicyOverride};
+use aigent_tools::{SecurityLevel, ToolMetadata, ToolOutput, ToolRegistry};
 
 // ── Execution Policy ─────────────────────────────────────────────────────────
 
@@ -44,6 +44,13 @@ pub struct ExecutionPolicy {
     /// Requires the `sandbox` Cargo feature to be compiled in, otherwise
     /// this field has no effect.
     pub sandbox_enabled: bool,
+    /// Maximum security level allowed for tool execution.
+    /// Tools with `metadata.security_level` above this threshold are denied.
+    /// Default: `SecurityLevel::High` (permits everything).
+    pub max_security_level: SecurityLevel,
+    /// Per-tool policy overrides keyed by tool name.
+    #[serde(default)]
+    pub tool_overrides: HashMap<String, ToolPolicyOverride>,
 }
 
 impl Default for ExecutionPolicy {
@@ -64,6 +71,8 @@ impl Default for ExecutionPolicy {
             ],
             git_auto_commit: false,
             sandbox_enabled: true,
+            max_security_level: SecurityLevel::High,
+            tool_overrides: HashMap::new(),
         }
     }
 }
@@ -130,12 +139,14 @@ impl ToolExecutor {
             .get(tool_name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {tool_name}"))?;
 
-        // 2. Enforce capability gates (deny-list / allow-list / shell guard)
-        self.check_capability(tool_name)?;
+        let metadata = tool.spec().metadata;
 
-        // 3. Approval flow — governed by ApprovalMode
-        if self.requires_approval(tool_name) {
-            let approved = self.request_approval(tool_name, args).await?;
+        // 2. Enforce capability gates (deny-list / allow-list / shell guard / security level)
+        self.check_capability(registry, tool_name, &metadata)?;
+
+        // 3. Approval flow — governed by ApprovalMode + metadata
+        if self.requires_approval(tool_name, &metadata) {
+            let approved = self.request_approval(tool_name, args, &metadata).await?;
             if !approved {
                 info!(tool = tool_name, "tool execution denied by user");
                 return Ok(ToolOutput {
@@ -154,7 +165,7 @@ impl ToolExecutor {
         #[cfg(all(feature = "sandbox", unix))]
         if tool_name == "run_shell" && self.policy.sandbox_enabled {
             let result = self.run_shell_sandboxed(args).await?;
-            if result.success && self.policy.git_auto_commit {
+            if result.success && self.policy.git_auto_commit && !metadata.read_only {
                 let detail = args
                     .get("command")
                     .map(|s| s.as_str())
@@ -174,24 +185,21 @@ impl ToolExecutor {
 
         let result = tool.run(args).await?;
 
-        // 5. Git auto-commit after successful write operations
-        if result.success && self.policy.git_auto_commit {
-            const WRITE_TOOLS: &[&str] = &["write_file", "run_shell"];
-            if WRITE_TOOLS.contains(&tool_name) {
-                let detail = args
-                    .get("path")
-                    .or_else(|| args.get("command"))
-                    .map(|s| s.as_str())
-                    .unwrap_or("(unknown)");
-                if let Err(err) = git::git_auto_commit(
-                    &self.policy.workspace_root,
-                    tool_name,
-                    detail,
-                )
-                .await
-                {
-                    warn!(?err, tool = tool_name, "git auto-commit failed (non-fatal)");
-                }
+        // 5. Git auto-commit after successful write operations (metadata-driven)
+        if result.success && self.policy.git_auto_commit && !metadata.read_only {
+            let detail = args
+                .get("path")
+                .or_else(|| args.get("command"))
+                .map(|s| s.as_str())
+                .unwrap_or("(unknown)");
+            if let Err(err) = git::git_auto_commit(
+                &self.policy.workspace_root,
+                tool_name,
+                detail,
+            )
+            .await
+            {
+                warn!(?err, tool = tool_name, "git auto-commit failed (non-fatal)");
             }
         }
 
@@ -199,14 +207,14 @@ impl ToolExecutor {
     }
 
     /// Returns `true` when this tool invocation needs interactive approval
-    /// based on the configured `ApprovalMode`.
+    /// based on the configured `ApprovalMode` and tool metadata.
     ///
     /// | Mode         | Needs approval                                          |
     /// |--------------|---------------------------------------------------------|
     /// | `Autonomous` | Never                                                   |
-    /// | `Balanced`   | Write / shell tools and anything not read-only          |
+    /// | `Balanced`   | Non-read-only tools or `SecurityLevel::High`            |
     /// | `Safer`      | Every tool (unless explicitly exempt)                   |
-    fn requires_approval(&self, tool_name: &str) -> bool {
+    fn requires_approval(&self, tool_name: &str, metadata: &ToolMetadata) -> bool {
         // Explicit exempt list always short-circuits.
         if self.policy
             .approval_exempt_tools
@@ -214,34 +222,66 @@ impl ToolExecutor {
         {
             return false;
         }
-        match &self.policy.approval_mode {
+
+        // Per-tool override can override the global approval mode.
+        let effective_mode = self.policy.tool_overrides.get(tool_name)
+            .and_then(|ovr| ovr.approval_mode.as_ref())
+            .unwrap_or(&self.policy.approval_mode);
+
+        match effective_mode {
             ApprovalMode::Autonomous => false,
             ApprovalMode::Balanced => {
-                // Read-only tools don't need approval.
-                const READ_ONLY: &[&str] = &[
-                    "read_file",
-                    "web_search",
-                ];
-                !READ_ONLY.contains(&tool_name)
+                // Read-only + non-High tools skip approval.
+                // Anything that writes or has High security level requires approval.
+                !metadata.read_only || metadata.security_level == SecurityLevel::High
             }
             ApprovalMode::Safer => true,
         }
     }
 
-    fn check_capability(&self, tool_name: &str) -> Result<()> {
+    fn check_capability(
+        &self,
+        registry: &ToolRegistry,
+        tool_name: &str,
+        metadata: &ToolMetadata,
+    ) -> Result<()> {
+        // Per-tool override: if explicitly denied, short-circuit.
+        if let Some(ovr) = self.policy.tool_overrides.get(tool_name) {
+            if ovr.denied {
+                bail!("tool '{}' is denied by per-tool policy override", tool_name);
+            }
+        }
+
         // Shell is only available when explicitly enabled in config.
         if tool_name == "run_shell" && !self.policy.allow_shell {
             bail!("shell execution is disabled by safety policy (set allow_shell = true)");
         }
-        // Per-tool deny-list (takes precedence over allow-list).
-        if self.policy.tool_denylist.contains(&tool_name.to_string()) {
+
+        // Security level ceiling — check per-tool override first, then global.
+        let effective_max = self.policy.tool_overrides.get(tool_name)
+            .and_then(|ovr| ovr.max_security_level.as_deref())
+            .map(|s| parse_security_level_str(s))
+            .unwrap_or(self.policy.max_security_level);
+        if !security_level_permitted(metadata.security_level, effective_max) {
+            bail!(
+                "tool '{}' has security level {:?} which exceeds the policy maximum {:?}",
+                tool_name,
+                metadata.security_level,
+                effective_max,
+            );
+        }
+
+        // Per-tool deny-list (supports `@group` expansion, takes precedence over allow-list).
+        let expanded_deny = registry.expand_groups(&self.policy.tool_denylist);
+        if expanded_deny.contains(&tool_name.to_string()) {
             bail!("tool '{}' is blocked by policy (tool_denylist)", tool_name);
         }
-        // Per-tool allow-list (empty = all permitted).
-        if !self.policy.tool_allowlist.is_empty()
-            && !self.policy.tool_allowlist.contains(&tool_name.to_string())
-        {
-            bail!("tool '{}' is not in the tool_allowlist", tool_name);
+        // Per-tool allow-list (supports `@group` expansion, empty = all permitted).
+        if !self.policy.tool_allowlist.is_empty() {
+            let expanded_allow = registry.expand_groups(&self.policy.tool_allowlist);
+            if !expanded_allow.contains(&tool_name.to_string()) {
+                bail!("tool '{}' is not in the tool_allowlist", tool_name);
+            }
         }
         Ok(())
     }
@@ -315,9 +355,11 @@ impl ToolExecutor {
         })
     }
 
-    async fn request_approval(        &self,
+    async fn request_approval(
+        &self,
         tool_name: &str,
         args: &HashMap<String, String>,
+        metadata: &ToolMetadata,
     ) -> Result<bool> {
         // Approval-exempt tools are auto-approved regardless of policy.
         if self.policy.approval_exempt_tools.contains(&tool_name.to_string()) {
@@ -334,21 +376,55 @@ impl ToolExecutor {
             return Ok(false);
         };
 
-        let risk = match tool_name {
+        // Build a metadata-driven risk summary.
+        let level_tag = match metadata.security_level {
+            SecurityLevel::Low => "LOW",
+            SecurityLevel::Medium => "MEDIUM",
+            SecurityLevel::High => "HIGH",
+        };
+        let rw_tag = if metadata.read_only { "read-only" } else { "READ-WRITE" };
+        let group_tag = if metadata.group.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", metadata.group)
+        };
+
+        // Tool-specific detail for common tools.
+        let detail = match tool_name {
             "run_shell" => format!(
-                "Execute shell command: {}",
+                "command: {}",
                 args.get("command").unwrap_or(&"(unknown)".to_string())
             ),
             "write_file" => format!(
-                "Write to file: {}",
+                "path: {}",
                 args.get("path").unwrap_or(&"(unknown)".to_string())
             ),
             "read_file" => format!(
-                "Read file: {}",
+                "path: {}",
                 args.get("path").unwrap_or(&"(unknown)".to_string())
             ),
-            _ => format!("Execute tool: {tool_name}"),
+            "git_rollback" => format!(
+                "commit: {}",
+                args.get("commit_hash").unwrap_or(&"(unknown)".to_string())
+            ),
+            _ => {
+                // Generic: show up to 2 args as key=value
+                let mut parts: Vec<String> = args
+                    .iter()
+                    .take(2)
+                    .map(|(k, v)| {
+                        let truncated = if v.len() > 60 { &v[..60] } else { v };
+                        format!("{k}={truncated}")
+                    })
+                    .collect();
+                if args.len() > 2 {
+                    parts.push(format!("(+{} more)", args.len() - 2));
+                }
+                parts.join(", ")
+            }
         };
+
+        let risk = format!("[{level_tag}/{rw_tag}]{group_tag} {tool_name}: {detail}");
 
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
@@ -366,6 +442,31 @@ impl ToolExecutor {
             .map_err(|_| anyhow::anyhow!("approval response channel dropped"))?;
 
         Ok(decision == ApprovalDecision::Approve)
+    }
+}
+
+// ── Security level ordering ──────────────────────────────────────────────────
+
+/// Returns `true` when `tool_level` is at or below `max_level`.
+///
+/// Ordering: `Low < Medium < High`.
+fn security_level_permitted(tool_level: SecurityLevel, max_level: SecurityLevel) -> bool {
+    fn rank(l: SecurityLevel) -> u8 {
+        match l {
+            SecurityLevel::Low => 0,
+            SecurityLevel::Medium => 1,
+            SecurityLevel::High => 2,
+        }
+    }
+    rank(tool_level) <= rank(max_level)
+}
+
+/// Parse a string into a `SecurityLevel`, defaulting to `High`.
+fn parse_security_level_str(s: &str) -> SecurityLevel {
+    match s.to_lowercase().as_str() {
+        "low" => SecurityLevel::Low,
+        "medium" => SecurityLevel::Medium,
+        _ => SecurityLevel::High,
     }
 }
 
@@ -396,6 +497,9 @@ pub fn default_registry(
     workspace_root: PathBuf,
     agent_data_dir: PathBuf,
     brave_api_key: Option<String>,
+    tavily_api_key: Option<String>,
+    searxng_base_url: Option<String>,
+    search_providers: Vec<String>,
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
         CalendarAddEventTool, DraftEmailTool, GitRollbackTool, ReadFileTool, RemindMeTool,
@@ -411,7 +515,7 @@ pub fn default_registry(
     #[cfg(feature = "wasm")]
     let wasm_names: std::collections::HashSet<String> = {
         let extensions_dir = workspace_root.join("extensions");
-        let tools = wasm::load_wasm_tools_from_dir(&extensions_dir);
+        let tools = wasm::load_wasm_tools_from_dir(&extensions_dir, Some(&workspace_root));
         let names: std::collections::HashSet<String> =
             tools.iter().map(|t| t.spec().name.clone()).collect();
         if !names.is_empty() {
@@ -448,7 +552,12 @@ pub fn default_registry(
         ),
         (
             "web_search",
-            Box::new(WebSearchTool { brave_api_key: brave_api_key.clone() }),
+            Box::new(WebSearchTool {
+                brave_api_key: brave_api_key.clone(),
+                tavily_api_key: tavily_api_key.clone(),
+                searxng_base_url: searxng_base_url.clone(),
+                search_providers: search_providers.clone(),
+            }),
         ),
         (
             "fetch_page",
@@ -494,6 +603,21 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::{ExecutionPolicy, ToolExecutor, default_registry, ensure_within_workspace};
+    use aigent_tools::{SecurityLevel, ToolMetadata};
+
+    // Helper metadata for common tool categories used in tests.
+    fn read_only_low() -> ToolMetadata {
+        ToolMetadata { security_level: SecurityLevel::Low, read_only: true, group: "filesystem".into(), ..Default::default() }
+    }
+    fn read_only_high() -> ToolMetadata {
+        ToolMetadata { security_level: SecurityLevel::High, read_only: true, group: "web".into(), ..Default::default() }
+    }
+    fn write_medium() -> ToolMetadata {
+        ToolMetadata { security_level: SecurityLevel::Medium, read_only: false, group: "filesystem".into(), ..Default::default() }
+    }
+    fn write_high() -> ToolMetadata {
+        ToolMetadata { security_level: SecurityLevel::High, read_only: false, group: "shell".into(), ..Default::default() }
+    }
 
     #[test]
     fn workspace_guard_rejects_escape() -> anyhow::Result<()> {
@@ -525,9 +649,9 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(!executor.requires_approval("run_shell"));
-        assert!(!executor.requires_approval("write_file"));
-        assert!(!executor.requires_approval("read_file"));
+        assert!(!executor.requires_approval("run_shell", &write_high()));
+        assert!(!executor.requires_approval("write_file", &write_medium()));
+        assert!(!executor.requires_approval("read_file", &read_only_low()));
     }
 
     #[test]
@@ -538,21 +662,33 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.requires_approval("read_file"));
-        assert!(executor.requires_approval("write_file"));
-        assert!(executor.requires_approval("run_shell"));
+        assert!(executor.requires_approval("read_file", &read_only_low()));
+        assert!(executor.requires_approval("write_file", &write_medium()));
+        assert!(executor.requires_approval("run_shell", &write_high()));
     }
 
     #[test]
-    fn balanced_read_only_no_approval() {
+    fn balanced_read_only_low_no_approval() {
         let policy = ExecutionPolicy {
             approval_mode: aigent_config::ApprovalMode::Balanced,
             approval_exempt_tools: vec![],
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(!executor.requires_approval("read_file"));
-        assert!(!executor.requires_approval("web_search"));
+        // read_only + Low → no approval
+        assert!(!executor.requires_approval("read_file", &read_only_low()));
+    }
+
+    #[test]
+    fn balanced_read_only_high_needs_approval() {
+        let policy = ExecutionPolicy {
+            approval_mode: aigent_config::ApprovalMode::Balanced,
+            approval_exempt_tools: vec![],
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        // read_only + High → still needs approval (High triggers it)
+        assert!(executor.requires_approval("web_search", &read_only_high()));
     }
 
     #[test]
@@ -563,11 +699,8 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.requires_approval("write_file"));
-        assert!(executor.requires_approval("run_shell"));
-        assert!(executor.requires_approval("git_rollback"));
-        assert!(executor.requires_approval("remind_me"));
-        assert!(executor.requires_approval("calendar_add_event"));
+        assert!(executor.requires_approval("write_file", &write_medium()));
+        assert!(executor.requires_approval("run_shell", &write_high()));
     }
 
     #[test]
@@ -578,10 +711,17 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(!executor.requires_approval("run_shell"));
+        assert!(!executor.requires_approval("run_shell", &write_high()));
     }
 
     // ── check_capability tests ─────────────────────────────────────────────
+
+    /// Make an empty registry (no tools) — sufficient for testing capability
+    /// checks since `check_capability` only uses the registry for group
+    /// expansion when allow/deny lists contain `@group` entries.
+    fn empty_reg() -> aigent_tools::ToolRegistry {
+        aigent_tools::ToolRegistry::default()
+    }
 
     #[test]
     fn denylist_blocks_tool() {
@@ -590,7 +730,7 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.check_capability("write_file").is_err());
+        assert!(executor.check_capability(&empty_reg(), "write_file", &write_medium()).is_err());
     }
 
     #[test]
@@ -600,8 +740,8 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.check_capability("read_file").is_ok());
-        assert!(executor.check_capability("write_file").is_err());
+        assert!(executor.check_capability(&empty_reg(), "read_file", &read_only_low()).is_ok());
+        assert!(executor.check_capability(&empty_reg(), "write_file", &write_medium()).is_err());
     }
 
     #[test]
@@ -612,9 +752,9 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.check_capability("read_file").is_ok());
-        assert!(executor.check_capability("write_file").is_ok());
-        assert!(executor.check_capability("run_shell").is_err()); // shell blocked by allow_shell=false
+        assert!(executor.check_capability(&empty_reg(), "read_file", &read_only_low()).is_ok());
+        assert!(executor.check_capability(&empty_reg(), "write_file", &write_medium()).is_ok());
+        assert!(executor.check_capability(&empty_reg(), "run_shell", &write_high()).is_err()); // shell blocked by allow_shell=false
     }
 
     #[test]
@@ -625,7 +765,30 @@ mod tests {
             ..ExecutionPolicy::default()
         };
         let executor = ToolExecutor::new(policy);
-        assert!(executor.check_capability("write_file").is_err());
+        assert!(executor.check_capability(&empty_reg(), "write_file", &write_medium()).is_err());
+    }
+
+    #[test]
+    fn security_level_ceiling_blocks_high_when_max_medium() {
+        let policy = ExecutionPolicy {
+            max_security_level: SecurityLevel::Medium,
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.check_capability(&empty_reg(), "run_shell", &write_high()).is_err());
+        assert!(executor.check_capability(&empty_reg(), "write_file", &write_medium()).is_ok());
+        assert!(executor.check_capability(&empty_reg(), "read_file", &read_only_low()).is_ok());
+    }
+
+    #[test]
+    fn security_level_ceiling_low_blocks_medium() {
+        let policy = ExecutionPolicy {
+            max_security_level: SecurityLevel::Low,
+            ..ExecutionPolicy::default()
+        };
+        let executor = ToolExecutor::new(policy);
+        assert!(executor.check_capability(&empty_reg(), "write_file", &write_medium()).is_err());
+        assert!(executor.check_capability(&empty_reg(), "read_file", &read_only_low()).is_ok());
     }
 
     // ── Integration tests ──────────────────────────────────────────────────
@@ -643,7 +806,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, None, None, vec![]);
 
         let mut args = HashMap::new();
         args.insert("command".to_string(), "echo hi".to_string());
@@ -671,7 +834,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, None, None, vec![]);
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), "hello.txt".to_string());
@@ -694,7 +857,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, None, None, vec![]);
 
         let result = executor
             .execute(&registry, "nonexistent_tool", &HashMap::new())

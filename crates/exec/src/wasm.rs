@@ -10,6 +10,25 @@
 //! one-shot execution), feeds it stdin, captures stdout, and deserialises the
 //! result.  No persistent WASM state is retained between calls.
 //!
+//! # Tool Metadata Discovery
+//!
+//! WASM tools can declare their spec (name, description, params) via a
+//! **sidecar manifest** — a `<name>.tool.json` file next to the `.wasm`:
+//!
+//! ```json
+//! {
+//!   "name": "my_tool",
+//!   "description": "Does something useful",
+//!   "params": [
+//!     { "name": "input", "description": "The input value", "required": true },
+//!     { "name": "verbose", "description": "Enable verbose output", "required": false }
+//!   ]
+//! }
+//! ```
+//!
+//! When no manifest is found, the host falls back to a built-in catalogue
+//! for known tools, or a generic one-param spec for unknown tools.
+//!
 //! # Discovery (`load_wasm_tools_from_dir`)
 //! Scans two layouts:
 //!
@@ -33,7 +52,125 @@ use wasmtime_wasi::preview1::{WasiP1Ctx, add_to_linker_sync};
 use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::WasiCtxBuilder;
 
-use aigent_tools::{Tool, ToolOutput, ToolParam, ToolSpec};
+use aigent_tools::{Tool, ToolOutput, ToolParam, ToolSpec, ToolMetadata};
+
+// ── Sidecar manifest ────────────────────────────────────────────────────────
+
+/// Sidecar manifest structure for `<name>.tool.json`.
+///
+/// Allows WASM tools to self-describe their spec without hardcoding in the host.
+#[derive(Deserialize)]
+struct ToolManifest {
+    name: String,
+    description: String,
+    #[serde(default)]
+    params: Vec<ManifestParam>,
+    #[serde(default)]
+    metadata: Option<ManifestMetadata>,
+}
+
+#[derive(Deserialize)]
+struct ManifestParam {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    required: bool,
+    #[serde(default)]
+    param_type: Option<String>,
+    #[serde(default)]
+    enum_values: Vec<String>,
+    #[serde(default)]
+    default: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ManifestMetadata {
+    #[serde(default)]
+    security_level: Option<String>,
+    #[serde(default)]
+    read_only: Option<bool>,
+    #[serde(default)]
+    group: Option<String>,
+}
+
+/// Try to load a `<stem>.tool.json` manifest next to the `.wasm` file.
+fn load_manifest(wasm_path: &Path) -> Option<ToolSpec> {
+    let stem = wasm_path.file_stem()?.to_str()?;
+    let manifest_path = wasm_path.with_file_name(format!("{stem}.tool.json"));
+
+    // Also check in the crate root (for tools-src layout).
+    let paths_to_try = [
+        manifest_path.clone(),
+        // tools-src/<crate>/tool.json
+        wasm_path
+            .ancestors()
+            .nth(4) // from target/wasm32-wasip1/release/<name>.wasm, go up 4
+            .map(|p| p.join("tool.json"))
+            .unwrap_or_default(),
+    ];
+
+    for path in &paths_to_try {
+        if path.is_file() {
+            match fs::read_to_string(path) {
+                Ok(json_str) => {
+                    match serde_json::from_str::<ToolManifest>(&json_str) {
+                        Ok(manifest) => {
+                            debug!(?path, "wasm: loaded tool manifest");
+                            let metadata = if let Some(m) = manifest.metadata {
+                                use aigent_tools::SecurityLevel;
+                                ToolMetadata {
+                                    security_level: match m.security_level.as_deref() {
+                                        Some("medium") => SecurityLevel::Medium,
+                                        Some("high") => SecurityLevel::High,
+                                        _ => SecurityLevel::Low,
+                                    },
+                                    read_only: m.read_only.unwrap_or(false),
+                                    group: m.group.unwrap_or_default(),
+                                    ..Default::default()
+                                }
+                            } else {
+                                ToolMetadata::default()
+                            };
+                            return Some(ToolSpec {
+                                name: manifest.name,
+                                description: manifest.description,
+                                params: manifest.params.into_iter().map(|p| {
+                                    use aigent_tools::ParamType;
+                                    let param_type = match p.param_type.as_deref() {
+                                        Some("number") => ParamType::Number,
+                                        Some("integer") => ParamType::Integer,
+                                        Some("boolean") => ParamType::Boolean,
+                                        Some("array") => ParamType::Array,
+                                        Some("object") => ParamType::Object,
+                                        _ => ParamType::String,
+                                    };
+                                    ToolParam {
+                                        name: p.name,
+                                        description: p.description,
+                                        required: p.required,
+                                        param_type,
+                                        enum_values: p.enum_values,
+                                        default: p.default,
+                                    }
+                                }).collect(),
+                                metadata,
+                            });
+                        }
+                        Err(e) => {
+                            warn!(?e, ?path, "wasm: failed to parse tool manifest");
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(?e, ?path, "wasm: could not read manifest");
+                }
+            }
+        }
+    }
+
+    None
+}
 
 // ── Internal store state ────────────────────────────────────────────────────
 
@@ -52,6 +189,8 @@ pub struct WasmTool {
     spec: ToolSpec,
     engine: Engine,
     module: Module,
+    /// Workspace root passed to guest tools as a pre-opened directory.
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl WasmTool {
@@ -61,6 +200,12 @@ impl WasmTool {
     /// that a single malformed guest binary does not prevent the daemon from
     /// starting.
     pub fn load(path: &Path) -> Option<Self> {
+        Self::load_with_workspace(path, None)
+    }
+
+    /// Load a `.wasm` file and optionally bind a workspace root directory
+    /// for filesystem access.
+    pub fn load_with_workspace(path: &Path, workspace_root: Option<&Path>) -> Option<Self> {
         let wasm_bytes = match fs::read(path) {
             Ok(b) => b,
             Err(e) => {
@@ -96,8 +241,15 @@ impl WasmTool {
             .unwrap_or("unknown")
             .to_string();
 
-        let spec = builtin_spec_for(&name);
-        Some(Self { spec, engine, module })
+        // Try sidecar manifest first, then fall back to built-in catalogue.
+        let spec = load_manifest(path).unwrap_or_else(|| builtin_spec_for(&name));
+
+        Some(Self {
+            spec,
+            engine,
+            module,
+            workspace_root: workspace_root.map(|p| p.to_path_buf()),
+        })
     }
 
     /// Run the WASM guest synchronously on a blocking thread.
@@ -105,14 +257,26 @@ impl WasmTool {
         let stdin_bytes = bytes::Bytes::from(serde_json::to_vec(args)?);
 
         // Bounded in-memory output buffers.
-        let stdout_pipe = MemoryOutputPipe::new(64 * 1024);
-        let stderr_pipe = MemoryOutputPipe::new(4 * 1024);
+        let stdout_pipe = MemoryOutputPipe::new(256 * 1024);
+        let stderr_pipe = MemoryOutputPipe::new(8 * 1024);
 
-        let wasi = WasiCtxBuilder::new()
+        let mut builder = WasiCtxBuilder::new();
+        builder
             .stdin(MemoryInputPipe::new(stdin_bytes))
             .stdout(stdout_pipe.clone())
-            .stderr(stderr_pipe.clone())
-            .build_p1();
+            .stderr(stderr_pipe.clone());
+
+        // Pre-open the workspace directory so guest tools can access files
+        // via WASI path_open.  The guest sees it as ".".
+        if let Some(ref ws) = self.workspace_root {
+            if ws.is_dir() {
+                if let Err(e) = builder.preopened_dir(ws, ".", wasmtime_wasi::DirPerms::all(), wasmtime_wasi::FilePerms::all()) {
+                    warn!(?e, ?ws, "wasm: failed to preopen workspace dir");
+                }
+            }
+        }
+
+        let wasi = builder.build_p1();
 
         let mut store = Store::new(&self.engine, State { wasi });
 
@@ -178,20 +342,16 @@ impl Tool for WasmTool {
         // use `spawn_blocking` to avoid starving the executor.
         let this_engine = self.engine.clone();
         let this_module = self.module.clone();
-        let this_name = self.spec.name.clone();
-        let this_params = self.spec.params.clone();
-        let this_desc = self.spec.description.clone();
+        let this_spec = self.spec.clone();
+        let this_workspace = self.workspace_root.clone();
         let args_owned = args.clone();
 
         tokio::task::spawn_blocking(move || {
             let tool = WasmTool {
-                spec: ToolSpec {
-                    name: this_name,
-                    description: this_desc,
-                    params: this_params,
-                },
+                spec: this_spec,
                 engine: this_engine,
                 module: this_module,
+                workspace_root: this_workspace,
             };
             tool.run_sync(&args_owned)
         })
@@ -203,6 +363,9 @@ impl Tool for WasmTool {
 // ── Tool discovery ──────────────────────────────────────────────────────────
 
 /// Discover and load WASM tool binaries from the given `extensions_dir`.
+///
+/// `workspace_root` is the agent's workspace directory, pre-opened so guest
+/// tools can access files via WASI.  Pass `None` to disable filesystem access.
 ///
 /// The returned `Vec` may be empty if no `.wasm` files are found or if no
 /// guest tools have been built yet.  The caller should register these tools on
@@ -218,7 +381,7 @@ impl Tool for WasmTool {
 /// ```text
 /// <extensions_dir>/tools-src/<crate-dir>/target/wasm32-wasip1/release/<name>.wasm
 /// ```
-pub fn load_wasm_tools_from_dir(extensions_dir: &Path) -> Vec<Box<dyn Tool>> {
+pub fn load_wasm_tools_from_dir(extensions_dir: &Path, workspace_root: Option<&Path>) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
     if !extensions_dir.is_dir() {
@@ -235,7 +398,7 @@ pub fn load_wasm_tools_from_dir(extensions_dir: &Path) -> Vec<Box<dyn Tool>> {
             let path = entry.path();
             if path.extension().map(|e| e == "wasm").unwrap_or(false) {
                 debug!(?path, "wasm: loading tool (direct layout)");
-                if let Some(tool) = WasmTool::load(&path) {
+                if let Some(tool) = WasmTool::load_with_workspace(&path, workspace_root) {
                     tools.push(Box::new(tool));
                 }
             }
@@ -281,7 +444,7 @@ pub fn load_wasm_tools_from_dir(extensions_dir: &Path) -> Vec<Box<dyn Tool>> {
 
                 if is_wasm && !is_artifact {
                     debug!(?path, "wasm: loading tool (tools-src layout)");
-                    if let Some(tool) = WasmTool::load(&path) {
+                    if let Some(tool) = WasmTool::load_with_workspace(&path, workspace_root) {
                         tools.push(Box::new(tool));
                     }
                 }
@@ -315,13 +478,16 @@ fn builtin_spec_for(tool_name: &str) -> ToolSpec {
                     name: "path".to_string(),
                     description: "Relative path from workspace root".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "max_bytes".to_string(),
                     description: "Maximum bytes to read (default 65536)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata::default(),
         },
         "write_file" => ToolSpec {
             name: "write_file".to_string(),
@@ -331,13 +497,16 @@ fn builtin_spec_for(tool_name: &str) -> ToolSpec {
                     name: "path".to_string(),
                     description: "Relative path from workspace root".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "content".to_string(),
                     description: "File content to write".to_string(),
                     required: true,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata::default(),
         },
         "run_shell" => ToolSpec {
             name: "run_shell".to_string(),
@@ -347,18 +516,22 @@ fn builtin_spec_for(tool_name: &str) -> ToolSpec {
                     name: "command".to_string(),
                     description: "Shell command to execute".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "timeout_secs".to_string(),
                     description: "Max execution time in seconds (default 30)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata::default(),
         },
         other => ToolSpec {
             name: other.to_string(),
             description: format!("WASM guest tool: {other}"),
             params: vec![],
+            metadata: ToolMetadata::default(),
         },
     }
 }

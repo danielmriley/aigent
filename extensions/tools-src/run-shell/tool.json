@@ -1,0 +1,24 @@
+{
+  "name": "run_shell",
+  "description": "Execute a shell command in the workspace directory. The command runs with a timeout and returns combined stdout/stderr output. Use for build commands, tests, file operations, and system queries.",
+  "params": [
+    {
+      "name": "command",
+      "description": "Shell command to execute (passed to /bin/sh -c)",
+      "required": true,
+      "param_type": "string"
+    },
+    {
+      "name": "timeout_secs",
+      "description": "Maximum execution time in seconds (default: 30). Long-running commands are killed after this limit.",
+      "required": false,
+      "param_type": "integer",
+      "default": "30"
+    }
+  ],
+  "metadata": {
+    "security_level": "high",
+    "read_only": false,
+    "group": "shell"
+  }
+}

@@ -18,7 +18,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use fs2::FileExt;
 
-use crate::{Tool, ToolSpec, ToolParam, ToolOutput};
+use crate::{Tool, ToolSpec, ToolParam, ToolOutput, ToolMetadata, SecurityLevel};
 
 /// Saves an email draft to `{data_dir}/drafts/` as a plain-text file.
 pub struct DraftEmailTool {
@@ -36,18 +36,27 @@ impl Tool for DraftEmailTool {
                     name: "to".to_string(),
                     description: "Recipient email address or name".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "subject".to_string(),
                     description: "Email subject line".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "body".to_string(),
                     description: "Email body text".to_string(),
                     required: true,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Medium,
+                read_only: false,
+                group: "email".to_string(),
+                ..Default::default()
+            },
         }
     }
 
@@ -109,13 +118,21 @@ impl Tool for RemindMeTool {
                     name: "text".to_string(),
                     description: "Reminder text".to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "when".to_string(),
                     description: "When to surface the reminder (natural language, optional)".to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: false,
+                group: "calendar".to_string(),
+                ..Default::default()
+            },
         }
     }
 
@@ -182,6 +199,12 @@ impl Tool for GitRollbackTool {
             name: "git_rollback".to_string(),
             description: "Revert the last automated git commit in the workspace (undo the most recent write_file or run_shell change). Requires git.".to_string(),
             params: vec![],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::High,
+                read_only: false,
+                group: "git".to_string(),
+                ..Default::default()
+            },
         }
     }
 

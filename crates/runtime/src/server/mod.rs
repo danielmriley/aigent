@@ -55,8 +55,8 @@ pub(super) fn is_in_window(now: DateTime<Utc>, tz: Tz, start_hour: u32, end_hour
 struct DaemonState {
     runtime: AgentRuntime,
     memory: MemoryManager,
-    tool_registry: ToolRegistry,
-    tool_executor: ToolExecutor,
+    tool_registry: Arc<ToolRegistry>,
+    tool_executor: Arc<ToolExecutor>,
     recent_turns: VecDeque<ConversationTurn>,
     turn_count: usize,
     started_at: Instant,
@@ -93,7 +93,7 @@ impl DaemonState {
             memory_semantic: stats.semantic,
             memory_episodic: stats.episodic,
             uptime_secs: self.started_at.elapsed().as_secs(),
-            available_tools: self.tool_registry.list_specs().iter().map(|s| s.name.clone()).collect(),
+            available_tools: self.tool_registry.list_specs().into_iter().map(|s| s.name).collect(),
         }
     }
 }
@@ -111,6 +111,18 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
         approval_exempt_tools: config.safety.approval_exempt_tools.clone(),
         git_auto_commit: config.tools.git_auto_commit,
         sandbox_enabled: config.tools.sandbox_enabled,
+        max_security_level: parse_security_level(&config.safety.max_security_level),
+        tool_overrides: config.safety.tool_overrides.clone(),
+    }
+}
+
+/// Parse a config string into a `SecurityLevel`, defaulting to `High` on
+/// unrecognised values.
+fn parse_security_level(s: &str) -> aigent_tools::SecurityLevel {
+    match s.to_lowercase().as_str() {
+        "low" => aigent_tools::SecurityLevel::Low,
+        "medium" => aigent_tools::SecurityLevel::Medium,
+        _ => aigent_tools::SecurityLevel::High,
     }
 }
 
@@ -206,8 +218,22 @@ pub async fn run_unified_daemon(
         let k = &config.tools.brave_api_key;
         if k.is_empty() { None } else { Some(k.clone()) }
     };
-    let tool_registry =
-        aigent_exec::default_registry(workspace_root, agent_data_dir, brave_api_key);
+    let tavily_api_key = {
+        let k = &config.tools.tavily_api_key;
+        if k.is_empty() { None } else { Some(k.clone()) }
+    };
+    let searxng_base_url = {
+        let u = &config.tools.searxng_base_url;
+        if u.is_empty() { None } else { Some(u.clone()) }
+    };
+    let tool_registry = aigent_exec::default_registry(
+        workspace_root,
+        agent_data_dir,
+        brave_api_key,
+        tavily_api_key,
+        searxng_base_url,
+        config.tools.search_providers.clone(),
+    );
     let tool_executor = ToolExecutor::new(policy);
 
     // Extract sleep scheduling config before `config` is moved into the runtime.
@@ -252,8 +278,8 @@ pub async fn run_unified_daemon(
     let state = Arc::new(Mutex::new(DaemonState {
         runtime,
         memory,
-        tool_registry,
-        tool_executor,
+        tool_registry: Arc::new(tool_registry),
+        tool_executor: Arc::new(tool_executor),
         recent_turns: VecDeque::new(),
         turn_count: 0,
         started_at: Instant::now(),

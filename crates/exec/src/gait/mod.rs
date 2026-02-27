@@ -12,7 +12,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use tracing::info;
 use async_trait::async_trait;
-use aigent_tools::{Tool, ToolSpec, ToolParam, ToolOutput};
+use aigent_tools::{Tool, ToolSpec, ToolParam, ToolOutput, ToolMetadata};
 use std::collections::HashMap;
 
 pub use types::{GitOperation, GaitPolicy, is_write_action, is_mutating_op, is_mutating_call};
@@ -95,6 +95,7 @@ impl Tool for GaitTool {
                                   tag, stash"
                         .to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "repo".to_string(),
@@ -105,6 +106,7 @@ impl Tool for GaitTool {
                                   path or a remote URL (clone/ls-remote only)."
                         .to_string(),
                     required: true,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "target_dir".to_string(),
@@ -112,6 +114,7 @@ impl Tool for GaitTool {
                                   trusted_write_paths)"
                         .to_string(),
                     required: false,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "branch".to_string(),
@@ -119,17 +122,20 @@ impl Tool for GaitTool {
                                   or revision for show/log)"
                         .to_string(),
                     required: false,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "message".to_string(),
                     description: "Commit/stash message".to_string(),
                     required: false,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "paths".to_string(),
                     description: "Comma-separated file paths (for selective commit or blame)"
                         .to_string(),
                     required: false,
+                    ..Default::default()
                 },
                 ToolParam {
                     name: "force".to_string(),
@@ -137,8 +143,10 @@ impl Tool for GaitTool {
                                   reset (--hard), branch (overwrite)"
                         .to_string(),
                     required: false,
+                    ..Default::default()
                 },
             ],
+            metadata: ToolMetadata::default(),
         }
     }
 
