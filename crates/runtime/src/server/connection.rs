@@ -7,14 +7,14 @@ use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
-use tracing::{info, warn};
+use tracing::warn;
 
 use aigent_config::AppConfig;
 use aigent_memory::MemoryTier;
 
 use crate::{BackendEvent, ClientCommand, ConversationTurn, ServerEvent};
 
-use super::{DaemonState, is_in_window, safe_truncate};
+use super::{DaemonState, is_in_window};
 
 pub(super) async fn handle_connection(
     stream: UnixStream,
@@ -95,10 +95,11 @@ pub(super) async fn handle_connection(
                 let mut state = state.lock().await;
                 let recent = state.recent_turns.iter().cloned().collect::<Vec<_>>();
                 let last_turn_at = state.last_turn_at;
+                let tool_specs = state.tool_registry.list_specs();
                 let mut memory = std::mem::take(&mut state.memory);
                 let reply_result = state
                     .runtime
-                    .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx)
+                    .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx, &tool_specs)
                     .await;
 
                 let outcome = match reply_result {
@@ -348,6 +349,72 @@ pub(super) async fn handle_connection(
                     }
                 }
             }
+        }
+        ClientCommand::TriggerProactive => {
+            let (rt_clone, mut memory, event_tx_clone) = {
+                let mut s = state.lock().await;
+                let rt = s.runtime.clone();
+                let mem = std::mem::take(&mut s.memory);
+                let tx = s.event_tx.clone();
+                (rt, mem, tx)
+            };
+            let outcome = rt_clone.run_proactive_check(&mut memory).await;
+            let msg = {
+                let mut s = state.lock().await;
+                s.memory = memory;
+                let _ = s.memory.flush_all();
+                if let Some(out) = outcome {
+                    if let Some(ref m) = out.message {
+                        let ev = BackendEvent::ProactiveMessage { content: m.clone() };
+                        let _ = event_tx_clone.send(ev);
+                        let _ = s
+                            .memory
+                            .record(MemoryTier::Episodic, format!("[proactive] {m}"), "proactive")
+                            .await;
+                        s.proactive_total_sent += 1;
+                        s.last_proactive_at = Some(Utc::now());
+                        format!("proactive message sent: {m}")
+                    } else {
+                        "proactive check ran — no message to send".to_string()
+                    }
+                } else {
+                    "proactive check ran — decided to stay silent".to_string()
+                }
+            };
+            send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
+        }
+        ClientCommand::GetProactiveStats => {
+            use crate::commands::ProactiveStatsPayload;
+            let s = state.lock().await;
+            let payload = ProactiveStatsPayload {
+                total_sent: s.proactive_total_sent,
+                last_proactive_at: s.last_proactive_at.map(|t| t.to_rfc3339()),
+                interval_minutes: s.runtime.config.memory.proactive_interval_minutes,
+                dnd_start_hour: s.runtime.config.memory.proactive_dnd_start_hour,
+                dnd_end_hour: s.runtime.config.memory.proactive_dnd_end_hour,
+            };
+            send_event(&mut write_half, ServerEvent::ProactiveStats(payload)).await?;
+        }
+        ClientCommand::GetSleepStatus => {
+            use crate::commands::SleepStatusPayload;
+            let s = state.lock().await;
+            let cfg = &s.runtime.config.memory;
+            let tz: chrono_tz::Tz = cfg.timezone.parse().unwrap_or(chrono_tz::UTC);
+            let start_h = cfg.night_sleep_start_hour as u32;
+            let end_h = cfg.night_sleep_end_hour as u32;
+            let payload = SleepStatusPayload {
+                auto_sleep_mode: cfg.auto_sleep_mode.clone(),
+                passive_interval_hours: cfg.auto_sleep_turn_interval as u64,
+                last_passive_sleep_at: s.last_passive_sleep_at
+                    .map(|t| format!("{}s ago", t.elapsed().as_secs())),
+                last_nightly_sleep_at: s.last_multi_agent_sleep_at
+                    .map(|t| format!("{}s ago", t.elapsed().as_secs())),
+                quiet_window_start: start_h as u8,
+                quiet_window_end: end_h as u8,
+                timezone: cfg.timezone.clone(),
+                in_quiet_window: is_in_window(Utc::now(), tz, start_h, end_h),
+            };
+            send_event(&mut write_half, ServerEvent::SleepStatus(payload)).await?;
         }
         ClientCommand::DeduplicateMemory => {
             let mut s = state.lock().await;
