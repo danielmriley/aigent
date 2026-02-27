@@ -44,8 +44,10 @@ impl Tool for WebSearchTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "web_search".to_string(),
-            description: "Search the web and return result titles, URLs, and snippets. \
-                Use `fetch_page` on a returned URL to read its full content."
+            description: "Search the web and return result titles, URLs, snippets, and \
+                structured data extracted from top results (meta tags, JSON-LD). \
+                This often includes live prices, stats, and other facts directly. \
+                Use `fetch_page` only when you need the full body text of a specific page."
                 .to_string(),
             params: vec![
                 ToolParam {
@@ -97,7 +99,11 @@ impl Tool for FetchPageTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "fetch_page".to_string(),
-            description: "Fetch a web page URL and return its extracted text content."
+            description: "Fetch a web page URL and return its full extracted text content. \
+                Use this when you need the complete body text of a specific page \
+                (e.g. reading an article, documentation, or detailed content). \
+                For quick facts like prices or stats, web_search already includes \
+                structured data from top results."
                 .to_string(),
             params: vec![
                 ToolParam {
@@ -172,6 +178,53 @@ async fn search_brave(
     let json: serde_json::Value = resp.json().await?;
 
     let mut parts: Vec<String> = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
+
+    // ── Infobox / knowledge panel ──────────────────────────────────────
+    // Brave returns these for stock tickers, company lookups, etc.
+    if let Some(ib) = json.get("infobox") {
+        if let Some(results) = ib.get("results").and_then(|r| r.as_array()) {
+            for item in results.iter().take(2) {
+                let mut ib_parts: Vec<String> = Vec::new();
+                if let Some(t) = item["title"].as_str() {
+                    ib_parts.push(format!("[Infobox] {t}"));
+                }
+                if let Some(d) = item["description"].as_str() {
+                    ib_parts.push(format!("  {d}"));
+                }
+                if let Some(ld) = item["long_desc"].as_str() {
+                    if ld.len() < 300 {
+                        ib_parts.push(format!("  {ld}"));
+                    }
+                }
+                // Key-value attributes (stock price, market cap, etc.)
+                if let Some(attrs) = item.get("attributes").and_then(|a| a.as_array()) {
+                    for attr in attrs {
+                        if let Some(pair) = attr.as_array() {
+                            let key = pair.first().and_then(|v| v.as_str()).unwrap_or("");
+                            let val = pair.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                            if !key.is_empty() && !val.is_empty() {
+                                ib_parts.push(format!("  {key}: {val}"));
+                            }
+                        }
+                    }
+                }
+                // Key-value data (alt format Brave sometimes uses)
+                if let Some(data) = item.get("data").and_then(|d| d.as_object()) {
+                    for (k, v) in data {
+                        if let Some(s) = v.as_str() {
+                            ib_parts.push(format!("  {k}: {s}"));
+                        }
+                    }
+                }
+                if !ib_parts.is_empty() {
+                    parts.push(ib_parts.join("\n"));
+                }
+            }
+        }
+    }
+
+    // ── Web results ────────────────────────────────────────────────────
     if let Some(results) = json["web"]["results"].as_array() {
         for item in results.iter().take(max_results) {
             let title = item["title"].as_str().unwrap_or("").trim();
@@ -179,21 +232,31 @@ async fn search_brave(
             let desc = item["description"].as_str().unwrap_or("").trim();
             if !title.is_empty() {
                 parts.push(format!("{title}\n  {url}\n  {desc}"));
+                if url.starts_with("http") {
+                    urls.push(url.to_string());
+                }
             }
         }
     }
 
     if parts.is_empty() {
-        Ok(ToolOutput {
+        return Ok(ToolOutput {
             success: true,
             output: format!("No Brave Search results for: {query}"),
-        })
-    } else {
-        Ok(ToolOutput {
-            success: true,
-            output: parts.join("\n\n"),
-        })
+        });
     }
+
+    // Enrich with structured data from top result pages.
+    let enrichment = enrich_with_structured_data(&urls, 3).await;
+    let mut output = parts.join("\n\n");
+    if !enrichment.is_empty() {
+        output.push_str("\n\n--- Structured data from top results ---\n");
+        output.push_str(&enrichment);
+    }
+    Ok(ToolOutput {
+        success: true,
+        output,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -220,59 +283,69 @@ async fn search_duckduckgo(
     }
 
     let body = resp.text().await?;
-    let doc = Html::parse_document(&body);
 
-    // DuckDuckGo HTML search results structure:
-    //   <div class="result">
-    //     <a class="result__a" href="...">Title</a>
-    //     <a class="result__snippet">Snippet text</a>
-    //   </div>
-    let result_sel = Selector::parse(".result").unwrap();
-    let link_sel = Selector::parse("a.result__a").unwrap();
-    let snippet_sel = Selector::parse("a.result__snippet, .result__snippet").unwrap();
+    // Parse the HTML and extract search results synchronously.
+    // The scraper `Html` type is !Send, so it must not live across an await.
+    let (parts, urls) = {
+        let doc = Html::parse_document(&body);
 
-    let mut parts: Vec<String> = Vec::new();
-    for result in doc.select(&result_sel).take(max_results) {
-        let title = result
-            .select(&link_sel)
-            .next()
-            .map(|el| el.text().collect::<String>())
-            .unwrap_or_default();
-        let title = title.trim();
+        let result_sel = Selector::parse(".result").unwrap();
+        let link_sel = Selector::parse("a.result__a").unwrap();
+        let snippet_sel = Selector::parse("a.result__snippet, .result__snippet").unwrap();
 
-        // Extract URL from the href attribute.
-        let url = result
-            .select(&link_sel)
-            .next()
-            .and_then(|el| el.value().attr("href"))
-            .unwrap_or("");
+        let mut parts: Vec<String> = Vec::new();
+        let mut urls: Vec<String> = Vec::new();
+        for result in doc.select(&result_sel).take(max_results) {
+            let title = result
+                .select(&link_sel)
+                .next()
+                .map(|el| el.text().collect::<String>())
+                .unwrap_or_default();
+            let title = title.trim();
 
-        // DDG sometimes wraps URLs in a redirect; extract the real one.
-        let url = extract_ddg_url(url);
+            let url = result
+                .select(&link_sel)
+                .next()
+                .and_then(|el| el.value().attr("href"))
+                .unwrap_or("");
 
-        let snippet = result
-            .select(&snippet_sel)
-            .next()
-            .map(|el| el.text().collect::<String>())
-            .unwrap_or_default();
-        let snippet = snippet.trim();
+            let url = extract_ddg_url(url);
 
-        if !title.is_empty() {
-            parts.push(format!("{title}\n  {url}\n  {snippet}"));
+            let snippet = result
+                .select(&snippet_sel)
+                .next()
+                .map(|el| el.text().collect::<String>())
+                .unwrap_or_default();
+            let snippet = snippet.trim();
+
+            if !title.is_empty() {
+                if url.starts_with("http") {
+                    urls.push(url.clone());
+                }
+                parts.push(format!("{title}\n  {url}\n  {snippet}"));
+            }
         }
-    }
+        (parts, urls)
+    }; // `doc` dropped here — before any .await
 
     if parts.is_empty() {
-        Ok(ToolOutput {
+        return Ok(ToolOutput {
             success: true,
             output: format!("No DuckDuckGo results for: {query}"),
-        })
-    } else {
-        Ok(ToolOutput {
-            success: true,
-            output: parts.join("\n\n"),
-        })
+        });
     }
+
+    // Enrich with structured data from top result pages.
+    let enrichment = enrich_with_structured_data(&urls, 3).await;
+    let mut output = parts.join("\n\n");
+    if !enrichment.is_empty() {
+        output.push_str("\n\n--- Structured data from top results ---\n");
+        output.push_str(&enrichment);
+    }
+    Ok(ToolOutput {
+        success: true,
+        output,
+    })
 }
 
 /// DDG sometimes wraps result URLs in redirect links like
@@ -293,6 +366,76 @@ fn extract_ddg_url(href: &str) -> String {
         }
     }
     href.to_string()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Search result enrichment — fetch structured data from top URLs
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Fetch the top `max_urls` search result pages in parallel and extract only
+/// structured data (JSON-LD, meta tags, title).  This is fast and works even
+/// when the page is a JS SPA, because the structured metadata is embedded in
+/// the `<head>` before any client-side rendering.
+///
+/// Returns a single string with one section per successfully enriched URL.
+async fn enrich_with_structured_data(urls: &[String], max_urls: usize) -> String {
+    const ENRICH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+    const ENRICH_MAX_BYTES: usize = 128_000; // only need <head> section
+
+    let client = match reqwest::Client::builder()
+        .timeout(ENRICH_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let fetches = urls.iter().take(max_urls).map(|url| {
+        let client = client.clone();
+        let url = url.clone();
+        tokio::spawn(async move {
+            let resp = client
+                .get(&url)
+                .header("Accept", "text/html")
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let ct = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !ct.contains("text/html") {
+                return None;
+            }
+            let body = resp.text().await.ok()?;
+            let body_slice: &str = if body.len() > ENRICH_MAX_BYTES {
+                &body[..truncate_byte_boundary(&body, ENRICH_MAX_BYTES)]
+            } else {
+                &body
+            };
+            let structured = extract_structured_data(body_slice);
+            if structured.is_empty() {
+                None
+            } else {
+                Some((url, structured))
+            }
+        })
+    })
+    .collect::<Vec<_>>();
+
+    let mut sections: Vec<String> = Vec::new();
+    for handle in fetches {
+        if let Ok(Some((url, data))) = handle.await {
+            sections.push(format!("[{url}]\n{data}"));
+        }
+    }
+    sections.join("\n\n")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
