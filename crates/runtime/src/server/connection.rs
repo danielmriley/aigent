@@ -7,14 +7,14 @@ use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
-use tracing::warn;
+use tracing::{info, warn};
 
 use aigent_config::AppConfig;
 use aigent_memory::MemoryTier;
 
 use crate::{BackendEvent, ClientCommand, ConversationTurn, ServerEvent};
 
-use super::{DaemonState, is_in_window};
+use super::{DaemonState, is_in_window, safe_truncate};
 
 pub(super) async fn handle_connection(
     stream: UnixStream,
@@ -91,73 +91,295 @@ pub(super) async fn handle_connection(
                 }
             });
 
-            let outcome = {
-                let mut state = state.lock().await;
-                let recent = state.recent_turns.iter().cloned().collect::<Vec<_>>();
-                let last_turn_at = state.last_turn_at;
-                let tool_specs = state.tool_registry.list_specs();
-                let mut memory = std::mem::take(&mut state.memory);
-                let reply_result = state
-                    .runtime
-                    .respond_and_remember_stream(&mut memory, &user, &recent, last_turn_at, chunk_tx, &tool_specs)
-                    .await;
+            // Phase 1: take what we need from state and RELEASE THE LOCK before
+            // any LLM call.  This keeps GetStatus / GetMemoryPeek responsive
+            // while the turn is being processed.
+            //
+            // ── Step 0: optional tool intent check ─────────────────────────
+            // Ask the LLM (without streaming) whether a tool should be called
+            // before the main response.  Runs without holding the state lock;
+            // holds it only for the brief synchronous tool execution below.
+            let (rt_early, tool_specs) = {
+                let s = state.lock().await;
+                (s.runtime.clone(), s.tool_registry.list_specs())
+            };
+            let tool_call_intent = rt_early.maybe_tool_call(&user, &tool_specs).await;
 
-                let outcome = match reply_result {
-                    Ok(reply) => {
-                        state.last_turn_at = Some(Utc::now());
-                        state.recent_turns.push_back(ConversationTurn {
-                            user,
-                            assistant: reply,
-                        });
-                        while state.recent_turns.len() > 8 {
-                            let _ = state.recent_turns.pop_front();
-                        }
-                        state.turn_count += 1;
+            // Execute the tool (if intent detected) and collect the result.
+            let tool_result_text: Option<(String, String)> = if let Some(ref call) = tool_call_intent {
+                // Emit ToolCallStart to broadcast subscribers.
+                let info = crate::events::ToolCallInfo {
+                    name: call.tool.clone(),
+                    args: serde_json::to_string(&call.args).unwrap_or_default(),
+                };
+                let _ = event_tx.send(BackendEvent::ToolCallStart(info));
 
-                        let mut extras = Vec::new();
-                        if state.runtime.config.memory.auto_sleep_turn_interval > 0
-                            && state.turn_count
-                                % state.runtime.config.memory.auto_sleep_turn_interval
-                                == 0
-                        {
-                            // Use agentic sleep for richer consolidation.
-                            let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-                        let sleep_result = state
-                                .runtime
-                                .run_agentic_sleep_cycle(&mut memory, &noop_tx)
-                                .await;
-                            match sleep_result {
-                                Ok(summary) => extras.push(format!("sleep cycle: {}", summary.distilled)),
-                                Err(err) => warn!(?err, "auto agentic sleep cycle failed"),
-                            }
-                        }
-
-                        Ok(extras)
-                    }
-                    Err(err) => Err(err),
+                // Execute — holds lock only for the duration of the tool run.
+                let exec_result = {
+                    let s = state.lock().await;
+                    s.tool_executor
+                        .execute(&s.tool_registry, &call.tool, &call.stringify_args())
+                        .await
                 };
 
-                state.memory = memory;
-                // Sync the vault once per turn (deferred from per-record calls).
-                let _ = state.memory.flush_all();
-                outcome
+                let (success, output) = match exec_result {
+                    Ok(ref o) => (o.success, o.output.clone()),
+                    Err(ref e) => (false, e.to_string()),
+                };
+                let _ = event_tx.send(BackendEvent::ToolCallEnd(crate::events::ToolResult {
+                    name: call.tool.clone(),
+                    success,
+                    output: output.clone(),
+                }));
+                info!(tool = %call.tool, success, output_len = output.len(), "tool call executed");
+                Some((call.tool.clone(), output))
+            } else {
+                None
             };
 
+            let (rt_clone, mut memory, mut recent, last_turn_at) = {
+                let mut s = state.lock().await;
+                let rt = s.runtime.clone();
+                let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
+                let lta = s.last_turn_at;
+                let mem = std::mem::take(&mut s.memory);
+                (rt, mem, recent, lta)
+                // MutexGuard dropped — lock released here
+            };
+
+            // LLM respond + inline reflect, both WITHOUT holding state lock.
+            //
+            // If a tool was called above, (a) record the result to Procedural
+            // memory for long-term recall, (b) inject a synthetic conversation
+            // turn so the RECENT CONVERSATION block in the prompt contains an
+            // explicit tool-result exchange, and (c) build an effective user
+            // message that presents the result as ground truth.
+            if let Some((ref tool_name, ref tool_output)) = tool_result_text {
+                let outcome_text = format!(
+                    "Tool '{}' executed in response to user turn. Output (first 400 chars): {}",
+                    tool_name,
+                    safe_truncate(tool_output, 400),
+                );
+                if let Err(err) = memory.record(
+                    MemoryTier::Procedural,
+                    outcome_text,
+                    format!("tool-use:{tool_name}"),
+                ).await {
+                    warn!(?err, tool = %tool_name, "failed to record tool result to procedural memory");
+                }
+
+                // (b) Inject the tool result as an explicit conversation turn.
+                recent.push(ConversationTurn {
+                    user: format!("[system: tool '{}' was invoked for this request]", tool_name),
+                    assistant: format!("[TOOL RESULT from '{}']: {}", tool_name, tool_output),
+                });
+            }
+
+            // Build the effective user message.  When a tool was executed, the
+            // user question is stated first (so the LLM knows what to answer),
+            // followed by the full tool output in a clearly demarcated block.
+            let effective_user: std::borrow::Cow<str> = if let Some((ref tool_name, ref output)) = tool_result_text {
+                let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                std::borrow::Cow::Owned(format!(
+                    "{user}\n\n\
+                     ===== TOOL RESULT (retrieved {now}) from '{tool_name}' =====\n\
+                     {output}\n\
+                     ===== END TOOL RESULT =====\n\n\
+                     CRITICAL INSTRUCTION — you MUST follow every point:\n\
+                     1. The TOOL RESULT embedded above is in your context RIGHT NOW between the ===== markers.\n\
+                     2. Synthesise a complete, natural, helpful final answer from it immediately.\n\
+                     3. Quote numbers, dates, names, and facts verbatim from the TOOL RESULT.\n\
+                     4. Speak conversationally as yourself — never use phrases like \"according to the tool\" \
+                        or \"based on the data retrieved\".\n\
+                     5. Do NOT claim the result is unavailable, pending, missing, or \"not yet in your memory\".\n\
+                     6. Do NOT output raw JSON or attempt to call a tool again.\n\
+                     7. If the tool returned an error, state the error honestly and suggest alternatives.",
+                    user = user,
+                    now = now,
+                    tool_name = tool_name,
+                    output = output,
+                ))
+            } else {
+                std::borrow::Cow::Borrowed(&user)
+            };
+
+            // When a tool was already executed, suppress the "AVAILABLE TOOLS"
+            // section from the streaming prompt.
+            let effective_specs: &[aigent_tools::ToolSpec] = if tool_result_text.is_some() {
+                &[]  // tool already ran — LLM should just answer
+            } else {
+                &tool_specs
+            };
+            let mut reply_result = rt_clone
+                .respond_and_remember_stream(&mut memory, &effective_user, &recent, last_turn_at, chunk_tx, effective_specs)
+                .await;
+
+            // ── Fallback: post-stream tool detection ──────────────────────
+            // If maybe_tool_call missed the intent (e.g. model returned bare
+            // JSON on the main path), detect tool JSON in the streamed reply,
+            // execute the tool, and do a second LLM call with the result.
+            if tool_result_text.is_none() {
+                if let Ok(ref reply) = reply_result {
+                    let trimmed = reply.trim();
+                    if let Ok(call) = serde_json::from_str::<crate::agent_loop::LlmToolCall>(trimmed) {
+                        if !call.tool.is_empty() {
+                            warn!(tool = %call.tool, "fallback: streamed reply was tool JSON — executing post-hoc");
+                            // Tell clients to discard the raw tool-JSON tokens.
+                            {
+                                let mut guard = writer.lock().await;
+                                let _ = send_event(
+                                    &mut guard,
+                                    ServerEvent::Backend(BackendEvent::ClearStream),
+                                ).await;
+                            }
+                            let _ = event_tx.send(BackendEvent::ClearStream);
+                            let info = crate::events::ToolCallInfo {
+                                name: call.tool.clone(),
+                                args: serde_json::to_string(&call.args).unwrap_or_default(),
+                            };
+                            let _ = event_tx.send(BackendEvent::ToolCallStart(info));
+
+                            let exec_result = {
+                                let s = state.lock().await;
+                                s.tool_executor
+                                    .execute(&s.tool_registry, &call.tool, &call.stringify_args())
+                                    .await
+                            };
+                            let (success, output) = match exec_result {
+                                Ok(ref o) => (o.success, o.output.clone()),
+                                Err(ref e) => (false, e.to_string()),
+                            };
+                            let _ = event_tx.send(BackendEvent::ToolCallEnd(crate::events::ToolResult {
+                                name: call.tool.clone(),
+                                success,
+                                output: output.clone(),
+                            }));
+
+                            // Build a grounded follow-up prompt and re-stream.
+                            let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+                            let followup = format!(
+                                "{user}\n\n\
+                                 ===== TOOL RESULT (retrieved {now}) from '{tool_name}' =====\n\
+                                 {output}\n\
+                                 ===== END TOOL RESULT =====\n\n\
+                                 CRITICAL INSTRUCTION — you MUST follow every point:\n\
+                                 1. The TOOL RESULT embedded above is in your context RIGHT NOW between the ===== markers.\n\
+                                 2. Synthesise a complete, natural, helpful final answer from it immediately.\n\
+                                 3. Quote numbers, dates, names, and facts verbatim from the TOOL RESULT.\n\
+                                 4. Speak conversationally as yourself — never use phrases like \"according to the tool\" \
+                                    or \"based on the data retrieved\".\n\
+                                 5. Do NOT claim the result is unavailable, pending, missing, or \"not yet in your memory\".\n\
+                                 6. Do NOT output raw JSON or attempt to call a tool again.\n\
+                                 7. If the tool returned an error, state the error honestly and suggest alternatives.",
+                                user = user,
+                                now = now,
+                                tool_name = call.tool,
+                                output = output,
+                            );
+
+                            let (followup_tx, mut followup_rx) = mpsc::channel::<String>(128);
+                            let writer2 = writer.clone();
+                            let event_tx2 = if is_external { Some(event_tx.clone()) } else { None };
+                            let followup_streamer = tokio::spawn(async move {
+                                while let Some(chunk) = followup_rx.recv().await {
+                                    {
+                                        let mut guard = writer2.lock().await;
+                                        let _ = send_event(
+                                            &mut guard,
+                                            ServerEvent::Backend(BackendEvent::Token(chunk.clone())),
+                                        ).await;
+                                    }
+                                    if let Some(ref tx) = event_tx2 {
+                                        let _ = tx.send(BackendEvent::Token(chunk));
+                                    }
+                                }
+                            });
+
+                            reply_result = rt_clone
+                                .respond_and_remember_stream(
+                                    &mut memory, &followup, &recent, last_turn_at, followup_tx, &tool_specs,
+                                )
+                                .await;
+                            let _ = followup_streamer.await;
+                        }
+                    }
+                }
+            }
+
+            // Reflect on the original user ↔ assistant exchange (not the tool-augmented prompt).
+            let reflect_events: Vec<BackendEvent> = match reply_result {
+                Ok(ref reply) => rt_clone
+                    .inline_reflect(&mut memory, &user, reply)
+                    .await
+                    .unwrap_or_default(),
+                Err(_) => vec![],
+            };
+
+            // Wait for the streaming task to finish flushing all tokens.
             let _ = streamer.await;
+
+            // Re-acquire lock to restore state and do bookkeeping.
+            let outcome: Result<Vec<BackendEvent>, anyhow::Error> = {
+                let mut s = state.lock().await;
+                // Always restore memory, even on error.
+                s.memory = memory;
+                let _ = s.memory.flush_all();
+
+                match reply_result {
+                    Ok(reply) => {
+                        s.last_turn_at = Some(Utc::now());
+                        s.recent_turns.push_back(ConversationTurn {
+                            user: user.clone(),
+                            assistant: reply,
+                        });
+                        while s.recent_turns.len() > 8 {
+                            let _ = s.recent_turns.pop_front();
+                        }
+                        s.turn_count += 1;
+
+                        // Spawn auto-sleep as a background task so it doesn't
+                        // add latency to the turn response.
+                        if s.runtime.config.memory.auto_sleep_turn_interval > 0
+                            && s.turn_count % s.runtime.config.memory.auto_sleep_turn_interval == 0
+                        {
+                            let state2 = state.clone();
+                            let event_tx2 = s.event_tx.clone();
+                            tokio::spawn(async move {
+                                let (rt, mut mem) = {
+                                    let mut s = state2.lock().await;
+                                    (s.runtime.clone(), std::mem::take(&mut s.memory))
+                                };
+                                let _ = event_tx2.send(BackendEvent::SleepCycleRunning);
+                                let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+                                match rt.run_agentic_sleep_cycle(&mut mem, &noop_tx).await {
+                                    Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
+                                    Err(ref err) => warn!(?err, "auto-turn sleep failed"),
+                                }
+                                let mut s = state2.lock().await;
+                                s.memory = mem;
+                                let _ = s.memory.flush_all();
+                                let _ = event_tx2.send(BackendEvent::MemoryUpdated);
+                            });
+                        }
+
+                        Ok(reflect_events)
+                    }
+                    Err(err) => Err(err),
+                }
+            };
+
             let mut writer = writer.lock().await;
             match outcome {
-                Ok(extras) => {
+                Ok(reflect_events) => {
                     send_event(
                         &mut writer,
                         ServerEvent::Backend(BackendEvent::MemoryUpdated),
                     )
                     .await?;
-                    for extra in extras {
-                        send_event(
-                            &mut writer,
-                            ServerEvent::Backend(BackendEvent::Token(extra)),
-                        )
-                        .await?;
+                    // Stream reflection events to the current client and all subscribers.
+                    for ev in reflect_events {
+                        let _ = send_event(&mut writer, ServerEvent::Backend(ev.clone())).await;
+                        let _ = event_tx.send(ev);
                     }
                     send_event(&mut writer, ServerEvent::Backend(BackendEvent::Done)).await?;
                     if is_external {
