@@ -152,7 +152,7 @@ pub async fn run_unified_daemon(
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    let mut memory = MemoryManager::with_event_log(memory_log_path)?;
+    let mut memory = MemoryManager::with_event_log(memory_log_path).await?;
 
     // Wire in the Ollama embedding backend so all new entries are automatically
     // embedded and retrieval uses hybrid lexical+vector scoring.

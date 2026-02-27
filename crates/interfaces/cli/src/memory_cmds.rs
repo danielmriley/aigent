@@ -222,7 +222,7 @@ pub(crate) async fn run_phase_review_gate(
     }
 
     let event_log = MemoryEventLog::new(memory_log_path);
-    let events = event_log.load()?;
+    let events = event_log.load().await?;
     let promotions = memory
         .all()
         .iter()

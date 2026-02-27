@@ -47,7 +47,7 @@ impl MemoryManager {
         // Back up events.jsonl before writing sleep-cycle entries so there is
         // always a clean pre-sleep snapshot on disk.
         if let Some(event_log) = &self.event_log {
-            event_log.backup()?;
+            event_log.backup().await?;
         }
 
         let marker = self.record_inner(

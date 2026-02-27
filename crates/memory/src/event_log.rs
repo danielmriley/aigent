@@ -1,5 +1,3 @@
-use std::fs;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -112,8 +110,8 @@ impl MemoryEventLog {
     /// Called at the start of each sleep cycle so a consistent snapshot is
     /// available even if the cycle writes new entries or the process crashes
     /// mid-cycle.  If the source file does not yet exist the call is a no-op.
-    pub fn backup(&self) -> Result<()> {
-        if !self.path.exists() {
+    pub async fn backup(&self) -> Result<()> {
+        if !tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
             return Ok(());
         }
 
@@ -126,23 +124,26 @@ impl MemoryEventLog {
             self.path.with_file_name(format!("{filename}.bak"))
         };
 
-        fs::copy(&self.path, &bak_path)?;
+        tokio::fs::copy(&self.path, &bak_path).await?;
         Ok(())
     }
 
-    pub fn load(&self) -> Result<Vec<MemoryRecordEvent>> {
-        use std::fs::OpenOptions;
-        if !self.path.exists() {
+    pub async fn load(&self) -> Result<Vec<MemoryRecordEvent>> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        if !tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
             return Ok(Vec::new());
         }
 
-        let file = OpenOptions::new().read(true).open(&self.path)?;
+        let file = tokio::fs::File::open(&self.path).await?;
         let reader = BufReader::new(file);
+        let mut lines = reader.lines();
         let mut events = Vec::new();
         let mut corrupt_count = 0usize;
+        let mut line_idx = 0usize;
 
-        for (line_idx, line_result) in reader.lines().enumerate() {
-            let line = line_result?;
+        while let Some(line) = lines.next_line().await? {
+            line_idx += 1;
             if line.trim().is_empty() {
                 continue;
             }
@@ -152,24 +153,22 @@ impl MemoryEventLog {
                 Err(err) => {
                     corrupt_count += 1;
                     tracing::warn!(
-                        line = line_idx + 1,
+                        line = line_idx,
                         error = %err,
                         path = %self.path.display(),
                         "corrupt JSONL record — skipping line (original preserved in .corrupt file)"
                     );
                     // Append the bad line to a sidecar file for forensics.
                     let corrupt_path = self.path.with_extension("jsonl.corrupt");
-                    let mut bad = std::fs::OpenOptions::new()
+                    if let Ok(mut bad) = tokio::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
                         .open(&corrupt_path)
-                        .unwrap_or_else(|_| {
-                            // If we can't open the sidecar, just continue.
-                            // The warning above is the only signal the user gets.
-                            std::fs::File::open("/dev/null").expect("/dev/null always exists")
-                        });
-                    use std::io::Write as _;
-                    let _ = writeln!(bad, "{line}");
+                        .await
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let _ = bad.write_all(format!("{line}\n").as_bytes()).await;
+                    }
                 }
             }
         }
@@ -223,7 +222,7 @@ mod tests {
         let log = MemoryEventLog::new(&path);
         let event = make_event("hello");
         log.append(&event).await.unwrap();
-        let events = log.load().unwrap();
+        let events = log.load().await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].entry.content, "hello");
         let _ = std::fs::remove_file(&path);
@@ -236,7 +235,7 @@ mod tests {
         for i in 0..5 {
             log.append(&make_event(&format!("event-{i}"))).await.unwrap();
         }
-        let events = log.load().unwrap();
+        let events = log.load().await.unwrap();
         assert_eq!(events.len(), 5);
         assert_eq!(events[0].entry.content, "event-0");
         assert_eq!(events[4].entry.content, "event-4");
@@ -249,10 +248,10 @@ mod tests {
         let log = MemoryEventLog::new(&path);
         log.append(&make_event("old")).await.unwrap();
         log.append(&make_event("also old")).await.unwrap();
-        assert_eq!(log.load().unwrap().len(), 2);
+        assert_eq!(log.load().await.unwrap().len(), 2);
         let new_events = vec![make_event("new")];
         log.overwrite(&new_events).await.unwrap();
-        let loaded = log.load().unwrap();
+        let loaded = log.load().await.unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].entry.content, "new");
         let _ = std::fs::remove_file(&path);
@@ -264,16 +263,16 @@ mod tests {
         let log = MemoryEventLog::new(&path);
         log.append(&make_event("a")).await.unwrap();
         log.overwrite(&[]).await.unwrap();
-        let loaded = log.load().unwrap();
+        let loaded = log.load().await.unwrap();
         assert!(loaded.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn load_nonexistent_returns_empty() {
+    #[tokio::test]
+    async fn load_nonexistent_returns_empty() {
         let path = temp_path();
         let log = MemoryEventLog::new(&path);
-        let events = log.load().unwrap();
+        let events = log.load().await.unwrap();
         assert!(events.is_empty());
     }
 
@@ -293,7 +292,7 @@ mod tests {
             })
             .unwrap();
         log.append(&make_event("also valid")).await.unwrap();
-        let events = log.load().unwrap();
+        let events = log.load().await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].entry.content, "valid");
         assert_eq!(events[1].entry.content, "also valid");
@@ -305,26 +304,26 @@ mod tests {
         let path = temp_path();
         let log = MemoryEventLog::new(&path);
         log.append(&make_event("backup me")).await.unwrap();
-        log.backup().unwrap();
+        log.backup().await.unwrap();
         let bak_path = path.with_file_name(
             format!("{}.bak", path.file_name().unwrap().to_string_lossy()),
         );
         assert!(bak_path.exists(), "backup file should exist");
         // Backup should be loadable too.
         let bak_log = MemoryEventLog::new(&bak_path);
-        let bak_events = bak_log.load().unwrap();
+        let bak_events = bak_log.load().await.unwrap();
         assert_eq!(bak_events.len(), 1);
         assert_eq!(bak_events[0].entry.content, "backup me");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&bak_path);
     }
 
-    #[test]
-    fn backup_nonexistent_file_is_no_op() {
+    #[tokio::test]
+    async fn backup_nonexistent_file_is_no_op() {
         let path = temp_path();
         let log = MemoryEventLog::new(&path);
         // Should not error when the file doesn't exist.
-        log.backup().unwrap();
+        log.backup().await.unwrap();
     }
 
     #[tokio::test]
@@ -334,7 +333,7 @@ mod tests {
         let mut event = make_event("tagged");
         event.entry.tags = vec!["belief".to_string(), "important".to_string()];
         log.append(&event).await.unwrap();
-        let loaded = log.load().unwrap();
+        let loaded = log.load().await.unwrap();
         assert_eq!(loaded[0].entry.tags, vec!["belief", "important"]);
         let _ = std::fs::remove_file(&path);
     }

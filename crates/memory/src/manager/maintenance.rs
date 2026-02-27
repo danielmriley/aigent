@@ -32,7 +32,7 @@ impl MemoryManager {
         let removed = self.store.retain(|entry| !tiers.contains(&entry.tier));
 
         if let Some(event_log) = &self.event_log {
-            let events = event_log.load()?;
+            let events = event_log.load().await?;
             let kept = events
                 .into_iter()
                 .filter(|event| !tiers.contains(&event.entry.tier))
@@ -101,7 +101,7 @@ impl MemoryManager {
         // Purge corresponding event-log entries so duplicates don't reappear
         // on the next daemon restart.
         if let Some(event_log) = &self.event_log {
-            let events = event_log.load()?;
+            let events = event_log.load().await?;
             let kept = events
                 .into_iter()
                 .filter(|ev| !id_set.contains(&ev.entry.id))
@@ -136,7 +136,7 @@ impl MemoryManager {
         self.store.retain(|e| !id_set.contains(&e.id));
         if let Some(event_log) = &self.event_log {
             let kept = event_log
-                .load()?
+                .load().await?
                 .into_iter()
                 .filter(|ev| !id_set.contains(&ev.entry.id))
                 .collect::<Vec<_>>();

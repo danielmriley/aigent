@@ -238,7 +238,7 @@ async fn main() -> Result<()> {
             provider,
             report,
         } => {
-            let mut memory = MemoryManager::with_event_log(&memory_log_path)?;
+            let mut memory = MemoryManager::with_event_log(&memory_log_path).await?;
             if model_catalog {
                 let lines = interactive::collect_model_lines(provider).await?;
                 for line in lines {
@@ -262,23 +262,23 @@ async fn main() -> Result<()> {
         }
         Commands::Memory { command } => match command {
             MemoryCommands::Wipe { layer, yes } => {
-                let mut memory = MemoryManager::with_event_log(memory_log_path)?;
+                let mut memory = MemoryManager::with_event_log(memory_log_path).await?;
                 memory_cmds::run_memory_wipe(&mut memory, layer, yes).await?;
             }
             MemoryCommands::Stats => {
-                let memory = MemoryManager::with_event_log(memory_log_path)?;
+                let memory = MemoryManager::with_event_log(memory_log_path).await?;
                 memory_cmds::run_memory_stats(&memory);
             }
             MemoryCommands::InspectCore { limit } => {
-                let memory = MemoryManager::with_event_log(memory_log_path)?;
+                let memory = MemoryManager::with_event_log(memory_log_path).await?;
                 memory_cmds::run_memory_inspect_core(&memory, limit.max(1));
             }
             MemoryCommands::Promotions { limit } => {
-                let memory = MemoryManager::with_event_log(memory_log_path)?;
+                let memory = MemoryManager::with_event_log(memory_log_path).await?;
                 memory_cmds::run_memory_promotions(&memory, limit.max(1));
             }
             MemoryCommands::ExportVault { path } => {
-                let memory = MemoryManager::with_event_log(memory_log_path)?;
+                let memory = MemoryManager::with_event_log(memory_log_path).await?;
                 let target = path.unwrap_or_else(|| ".aigent/vault".to_string());
                 memory_cmds::run_memory_export_vault(&memory, &target)?;
             }
@@ -465,7 +465,7 @@ async fn seed_identity_from_config(config: &AppConfig, memory_log_path: &Path) -
         return Ok(());
     }
 
-    let mut memory = MemoryManager::with_event_log(memory_log_path)?;
+    let mut memory = MemoryManager::with_event_log(memory_log_path).await?;
     memory.seed_core_identity(&config.agent.user_name, &config.agent.name).await?;
     Ok(())
 }

@@ -252,7 +252,7 @@ impl MemoryIndex {
     ///
     /// Drops all existing index data first.  Called at startup when the index
     /// file is missing or the schema version changes.
-    pub fn rebuild_from_log(&mut self, event_log: &MemoryEventLog) -> Result<usize> {
+    pub async fn rebuild_from_log(&mut self, event_log: &MemoryEventLog) -> Result<usize> {
         // Wipe existing data.
         {
             let tx = self.db.begin_write()?;
@@ -280,7 +280,7 @@ impl MemoryIndex {
         }
         self.cache.clear();
 
-        let events = event_log.load()?;
+        let events = event_log.load().await?;
         let count = events.len();
         for event in events {
             self.insert(&event.entry)?;
