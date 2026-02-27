@@ -60,11 +60,16 @@ impl Tool for ReadFileTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".to_string(),
-            description: "Read the contents of a file within the workspace.".to_string(),
+            description: "Read the contents of a file. Accepts a relative path \
+                (resolved from workspace root) or an absolute path (read any \
+                file on the system). Use this to inspect source code, configs, \
+                logs, or any other readable file."
+                .to_string(),
             params: vec![
                 ToolParam {
                     name: "path".to_string(),
-                    description: "Relative path from workspace root".to_string(),
+                    description: "File path — relative (from workspace) or absolute"
+                        .to_string(),
                     required: true,
                     ..Default::default()
                 },
@@ -85,11 +90,11 @@ impl Tool for ReadFileTool {
     }
 
     async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
-        let rel_path = args
+        let path_arg = args
             .get("path")
             .ok_or_else(|| anyhow::anyhow!("missing required param: path"))?;
 
-        let full = checked_path(&self.workspace_root, rel_path)?;
+        let full = resolve_read_path(&self.workspace_root, path_arg);
 
         let max_bytes: usize = args
             .get("max_bytes")
@@ -108,6 +113,17 @@ impl Tool for ReadFileTool {
             success: true,
             output: truncated,
         })
+    }
+}
+
+/// Resolve a read path.  Absolute paths are used as-is (read access is
+/// unrestricted).  Relative paths are joined to `workspace_root`.
+fn resolve_read_path(workspace_root: &std::path::Path, path: &str) -> PathBuf {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        normalize_path(p)
+    } else {
+        normalize_path(&workspace_root.join(path))
     }
 }
 

@@ -164,10 +164,22 @@ fn build_environment_block(
         .ok()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let workspace = &config.agent.workspace_path;
     let local_ts = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
     let timestamp = Utc::now().to_rfc3339();
     let git_present = std::path::Path::new(".git").exists();
     let stats = memory.stats();
+
+    // Detect the aigent source directory (parent of workspace, if it has Cargo.toml).
+    let source_dir = {
+        let ws = std::path::Path::new(workspace);
+        ws.parent()
+            .filter(|p| p.join("Cargo.toml").exists())
+            .map(|p| p.display().to_string())
+    };
+    let source_line = source_dir
+        .map(|d| format!("\n- aigent_source_dir: {d}"))
+        .unwrap_or_default();
 
     format!(
         "- local_time: {local_ts}\n\
@@ -175,7 +187,8 @@ fn build_environment_block(
          - os: {}\n\
          - arch: {}\n\
          - cwd: {cwd}\n\
-         - git_repo_present: {git_present}\n\
+         - workspace: {workspace}\n\
+         - git_repo_present: {git_present}{source_line}\n\
          - provider: {}\n\
          - model: {}\n\
          - thinking_level: {}\n\

@@ -17,10 +17,13 @@ impl Tool for RunShellTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_shell".to_string(),
-            description: "Execute a shell command within the workspace directory. \
-                Each invocation runs in a fresh shell — `cd` does not persist \
-                between calls. Chain commands with `&&` if you need them to \
-                share working directory or state."
+            description: "Execute a shell command. The working directory is the \
+                workspace. You have full access (read, write, git, etc.) inside \
+                the workspace. You can also read files outside the workspace \
+                using absolute paths (e.g. `cat /path/to/file`, \
+                `git -C /path/to/repo log`). Each invocation runs in a fresh \
+                shell — `cd` does not persist between calls. Chain commands \
+                with `&&` if needed."
                 .to_string(),
             params: vec![
                 ToolParam {
