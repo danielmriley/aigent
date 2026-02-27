@@ -184,6 +184,13 @@ pub async fn run_unified_daemon(
 
     let policy = build_execution_policy(&config);
     let workspace_root = policy.workspace_root.clone();
+
+    // Ensure the workspace directory exists and has a git repo so the agent
+    // can use git for file recovery/rollback inside its sandbox.
+    std::fs::create_dir_all(&workspace_root).ok();
+    if let Err(e) = aigent_exec::git::git_init_if_needed(&workspace_root).await {
+        warn!(?e, "failed to auto-init workspace git repo (non-fatal)");
+    }
     let agent_data_dir = std::path::Path::new(".aigent").to_path_buf();
     let brave_api_key = {
         let key = config.tools.brave_api_key.trim().to_string();

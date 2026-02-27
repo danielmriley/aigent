@@ -181,21 +181,9 @@ impl GaitPolicy {
 fn resolve_repo_path(op: &GitOperation, policy: &GaitPolicy) -> Result<PathBuf> {
     let raw = op.repo.trim();
     if raw.eq_ignore_ascii_case("workspace") {
-        // The workspace_root may be a sandbox directory without .git.
-        // Walk upward to find the nearest directory containing .git so
-        // Read operations like `status` and `log` work naturally.
-        let mut candidate = policy.workspace_root.clone();
-        loop {
-            if candidate.join(".git").exists() {
-                return Ok(candidate);
-            }
-            match candidate.parent() {
-                Some(parent) => candidate = parent.to_path_buf(),
-                None => break,
-            }
-        }
-        // Fall back to the literal workspace root (will yield a clear
-        // "not a git repository" error from libgit2).
+        // The workspace directory is auto-initialised as a git repo on
+        // daemon startup (see `git_init_if_needed`).  Never walk upward —
+        // that would escape the sandbox boundary.
         return Ok(policy.workspace_root.clone());
     }
     if raw.eq_ignore_ascii_case("self") {
@@ -870,9 +858,12 @@ impl Tool for GaitTool {
         ToolSpec {
             name: "perform_gait".to_string(),
             description: "Preferred git tool — safe, powerful, and recommended for all git \
-                          operations including self-updates. Use repo=\"workspace\" for the \
-                          project you are working in, repo=\"self\" for the Aigent source code. \
-                          All writes are restricted to trusted_write_paths only."
+                          operations. Use repo=\"workspace\" for the sandboxed workspace \
+                          where you create and edit files on behalf of the user. Use \
+                          repo=\"self\" to inspect or update the Aigent source code itself. \
+                          The workspace has its own git repository (auto-initialised); never \
+                          confuse it with the Aigent project repo. All writes are restricted \
+                          to trusted_write_paths only."
                 .to_string(),
             params: vec![
                 ToolParam {
@@ -885,8 +876,10 @@ impl Tool for GaitTool {
                 },
                 ToolParam {
                     name: "repo".to_string(),
-                    description: "Target repository: \"workspace\", \"self\", an absolute path, \
-                                  or a remote URL (for clone/ls-remote)"
+                    description: "Target repository. \"workspace\" = the sandboxed directory \
+                                  where you work on user tasks (file edits, projects). \
+                                  \"self\" = the Aigent source code repository. You may also \
+                                  pass an absolute path or a remote URL (clone/ls-remote only)."
                         .to_string(),
                     required: true,
                 },
