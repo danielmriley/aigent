@@ -70,15 +70,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aigent-audit"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "aigent-config"
 version = "0.1.0"
 dependencies = [
@@ -88,10 +79,6 @@ dependencies = [
  "tempfile",
  "toml",
 ]
-
-[[package]]
-name = "aigent-core"
-version = "0.1.0"
 
 [[package]]
 name = "aigent-exec"

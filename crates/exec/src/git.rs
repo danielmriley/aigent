@@ -11,7 +11,7 @@
 //! 1. `ToolExecutor::execute` calls `git_auto_commit` after a successful write.
 //! 2. `git_auto_commit` stages all changes and commits with
 //!    `"Aigent tool: <name> — <detail>"`.
-//! 3. The agent (or the user via CLI) can call `git_rollback_last` to revert
+//! 3. The agent (or the user via CLI) can revert changes via the git_rollback tool
 //!    the most recent auto-commit.
 
 use std::path::Path;
@@ -137,64 +137,4 @@ pub async fn git_auto_commit(workspace_root: &Path, tool_name: &str, detail: &st
     }
 
     Ok(())
-}
-
-// ── git_rollback_last ─────────────────────────────────────────────────────────
-
-/// Reverts the most recent commit in `workspace_root` via `git revert HEAD`.
-///
-/// Returns a human-readable summary on success.  Returns an error when:
-///
-/// - `git` is not installed.
-/// - The workspace is not a git repository.
-/// - The revert fails (e.g., merge conflict, no commits to revert).
-pub async fn git_rollback_last(workspace_root: &Path) -> Result<String> {
-    if !workspace_root.join(".git").exists() {
-        anyhow::bail!("workspace is not a git repository; cannot roll back");
-    }
-
-    let out = tokio::process::Command::new("git")
-        .args(["revert", "HEAD", "--no-edit"])
-        .env("GIT_AUTHOR_NAME", "Aigent")
-        .env("GIT_AUTHOR_EMAIL", "aigent@localhost")
-        .env("GIT_COMMITTER_NAME", "Aigent")
-        .env("GIT_COMMITTER_EMAIL", "aigent@localhost")
-        .current_dir(workspace_root)
-        .output()
-        .await?;
-
-    if out.status.success() {
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        info!("git_rollback_last succeeded");
-        Ok(if stdout.is_empty() {
-            "Last commit reverted successfully.".to_string()
-        } else {
-            stdout
-        })
-    } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        anyhow::bail!("git revert failed: {}", stderr);
-    }
-}
-
-// ── git_log_last ──────────────────────────────────────────────────────────────
-
-/// Returns a one-line summary of the most recent commit, or `None` when the
-/// workspace has no commits.
-pub async fn git_log_last(workspace_root: &Path) -> Option<String> {
-    if !workspace_root.join(".git").exists() {
-        return None;
-    }
-    let out = tokio::process::Command::new("git")
-        .args(["log", "-1", "--oneline"])
-        .current_dir(workspace_root)
-        .output()
-        .await
-        .ok()?;
-    if out.status.success() {
-        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if line.is_empty() { None } else { Some(line) }
-    } else {
-        None
-    }
 }

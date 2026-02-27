@@ -27,7 +27,6 @@ const BROADCAST_CAP: usize = 256;
 
 /// UTF-8-safe truncation — ensures we never slice in the middle of a multi-byte
 /// character.
-#[allow(dead_code)]
 pub(super) fn safe_truncate(text: &str, limit: usize) -> &str {
     if limit >= text.len() {
         return text;

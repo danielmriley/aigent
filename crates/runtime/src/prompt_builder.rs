@@ -160,30 +160,22 @@ fn build_environment_block(
     memory: &MemoryManager,
     recent_turn_count: usize,
 ) -> String {
-    let workspace_raw = &config.agent.workspace_path;
-    let workspace = std::fs::canonicalize(workspace_raw)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| workspace_raw.clone());
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     let local_ts = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
     let timestamp = Utc::now().to_rfc3339();
-    let ws_path = std::path::Path::new(&workspace);
-    let git_present = ws_path.join(".git").exists();
+    let git_present = std::path::Path::new(".git").exists();
     let stats = memory.stats();
-
-    // Detect the aigent source directory (parent of workspace, if it has Cargo.toml).
-    let source_line = ws_path
-        .parent()
-        .filter(|p| p.join("Cargo.toml").exists())
-        .map(|p| format!("\n- aigent_source_dir: {} (your source code repo — use read_file with absolute paths or `git -C` to inspect)", p.display()))
-        .unwrap_or_default();
 
     format!(
         "- local_time: {local_ts}\n\
          - utc_time: {timestamp}\n\
          - os: {}\n\
          - arch: {}\n\
-         - workspace: {workspace} (shell commands run here)\n\
-         - git_repo_in_workspace: {git_present}{source_line}\n\
+         - cwd: {cwd}\n\
+         - git_repo_present: {git_present}\n\
          - provider: {}\n\
          - model: {}\n\
          - thinking_level: {}\n\

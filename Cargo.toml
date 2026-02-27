@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/interfaces/cli",
-  "crates/core",
   "crates/config",
   "crates/memory",
   "crates/llm",
@@ -10,7 +9,6 @@ members = [
   "crates/interfaces/tui",
   "crates/interfaces/telegram",
   "crates/runtime",
-  "crates/audit",
 ]
 resolver = "2"
 

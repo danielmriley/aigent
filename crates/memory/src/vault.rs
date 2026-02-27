@@ -126,59 +126,6 @@ pub fn export_obsidian_vault(
     })
 }
 
-/// Write a single note file for a new memory entry.
-///
-/// Called incrementally from `record_inner` so each new entry gets its own
-/// `.md` file without triggering a full vault rebuild.  The index files
-/// (tier/daily/topic pages) are only rebuilt during sleep cycles or explicit
-/// `export-vault` runs, which is acceptable since those are human navigation
-/// aids rather than per-entry content.
-pub fn write_entry_note(entry: &MemoryEntry, vault_root: &Path) -> Result<()> {
-    let notes_dir = vault_root.join("notes");
-    std::fs::create_dir_all(&notes_dir)?;
-
-    let note_name = note_name(entry);
-    let note_file = notes_dir.join(format!("{note_name}.md"));
-
-    // If the file already exists (duplicate insert) skip the write.
-    if note_file.exists() {
-        return Ok(());
-    }
-
-    let day = entry.created_at.format("%Y-%m-%d").to_string();
-    let tier_label = entry.tier.slug();
-    let topics = extract_topics(&entry.content);
-
-    let topic_links = if topics.is_empty() {
-        "(none)".to_string()
-    } else {
-        topics
-            .iter()
-            .map(|t| format!("[[topic-{t}]]"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    let note_body = format!(
-        "---\nid: {}\ntier: {}\nsource: {}\nconfidence: {:.2}\nvalence: {:.2}\ncreated_at: {}\nprovenance_hash: {}\n---\n\n# {}\n\n{}\n\n## Topics\n{}\n\n## Links\n- [[index]]\n- [[tier-{}]]\n- [[day-{}]]\n",
-        entry.id,
-        tier_label,
-        entry.source,
-        entry.confidence,
-        entry.valence,
-        entry.created_at,
-        entry.provenance_hash,
-        note_name,
-        entry.content,
-        topic_links,
-        tier_label,
-        day,
-    );
-
-    std::fs::write(note_file, note_body)?;
-    Ok(())
-}
-
 fn write_root_index(
     root: &Path,
     tier_links: &BTreeMap<String, Vec<String>>,

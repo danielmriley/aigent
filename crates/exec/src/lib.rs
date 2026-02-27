@@ -5,7 +5,7 @@ pub mod sandbox;
 pub mod wasm;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -470,27 +470,6 @@ fn parse_security_level_str(s: &str) -> SecurityLevel {
     }
 }
 
-// ── Workspace boundary helper ────────────────────────────────────────────────
-
-pub fn ensure_within_workspace(workspace_root: &Path, target: &Path) -> Result<PathBuf> {
-    let canonical_root = workspace_root.canonicalize()?;
-    let joined = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        canonical_root.join(target)
-    };
-    let canonical_target = joined.canonicalize()?;
-
-    if !canonical_target.starts_with(&canonical_root) {
-        bail!(
-            "path escapes workspace boundary: {}",
-            canonical_target.display()
-        );
-    }
-
-    Ok(canonical_target)
-}
-
 // ── Convenience: create a default registry with built-in tools ───────────────
 
 pub fn default_registry(
@@ -600,9 +579,8 @@ pub fn default_registry(
 mod tests {
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
 
-    use crate::{ExecutionPolicy, ToolExecutor, default_registry, ensure_within_workspace};
+    use crate::{ExecutionPolicy, ToolExecutor, default_registry};
     use aigent_tools::{SecurityLevel, ToolMetadata};
 
     // Helper metadata for common tool categories used in tests.
@@ -619,26 +597,7 @@ mod tests {
         ToolMetadata { security_level: SecurityLevel::High, read_only: false, group: "shell".into(), ..Default::default() }
     }
 
-    #[test]
-    fn workspace_guard_rejects_escape() -> anyhow::Result<()> {
-        let base = std::env::temp_dir().join("aigent-exec-workspace-test");
-        let child = base.join("safe");
-        fs::create_dir_all(&child)?;
 
-        let escaped = ensure_within_workspace(&base, &PathBuf::from("../"));
-        assert!(escaped.is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn workspace_guard_accepts_child_path() -> anyhow::Result<()> {
-        let base = std::env::temp_dir().join("aigent-exec-ws-accept-test");
-        let child = base.join("subdir");
-        fs::create_dir_all(&child)?;
-        let result = ensure_within_workspace(&base, &PathBuf::from("subdir"));
-        assert!(result.is_ok());
-        Ok(())
-    }
 
     // ── requires_approval tests ────────────────────────────────────────────
 
