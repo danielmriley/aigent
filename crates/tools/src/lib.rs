@@ -276,7 +276,7 @@ impl ToolRegistry {
 pub mod builtins;
 pub use builtins::{
     CalendarAddEventTool, DraftEmailTool, FetchPageTool, GitRollbackTool,
-    ReadFileTool, RemindMeTool, RunShellTool, WebSearchTool, WriteFileTool,
+    ReadFileTool, RemindMeTool, RunShellTool, WebBrowseTool, WebSearchTool, WriteFileTool,
 };
 
 // ── ToolRegistry tests ───────────────────────────────────────────────────────

@@ -4,11 +4,13 @@ mod fs;
 mod shell;
 mod web;
 mod calendar;
+mod web_browse;
 
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use shell::RunShellTool;
 pub use web::{WebSearchTool, FetchPageTool};
 pub use calendar::CalendarAddEventTool;
+pub use web_browse::WebBrowseTool;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};

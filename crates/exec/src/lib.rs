@@ -482,7 +482,7 @@ pub fn default_registry(
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
         CalendarAddEventTool, DraftEmailTool, GitRollbackTool, ReadFileTool, RemindMeTool,
-        RunShellTool, WebSearchTool, WriteFileTool, FetchPageTool,
+        RunShellTool, WebBrowseTool, WebSearchTool, WriteFileTool, FetchPageTool,
     };
 
     let mut registry = ToolRegistry::default();
@@ -541,6 +541,10 @@ pub fn default_registry(
         (
             "fetch_page",
             Box::new(FetchPageTool),
+        ),
+        (
+            "web_browse",
+            Box::new(WebBrowseTool),
         ),
         (
             "draft_email",
