@@ -72,6 +72,10 @@ struct DaemonState {
     proactive_total_sent: u64,
     /// Timestamp of the last proactive message sent.
     last_proactive_at: Option<DateTime<Utc>>,
+    /// Abort handle for Task C (proactive mode).  `None` when proactive mode is
+    /// disabled.  Aborted gracefully during daemon shutdown so the task does not
+    /// outlive the daemon process.
+    proactive_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl DaemonState {
@@ -163,6 +167,9 @@ pub async fn run_unified_daemon(
         info!(model = %embed_model, "embedding backend configured");
     }
 
+    // Apply config-driven memory tuning.
+    memory.set_kv_tier_limit(config.memory.kv_tier_limit);
+
     // Auto-seed Core identity if it's missing (safety net for upgrades or
     // first-run cases where onboarding seeded the config but not the event log).
     {
@@ -211,6 +218,19 @@ pub async fn run_unified_daemon(
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
+    // IANA timezone for the nightly quiet window (default UTC).
+    let sleep_tz: chrono_tz::Tz = config.memory.timezone.parse().unwrap_or_else(|_| {
+        warn!(tz = %config.memory.timezone, "unrecognised timezone — falling back to UTC");
+        chrono_tz::UTC
+    });
+    // Lightweight forgetting parameters.
+    let forget_after_days = config.memory.forget_episodic_after_days;
+    let forget_min_confidence = config.memory.forget_min_confidence;
+    // Proactive mode parameters.
+    let proactive_interval_minutes = config.memory.proactive_interval_minutes;
+    let proactive_dnd_start = config.memory.proactive_dnd_start_hour as u32;
+    let proactive_dnd_end = config.memory.proactive_dnd_end_hour as u32;
+    let proactive_cooldown_minutes = config.memory.proactive_cooldown_minutes as i64;
 
     let runtime = AgentRuntime::new(config);
     runtime.run().await?;
@@ -225,7 +245,8 @@ pub async fn run_unified_daemon(
         .filter(|e| e.source == "sleep:multi-agent-cycle")
         .max_by_key(|e| e.created_at)
         .and_then(|e| {
-            let age = (Utc::now() - e.created_at).to_std().ok()?;
+            let delta: chrono::TimeDelta = Utc::now() - e.created_at;
+            let age = delta.to_std().ok()?;
             Instant::now().checked_sub(age)
         });
 
@@ -243,21 +264,44 @@ pub async fn run_unified_daemon(
         last_passive_sleep_at: None,
         proactive_total_sent: 0,
         last_proactive_at: None,
+        proactive_handle: None,
     }));
 
     let listener = UnixListener::bind(&socket_path)?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     info!(path = %socket_path.display(), "unified daemon listening");
 
+    // Extract vault path before memory is moved into DaemonState so the
+    // bidirectional watcher can be started with an owned PathBuf.
+    let vault_path_for_watcher: Option<std::path::PathBuf> =
+        state.lock().await.memory.vault_path().map(|p| p.to_path_buf());
+
     // Spawn background tasks.
+    sleep::spawn_vault_watcher_task(state.clone(), vault_path_for_watcher);
     sleep::spawn_compaction_task(state.clone(), &shutdown_tx);
-    sleep::spawn_passive_distillation(state.clone(), &shutdown_tx, sleep_interval_hours);
+    sleep::spawn_passive_distillation(
+        state.clone(), &shutdown_tx, sleep_interval_hours,
+        forget_after_days, forget_min_confidence,
+    );
     sleep::spawn_nightly_consolidation(
         state.clone(),
         &shutdown_tx,
         sleep_quiet_start,
         sleep_quiet_end,
+        sleep_tz,
     );
+    if proactive_interval_minutes > 0 {
+        let handle = sleep::spawn_proactive_task(
+            state.clone(),
+            &shutdown_tx,
+            proactive_interval_minutes,
+            sleep_tz,
+            proactive_dnd_start,
+            proactive_dnd_end,
+            proactive_cooldown_minutes,
+        );
+        state.lock().await.proactive_handle = Some(handle);
+    }
 
     loop {
         tokio::select! {
@@ -280,6 +324,14 @@ pub async fn run_unified_daemon(
     }
 
     info!("daemon shutting down gracefully");
+    {
+        // Cancel Task C before the final sleep so it cannot fire mid-shutdown.
+        let handle = state.lock().await.proactive_handle.take();
+        if let Some(h) = handle {
+            h.abort();
+            info!("proactive task stopped");
+        }
+    }
     {
         // Clone runtime and take memory while holding the lock, then release
         // before the LLM call so incoming connections (e.g. from daemon restart)

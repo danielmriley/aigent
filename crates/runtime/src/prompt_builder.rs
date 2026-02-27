@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 use uuid::Uuid;
 
 use aigent_config::AppConfig;
@@ -49,11 +49,12 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
     let environment_block = build_environment_block(config, memory, inputs.recent_turns.len());
     let conversation_block = build_conversation_block(inputs.recent_turns);
     let tools_section = build_tools_and_grounding(inputs.tool_specs);
+    let today_date = Local::now().format("%A, %B %-d, %Y").to_string();
 
     let mut buf = String::with_capacity(8192);
     let _ = write!(
         buf,
-        "You are {name}. Thinking depth: {thought_style}.\n\
+        "You are {name}. Thinking depth: {thought_style}. Today is {today_date}.\n\
          Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
          continuity, and MEMORY CONTEXT for durable background facts.\n\
          Never repeat previous answers unless asked.\n\
@@ -66,6 +67,7 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
          LATEST USER MESSAGE:\n{msg}\n\n\
          ASSISTANT RESPONSE:",
         name = config.agent.name,
+        today_date = today_date,
         relational_block = relational_block,
         follow_ups = follow_up_block,
         proactive_directive = proactive_directive,
@@ -162,12 +164,14 @@ fn build_environment_block(
         .ok()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let local_ts = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
     let timestamp = Utc::now().to_rfc3339();
     let git_present = std::path::Path::new(".git").exists();
     let stats = memory.stats();
 
     format!(
-        "- utc_time: {timestamp}\n\
+        "- local_time: {local_ts}\n\
+         - utc_time: {timestamp}\n\
          - os: {}\n\
          - arch: {}\n\
          - cwd: {cwd}\n\
