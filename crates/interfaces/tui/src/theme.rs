@@ -1,3 +1,5 @@
+//! Enhanced theme system with semantic colour roles.
+
 use ratatui::style::Color;
 
 #[derive(Debug, Clone)]
@@ -8,6 +10,10 @@ pub struct Theme {
     pub muted: Color,
     pub user_bubble: Color,
     pub assistant_bubble: Color,
+    pub border: Color,
+    pub success: Color,
+    pub error: Color,
+    pub warning: Color,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +45,10 @@ impl Theme {
                 muted: Color::Rgb(108, 112, 134),
                 user_bubble: Color::Rgb(49, 50, 68),
                 assistant_bubble: Color::Rgb(24, 24, 37),
+                border: Color::Rgb(69, 71, 90),
+                success: Color::Rgb(166, 227, 161),
+                error: Color::Rgb(243, 139, 168),
+                warning: Color::Rgb(249, 226, 175),
             },
             ThemeName::TokyoNight => Self {
                 background: Color::Rgb(26, 27, 38),
@@ -47,6 +57,10 @@ impl Theme {
                 muted: Color::Rgb(86, 95, 137),
                 user_bubble: Color::Rgb(41, 46, 66),
                 assistant_bubble: Color::Rgb(31, 35, 53),
+                border: Color::Rgb(56, 62, 87),
+                success: Color::Rgb(158, 206, 106),
+                error: Color::Rgb(247, 118, 142),
+                warning: Color::Rgb(224, 175, 104),
             },
             ThemeName::Nord => Self {
                 background: Color::Rgb(46, 52, 64),
@@ -55,6 +69,10 @@ impl Theme {
                 muted: Color::Rgb(129, 161, 193),
                 user_bubble: Color::Rgb(59, 66, 82),
                 assistant_bubble: Color::Rgb(67, 76, 94),
+                border: Color::Rgb(76, 86, 106),
+                success: Color::Rgb(163, 190, 140),
+                error: Color::Rgb(191, 97, 106),
+                warning: Color::Rgb(235, 203, 139),
             },
         }
     }

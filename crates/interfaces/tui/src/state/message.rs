@@ -1,7 +1,4 @@
 //! Core data types for the TUI state.
-//!
-//! These types are pure data — no UI handles, no channels, no rendering
-//! logic.  They form the **Model** in the Elm-inspired MVU architecture.
 
 /// Commands the TUI sends back to the host (CLI) layer.
 #[derive(Debug, Clone)]

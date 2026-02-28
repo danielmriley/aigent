@@ -1,4 +1,4 @@
-//! Root layout computation and focus management.
+//! Root layout computation.
 //!
 //! Provides deterministic layout functions that convert a terminal area
 //! into named regions.  All layout decisions live here so components
@@ -6,15 +6,15 @@
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
-/// Compute the four-row root layout: header, middle, input, footer.
+/// The four-row root regions: header, middle, input, footer.
 pub fn root_layout(area: Rect, input_height: u16) -> [Rect; 4] {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),              // header / status bar
-            Constraint::Min(5),                 // middle (chat + sidebar)
-            Constraint::Length(input_height),    // input
-            Constraint::Length(1),              // footer
+            Constraint::Length(1),
+            Constraint::Min(5),
+            Constraint::Length(input_height),
+            Constraint::Length(1),
         ])
         .split(area);
     [chunks[0], chunks[1], chunks[2], chunks[3]]

@@ -3,14 +3,11 @@
 //! Actions are the "messages" in the Elm architecture: they describe
 //! *what happened* and let the root `App::update` decide how to mutate
 //! state and which side-effects to trigger.
-//!
-//! `Action` is **internal** to the TUI crate.  The only thing that
-//! crosses the crate boundary is `UiCommand` (Quit / Submit).
 
 /// An internal action produced by a component or the root App.
 #[derive(Debug, Clone)]
 pub enum Action {
-    /// No-op — useful as a default return.
+    /// No-op.
     Noop,
 
     /// User submitted text from the input bar.
