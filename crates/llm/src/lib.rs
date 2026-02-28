@@ -1,3 +1,13 @@
+pub mod candle_backend;
+pub mod embedding;
+
+pub use embedding::{EmbeddingClient, OllamaEmbeddingConfig, OllamaEmbeddingClient};
+pub use candle_backend::{estimate_complexity, should_use_candle};
+#[cfg(feature = "candle")]
+pub use candle_backend::{CandleConfig, CandleBackend};
+#[cfg(feature = "candle")]
+pub use embedding::{CandleEmbeddingConfig, CandleEmbeddingClient};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

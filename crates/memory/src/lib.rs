@@ -12,6 +12,7 @@ pub mod scorer;
 pub mod sentiment;
 pub mod sleep;
 pub mod store;
+pub mod vector_store;
 pub mod vault;
 
 pub use identity::IdentityKernel;
@@ -20,6 +21,7 @@ pub use manager::{EmbedFn, MemoryManager, MemoryStats};
 pub use multi_sleep::{SpecialistRole, batch_memories, merge_insights};
 pub use schema::{MemoryEntry, MemoryTier, truncate_str};
 pub use sleep::{AgenticSleepInsights, SleepSummary, parse_agentic_insights};
+pub use vector_store::{FlatVectorStore, VectorBackend, VectorMatch, cosine_similarity};
 pub use vault::{
     KV_CORE, KV_REFLECTIVE, KV_TIER_LIMIT, KV_USER_PROFILE, NARRATIVE_MD, WATCHED_SUMMARIES,
     VaultEditEvent, VaultExportSummary, VaultFileStatus,

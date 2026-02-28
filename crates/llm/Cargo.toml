@@ -16,6 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+tracing.workspace = true
+
 # Candle local inference (optional)
 candle-core         = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
