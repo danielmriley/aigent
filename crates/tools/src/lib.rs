@@ -199,6 +199,142 @@ impl ToolSpec {
             }
         })
     }
+
+    /// Generate a standalone JSON Schema document for this tool's parameters.
+    ///
+    /// Unlike [`to_openai_tool_schema`](Self::to_openai_tool_schema), this
+    /// produces a self-contained `$schema`-annotated document suitable for
+    /// validation or IDE tooling.
+    pub fn to_json_schema(&self) -> serde_json::Value {
+        let mut properties = serde_json::Map::new();
+        let mut required: Vec<String> = Vec::new();
+
+        for p in &self.params {
+            let type_str = match p.param_type {
+                ParamType::String => "string",
+                ParamType::Number => "number",
+                ParamType::Integer => "integer",
+                ParamType::Boolean => "boolean",
+                ParamType::Array => "array",
+                ParamType::Object => "object",
+            };
+            let mut prop = serde_json::json!({
+                "type": type_str,
+                "description": p.description,
+            });
+            if !p.enum_values.is_empty() {
+                prop["enum"] = serde_json::json!(p.enum_values);
+            }
+            if let Some(ref def) = p.default {
+                prop["default"] = match p.param_type {
+                    ParamType::Number => def.parse::<f64>()
+                        .map(|n| serde_json::json!(n))
+                        .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
+                    ParamType::Integer => def.parse::<i64>()
+                        .map(|n| serde_json::json!(n))
+                        .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
+                    ParamType::Boolean => match def.as_str() {
+                        "true" => serde_json::json!(true),
+                        "false" => serde_json::json!(false),
+                        _ => serde_json::Value::String(def.clone()),
+                    },
+                    ParamType::Array | ParamType::Object => {
+                        serde_json::from_str(def)
+                            .unwrap_or_else(|_| serde_json::Value::String(def.clone()))
+                    }
+                    ParamType::String => serde_json::Value::String(def.clone()),
+                };
+            }
+            properties.insert(p.name.clone(), prop);
+            if p.required {
+                required.push(p.name.clone());
+            }
+        }
+
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": format!("aigent://tools/{}", self.name),
+            "title": self.name,
+            "description": self.description,
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false,
+            "x-metadata": {
+                "security_level": format!("{:?}", self.metadata.security_level),
+                "read_only": self.metadata.read_only,
+                "group": self.metadata.group,
+            }
+        })
+    }
+
+    /// Validate a set of arguments against this tool's parameter spec.
+    ///
+    /// Returns a list of validation errors (empty if valid).
+    pub fn validate_args(&self, args: &HashMap<String, String>) -> Vec<String> {
+        let mut errors = Vec::new();
+        for p in &self.params {
+            if p.required && !args.contains_key(&p.name) {
+                errors.push(format!("missing required param: '{}'", p.name));
+            }
+            if let Some(val) = args.get(&p.name) {
+                // Type validation for non-string types.
+                match p.param_type {
+                    ParamType::Integer => {
+                        if val.parse::<i64>().is_err() {
+                            errors.push(format!(
+                                "param \'{}\' expected integer, got '{}'",
+                                p.name, val
+                            ));
+                        }
+                    }
+                    ParamType::Number => {
+                        if val.parse::<f64>().is_err() {
+                            errors.push(format!(
+                                "param \'{}\' expected number, got '{}'",
+                                p.name, val
+                            ));
+                        }
+                    }
+                    ParamType::Boolean => {
+                        if val != "true" && val != "false" {
+                            errors.push(format!(
+                                "param \'{}\' expected boolean, got '{}'",
+                                p.name, val
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                if !p.enum_values.is_empty() && !p.enum_values.contains(val) {
+                    errors.push(format!(
+                        "param \'{}\' must be one of {:?}, got '{}'",
+                        p.name, p.enum_values, val
+                    ));
+                }
+            }
+        }
+        errors
+    }
+}
+
+/// Export all tool schemas to a JSON manifest.
+///
+/// Produces an object keyed by tool name with both OpenAI and standalone
+/// JSON Schema representations, suitable for writing to
+/// `.aigent/schemas/tools.json`.
+pub fn export_tool_schemas(specs: &[ToolSpec]) -> serde_json::Value {
+    let mut manifest = serde_json::Map::new();
+    for spec in specs {
+        manifest.insert(
+            spec.name.clone(),
+            serde_json::json!({
+                "openai": spec.to_openai_tool_schema(),
+                "json_schema": spec.to_json_schema(),
+            }),
+        );
+    }
+    serde_json::Value::Object(manifest)
 }
 
 /// Convert a slice of `ToolSpec` into the `tools` JSON array accepted by

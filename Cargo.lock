@@ -92,6 +92,8 @@ dependencies = [
  "chrono",
  "git2",
  "libc",
+ "notify",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

@@ -37,6 +37,12 @@ libc = { workspace = true, optional = true }
 git2 = { workspace = true }
 chrono = { workspace = true }
 
+# File watcher for WASM hot-reload.
+notify = { workspace = true }
+
+# Regex for tool chain placeholder resolution.
+regex = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 
