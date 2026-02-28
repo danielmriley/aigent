@@ -10,7 +10,7 @@ use std::time::Duration;
 use chrono::Utc;
 use chrono_tz::Tz;
 use tokio::sync::{Mutex, mpsc, watch};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use aigent_memory::{MemoryTier, VaultEditEvent, spawn_vault_watcher as spawn_fs_vault_watcher};
 
@@ -159,6 +159,7 @@ pub(super) fn spawn_nightly_consolidation(
 
             // Time-of-day guard: only consolidate in the quiet window.
             if !is_in_window(Utc::now(), sleep_tz, sleep_quiet_start, sleep_quiet_end) {
+                debug!("nightly consolidation: outside quiet window, skipping");
                 continue;
             }
 
@@ -170,6 +171,7 @@ pub(super) fn spawn_nightly_consolidation(
                     .unwrap_or(false)
             };
             if already_ran {
+                debug!("nightly consolidation: ran recently (<22h), skipping");
                 continue;
             }
 
@@ -181,6 +183,7 @@ pub(super) fn spawn_nightly_consolidation(
                     .unwrap_or(false)
             };
             if recently_active {
+                debug!("nightly consolidation: conversation active (<15min), skipping");
                 continue;
             }
 
@@ -198,14 +201,30 @@ pub(super) fn spawn_nightly_consolidation(
             // Lock is released — a user conversation can proceed normally.
 
             // ── Phase 2: Generate — long-running LLM calls, no lock held ──
+            // Overall timeout so a hung LLM can never block the nightly
+            // pipeline indefinitely (individual request timeout is 5 min
+            // via the reqwest client; this caps the whole multi-agent run).
+            let llm_start = std::time::Instant::now();
             let (noop_tx, _) = mpsc::unbounded_channel::<String>();
-            let gen_result = rt_clone
-                .generate_multi_agent_sleep_insights(
+            let gen_result = match tokio::time::timeout(
+                Duration::from_secs(10 * 60), // 10 min hard cap
+                rt_clone.generate_multi_agent_sleep_insights(
                     &memories_snapshot,
                     &identity_snapshot,
                     &noop_tx,
-                )
-                .await;
+                ),
+            )
+            .await
+            {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    warn!(
+                        elapsed_secs = llm_start.elapsed().as_secs(),
+                        "nightly consolidation: timed out after 10 minutes"
+                    );
+                    Err(anyhow::anyhow!("nightly consolidation timed out"))
+                }
+            };
 
             // ── Phase 3: Apply — re-acquire lock and merge insights ───────
             {
@@ -228,7 +247,7 @@ pub(super) fn spawn_nightly_consolidation(
                                     "sleep:multi-agent-cycle",
                                 ).await;
                                 s.last_multi_agent_sleep_at = Some(std::time::Instant::now());
-                                info!(summary = %summary.distilled, "nightly multi-agent LLM consolidation: complete");
+                                info!(elapsed_secs = llm_start.elapsed().as_secs(), summary = %summary.distilled, "nightly multi-agent LLM consolidation: complete");
                             }
                             Ok(_) => {
                                 let _ = s.memory.record(

@@ -270,6 +270,7 @@ pub(super) async fn handle_connection(
                                     }
                                     let _ = s.memory.flush_all();
                                     let _ = event_tx2.send(BackendEvent::MemoryUpdated);
+                                    let _ = event_tx2.send(BackendEvent::Done);
                                 });
                             }
                             Ok(reflect_events)
@@ -575,6 +576,7 @@ pub(super) async fn handle_connection(
                                 }
                                 let _ = s.memory.flush_all();
                                 let _ = event_tx2.send(BackendEvent::MemoryUpdated);
+                                let _ = event_tx2.send(BackendEvent::Done);
                             });
                         }
 
