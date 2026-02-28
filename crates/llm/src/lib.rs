@@ -510,7 +510,9 @@ impl OllamaClient {
         let status = response.status();
         if !status.is_success() {
             let body: serde_json::Value = response.json().await?;
-            return Ok((format!("Ollama error ({status}): {body}"), vec![], "error".to_string()));
+            let err_msg = format!("Ollama error ({status}): {body}");
+            let _ = tx.send(err_msg.clone()).await;
+            return Ok((err_msg, vec![], "error".to_string()));
         }
 
         let mut full_response = String::new();
@@ -788,7 +790,9 @@ impl OpenRouterClient {
     ) -> Result<(String, Vec<ToolCall>, String)> {
         let api_key = std::env::var("OPENROUTER_API_KEY").ok();
         let Some(api_key) = api_key.filter(|k| !k.trim().is_empty()) else {
-            return Ok(("OpenRouter key missing. Set OPENROUTER_API_KEY.".to_string(), vec![], "error".to_string()));
+            let err_msg = "OpenRouter key missing. Set OPENROUTER_API_KEY.".to_string();
+            let _ = tx.send(err_msg.clone()).await;
+            return Ok((err_msg, vec![], "error".to_string()));
         };
 
         let openai_messages = messages_to_openai(messages);
@@ -813,7 +817,9 @@ impl OpenRouterClient {
         let status = response.status();
         if !status.is_success() {
             let body: serde_json::Value = response.json().await?;
-            return Ok((format!("OpenRouter error ({status}): {body}"), vec![], "error".to_string()));
+            let err_msg = format!("OpenRouter error ({status}): {body}");
+            let _ = tx.send(err_msg.clone()).await;
+            return Ok((err_msg, vec![], "error".to_string()));
         }
 
         let mut full_response = String::new();
