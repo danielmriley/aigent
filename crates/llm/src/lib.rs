@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -134,6 +135,82 @@ impl Default for OpenRouterClient {
 pub enum Provider {
     Ollama,
     OpenRouter,
+}
+
+// ── LlmClient trait & ModelProvider ──────────────────────────────────────────
+
+/// Which backend actually executes an inference request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ModelProvider {
+    /// Remote Ollama server (usually local GPU).
+    Ollama,
+    /// OpenRouter cloud API (many models behind one key).
+    OpenRouter,
+    /// Local pure-Rust inference via HuggingFace Candle.
+    /// Only available when the `candle` feature is compiled in.
+    Candle,
+}
+
+impl From<Provider> for ModelProvider {
+    fn from(p: Provider) -> Self {
+        match p {
+            Provider::Ollama => ModelProvider::Ollama,
+            Provider::OpenRouter => ModelProvider::OpenRouter,
+        }
+    }
+}
+
+impl From<ModelProvider> for Provider {
+    fn from(mp: ModelProvider) -> Self {
+        match mp {
+            ModelProvider::Ollama => Provider::Ollama,
+            ModelProvider::OpenRouter | ModelProvider::Candle => Provider::OpenRouter,
+        }
+    }
+}
+
+/// Unified trait for any LLM backend (Ollama, OpenRouter, Candle, …).
+///
+/// The existing [`LlmRouter`] implements this directly.  New backends
+/// (e.g. Candle local models) can implement `LlmClient` and be composed
+/// into the router without changing the runtime.
+#[async_trait]
+pub trait LlmClient: Send + Sync {
+    /// Simple text completion: prompt in, response text out.
+    async fn complete(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        prompt: &str,
+    ) -> Result<(ModelProvider, String)>;
+
+    /// Streaming text completion — tokens arrive on `tx`.
+    async fn complete_stream(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        prompt: &str,
+        tx: mpsc::Sender<String>,
+    ) -> Result<(ModelProvider, String)>;
+
+    /// Structured chat with optional tool definitions (native calling).
+    async fn chat(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<ChatResponse>;
+
+    /// Streaming structured chat — content tokens arrive on `tx`.
+    async fn chat_stream(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<ChatResponse>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -360,6 +437,63 @@ impl LlmRouter {
                 })
             }
         }
+    }
+}
+
+// ── LlmClient blanket impl for LlmRouter ────────────────────────────────────
+
+#[async_trait]
+impl LlmClient for LlmRouter {
+    async fn complete(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        prompt: &str,
+    ) -> Result<(ModelProvider, String)> {
+        let legacy = Provider::from(provider);
+        let (used, text) = self
+            .chat_with_fallback(legacy, model, model, prompt)
+            .await?;
+        Ok((ModelProvider::from(used), text))
+    }
+
+    async fn complete_stream(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        prompt: &str,
+        tx: mpsc::Sender<String>,
+    ) -> Result<(ModelProvider, String)> {
+        let legacy = Provider::from(provider);
+        let (used, text) = self
+            .chat_stream_with_fallback(legacy, model, model, prompt, tx)
+            .await?;
+        Ok((ModelProvider::from(used), text))
+    }
+
+    async fn chat(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+    ) -> Result<ChatResponse> {
+        let legacy = Provider::from(provider);
+        self.chat_messages(legacy, model, model, messages, tools)
+            .await
+    }
+
+    async fn chat_stream(
+        &self,
+        provider: ModelProvider,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<ChatResponse> {
+        let legacy = Provider::from(provider);
+        self.chat_messages_stream(legacy, model, model, messages, tools, tx)
+            .await
     }
 }
 

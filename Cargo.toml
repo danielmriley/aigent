@@ -19,6 +19,17 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/your-org/aigent"
 authors = ["Aigent Contributors"]
 
+# ── workspace-level feature flags ──────────────────────────────────────────────
+# These are *not* automatically forwarded to members — each crate opts in to the
+# features it needs.  The flags below let `cargo check --all-features` or
+# `--features candle` work from the workspace root via the CLI binary.
+[workspace.metadata.features]
+default = ["tui-advanced", "candle", "qdrant"]
+tui-advanced = []
+candle       = []
+qdrant       = []
+marketplace  = []
+
 [workspace.dependencies]
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -52,3 +63,8 @@ fs2 = "0.4"
 percent-encoding = "2.3"
 futures = "0.3"
 url = "2.5"
+
+# ── native coreutils / FS helpers ──────────────────────────────────────────────
+walkdir = "2"
+ignore = "0.4"
+globset = "0.4"
