@@ -184,14 +184,18 @@ dependencies = [
  "chrono",
  "fs2",
  "futures",
+ "globset",
+ "ignore",
  "lru",
  "percent-encoding",
+ "regex",
  "reqwest",
  "scraper",
  "serde",
  "serde_json",
  "tokio",
  "url",
+ "walkdir",
 ]
 
 [[package]]

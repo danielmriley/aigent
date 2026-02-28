@@ -520,8 +520,11 @@ pub fn default_registry(
     search_providers: Vec<String>,
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
-        BrowsePageTool, CalendarAddEventTool, DraftEmailTool, GitRollbackTool, ReadFileTool, RemindMeTool,
-        RunShellTool, WebBrowseTool, WebSearchTool, WriteFileTool, FetchPageTool,
+        BrowsePageTool, CalendarAddEventTool, CpTool, DraftEmailTool, FetchPageTool,
+        FindTool, GitRollbackTool, GrepTool, HeadTool, ListDirTool, MkdirTool,
+        MvTool, ReadFileTool, RemindMeTool, RmTool, RunShellTool, TailTool,
+        TouchTool, TreeTool, WcTool, WebBrowseTool, WebSearchTool,
+        WorkspaceStatusTool, WriteFileTool,
     };
 
     let mut registry = ToolRegistry::default();
@@ -602,6 +605,59 @@ pub fn default_registry(
         (
             "browse_page",
             Box::new(BrowsePageTool),
+        ),
+        // ── Coreutils (native replacements for common shell commands) ──────
+        (
+            "list_dir",
+            Box::new(ListDirTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "mkdir",
+            Box::new(MkdirTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "touch",
+            Box::new(TouchTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "rm",
+            Box::new(RmTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "cp",
+            Box::new(CpTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "mv",
+            Box::new(MvTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "find",
+            Box::new(FindTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "grep",
+            Box::new(GrepTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "head",
+            Box::new(HeadTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "tail",
+            Box::new(TailTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "wc",
+            Box::new(WcTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "tree",
+            Box::new(TreeTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "workspace_status",
+            Box::new(WorkspaceStatusTool { workspace_root: workspace_root.clone() }),
         ),
     ];
 

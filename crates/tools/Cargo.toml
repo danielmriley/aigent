@@ -18,4 +18,8 @@ percent-encoding.workspace = true
 futures.workspace = true
 url.workspace = true
 lru.workspace = true
+walkdir.workspace = true
+ignore.workspace = true
+globset.workspace = true
+regex.workspace = true
 

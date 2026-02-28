@@ -3,12 +3,17 @@
 mod browse;
 pub(crate) mod cache;
 mod fs;
+mod coreutils;
 mod shell;
 mod web;
 mod calendar;
 mod web_browse;
 
 pub use browse::BrowsePageTool;
+pub use coreutils::{
+    CpTool, FindTool, GrepTool, HeadTool, ListDirTool, MkdirTool, MvTool,
+    RmTool, TailTool, TouchTool, TreeTool, WcTool, WorkspaceStatusTool,
+};
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use shell::RunShellTool;
 pub use web::{WebSearchTool, FetchPageTool};
