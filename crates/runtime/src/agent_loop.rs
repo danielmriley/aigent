@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use std::fmt;
 use serde::{Deserialize, Serialize};
 
 // ─── reflection ──────────────────────────────────────────────────────────────
@@ -98,6 +99,175 @@ impl LlmToolCall {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+
+
+// ── ReAct state machine ──────────────────────────────────────────────────────
+
+/// Phase within a single ReAct iteration.
+///
+/// The canonical loop is: **Think → Act → Observe → Critique → (iterate or finish)**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReactPhase {
+    /// The agent reasons about the current context and decides next steps.
+    Think,
+    /// The agent executes one or more tool calls (or sends a sub-agent task).
+    Act,
+    /// The agent consumes the results of the action.
+    Observe,
+    /// The agent evaluates result quality and decides whether to iterate.
+    Critique,
+    /// Terminal state — the loop has produced a final answer.
+    Done,
+}
+
+impl fmt::Display for ReactPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReactPhase::Think => write!(f, "think"),
+            ReactPhase::Act => write!(f, "act"),
+            ReactPhase::Observe => write!(f, "observe"),
+            ReactPhase::Critique => write!(f, "critique"),
+            ReactPhase::Done => write!(f, "done"),
+        }
+    }
+}
+
+/// Role of a sub-agent within a swarm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SwarmRole {
+    /// Decomposes complex goals into sub-tasks and assigns them.
+    Planner,
+    /// Executes tool calls and manages workspace mutations.
+    Executor,
+    /// Validates outputs against acceptance criteria.
+    Verifier,
+    /// Gathers information from memory, web, or code search.
+    Researcher,
+    /// Top-level coordinator that routes between sub-agents.
+    Supervisor,
+}
+
+impl fmt::Display for SwarmRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SwarmRole::Planner => write!(f, "planner"),
+            SwarmRole::Executor => write!(f, "executor"),
+            SwarmRole::Verifier => write!(f, "verifier"),
+            SwarmRole::Researcher => write!(f, "researcher"),
+            SwarmRole::Supervisor => write!(f, "supervisor"),
+        }
+    }
+}
+
+/// A scored evaluation of a completed task or sub-task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvalScore {
+    /// Numeric quality score (0.0 = failure, 1.0 = perfect).
+    pub score: f32,
+    /// Short explanation of the score.
+    pub rationale: String,
+    /// Whether the result is good enough to accept without human review.
+    pub accepted: bool,
+}
+
+/// Snapshot of the ReAct loop's internal state, useful for TUI rendering
+/// and for persisting to the Procedural memory tier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactSnapshot {
+    pub phase: ReactPhase,
+    pub round: usize,
+    pub max_rounds: usize,
+    /// The current "thought" text (populated in Think phase).
+    pub thought: Option<String>,
+    /// Tool calls planned or just executed (populated in Act phase).
+    pub actions: Vec<LlmToolCall>,
+    /// Observation summary (populated in Observe phase).
+    pub observation: Option<String>,
+    /// Critique / self-evaluation (populated in Critique phase).
+    pub critique: Option<String>,
+    /// Final answer when Done.
+    pub answer: Option<String>,
+}
+
+/// The `AgentLoop` hosts the ReAct state machine and multi-agent swarm
+/// orchestration.  It is instantiated per-turn (or per-task) by the daemon
+/// connection handler and driven to completion.
+pub struct AgentLoop {
+    /// Current ReAct phase.
+    pub phase: ReactPhase,
+    /// Current iteration within the ReAct loop (0-indexed).
+    pub round: usize,
+    /// Maximum rounds before forcing a final answer.
+    pub max_rounds: usize,
+    /// Accumulated thoughts, actions, observations, and critiques.
+    pub history: Vec<ReactSnapshot>,
+    /// Role when this loop is running as a sub-agent inside a swarm.
+    pub role: Option<SwarmRole>,
+}
+
+impl Default for AgentLoop {
+    fn default() -> Self {
+        Self::new(8)
+    }
+}
+
+impl AgentLoop {
+    pub fn new(max_rounds: usize) -> Self {
+        Self {
+            phase: ReactPhase::Think,
+            round: 0,
+            max_rounds,
+            history: Vec::new(),
+            role: None,
+        }
+    }
+
+    /// Create a sub-agent loop with a specific swarm role.
+    pub fn with_role(max_rounds: usize, role: SwarmRole) -> Self {
+        Self {
+            phase: ReactPhase::Think,
+            round: 0,
+            max_rounds,
+            history: Vec::new(),
+            role: Some(role),
+        }
+    }
+
+    /// Advance the phase to the next step in the ReAct cycle.
+    pub fn advance(&mut self) -> ReactPhase {
+        self.phase = match self.phase {
+            ReactPhase::Think => ReactPhase::Act,
+            ReactPhase::Act => ReactPhase::Observe,
+            ReactPhase::Observe => ReactPhase::Critique,
+            ReactPhase::Critique => {
+                self.round += 1;
+                if self.round >= self.max_rounds {
+                    ReactPhase::Done
+                } else {
+                    ReactPhase::Think
+                }
+            }
+            ReactPhase::Done => ReactPhase::Done,
+        };
+        self.phase
+    }
+
+    /// Force the loop to completion.
+    pub fn finish(&mut self) {
+        self.phase = ReactPhase::Done;
+    }
+
+    /// Whether the loop has terminated.
+    pub fn is_done(&self) -> bool {
+        self.phase == ReactPhase::Done
+    }
+
+    /// Record a snapshot of the current round state.
+    pub fn record_snapshot(&mut self, snapshot: ReactSnapshot) {
+        self.history.push(snapshot);
+    }
+}
 
 #[cfg(test)]
 mod tests {

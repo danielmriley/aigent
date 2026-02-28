@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::agent_loop::{ReactPhase, SwarmRole};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallInfo {
     pub name: String,
@@ -48,4 +50,24 @@ pub enum BackendEvent {
     /// streamed reply was raw tool JSON — the ugly tokens are cleared before
     /// the corrected response is streamed.
     ClearStream,
+
+    // ── ReAct state machine events ─────────────────────────────────
+    /// Emitted when the ReAct loop transitions to a new phase.
+    ReactPhaseChanged {
+        phase: ReactPhase,
+        round: u32,
+        max_rounds: u32,
+    },
+    /// Emitted when a sub-agent is spawned within a swarm.
+    SubAgentSpawned {
+        role: SwarmRole,
+        task: String,
+    },
+    /// Emitted when a sub-agent completes its work.
+    SubAgentCompleted {
+        role: SwarmRole,
+        success: bool,
+        summary: String,
+    },
 }
+

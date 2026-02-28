@@ -258,6 +258,16 @@ pub fn build_tools_json(specs: &[ToolSpec]) -> serde_json::Value {
     aigent_tools::specs_to_openai_tools(specs)
 }
 
+/// Public wrapper for `execute_tool_calls` used by the ReAct loop.
+pub async fn execute_tool_calls_public(
+    calls: &[ToolCall],
+    registry: &ToolRegistry,
+    executor: &ToolExecutor,
+    event_tx: Option<&tokio::sync::broadcast::Sender<BackendEvent>>,
+) -> Vec<ToolExecution> {
+    execute_tool_calls(calls, registry, executor, event_tx).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -631,6 +631,24 @@ impl App {
                 }
                 self.pending_stream.clear();
             }
+            BackendEvent::ReactPhaseChanged { phase, round, max_rounds } => {
+                self.state.react_phase = Some(format!("{phase}"));
+                self.state.react_round = Some(round);
+                self.state.react_max_rounds = Some(max_rounds);
+                self.state.status = format!("ReAct {phase} ({}/{})", round + 1, max_rounds);
+            }
+            BackendEvent::SubAgentSpawned { role, ref task } => {
+                let short = if task.chars().count() > 60 {
+                    format!("{}\u{2026}", &task.chars().take(60).collect::<String>())
+                } else {
+                    task.clone()
+                };
+                self.state.status = format!("sub-agent [{role}]: {short}");
+            }
+            BackendEvent::SubAgentCompleted { role, success, .. } => {
+                let icon = if success { "\u{2713}" } else { "\u{2717}" };
+                self.state.status = format!("{icon} sub-agent [{role}] finished");
+            }
         }
     }
 
