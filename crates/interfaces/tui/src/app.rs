@@ -14,6 +14,7 @@ use aigent_runtime::BackendEvent;
 
 use crate::components::chat::ChatPanel;
 use crate::components::command_palette::CommandPalette;
+use crate::components::context_panel::ContextPanel;
 use crate::components::file_picker::{replace_last_at_token, FilePicker};
 use crate::components::footer::Footer;
 use crate::components::input::InputBar;
@@ -21,6 +22,7 @@ use crate::components::sidebar::SidebarPanel;
 use crate::components::status_bar::StatusBar;
 use crate::events::AppEvent;
 use crate::layout;
+use crate::state::SidebarTab;
 use crate::theme::Theme;
 use crate::widgets::markdown::render_markdown_lines;
 
@@ -45,6 +47,7 @@ pub struct App {
     // ── components ─────────────────────────────────────────────
     pub chat: ChatPanel,
     pub sidebar: SidebarPanel,
+    pub context_panel: ContextPanel,
     pub input: InputBar,
     pub status_bar: StatusBar,
     pub footer: Footer,
@@ -68,6 +71,16 @@ impl App {
                 memory_peek: Vec::new(),
                 selected_message: None,
                 history_mode: false,
+                react_phase: None,
+                react_round: None,
+                react_max_rounds: None,
+                swarm_role: None,
+                token_prompt: None,
+                token_response: None,
+                token_total: None,
+                tool_history: Vec::new(),
+                sidebar_tab: SidebarTab::Sessions,
+                model_name: Some(config.active_model().to_string()),
             },
             backend_rx,
             focus: Focus::Input,
@@ -78,6 +91,7 @@ impl App {
             pending_stream: String::new(),
             chat: ChatPanel::new(),
             sidebar: SidebarPanel::new(),
+            context_panel: ContextPanel::new(),
             input: InputBar::new(),
             status_bar: StatusBar::new(),
             footer: Footer::new(),
@@ -178,6 +192,15 @@ impl App {
             && key.code == KeyCode::Char('s')
         {
             self.sidebar.visible = !self.sidebar.visible;
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Tab
+        {
+            self.state.sidebar_tab = match self.state.sidebar_tab {
+                SidebarTab::Sessions => SidebarTab::Context,
+                SidebarTab::Context => SidebarTab::Sessions,
+            };
             return None;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -526,6 +549,11 @@ impl App {
             }
             BackendEvent::ToolCallEnd(result) => {
                 self.active_tool = None;
+                // Track in tool history for context panel.
+                self.state.tool_history.push(crate::state::ToolCallEntry {
+                    name: result.name.clone(),
+                    success: result.success,
+                });
                 if let Some(msg) = self
                     .state
                     .messages
@@ -643,14 +671,26 @@ impl App {
             self.status_bar.spinner_tick,
         );
 
-        // ── sidebar ────────────────────────────────────────────
+        // ── sidebar / context panel ─────────────────────────────
         if self.sidebar.visible {
-            self.sidebar.draw(
-                frame,
-                sidebar_area,
-                &self.state,
-                &self.theme,
-            );
+            match self.state.sidebar_tab {
+                SidebarTab::Sessions => {
+                    self.sidebar.draw(
+                        frame,
+                        sidebar_area,
+                        &self.state,
+                        &self.theme,
+                    );
+                }
+                SidebarTab::Context => {
+                    self.context_panel.draw(
+                        frame,
+                        sidebar_area,
+                        &self.state,
+                        &self.theme,
+                    );
+                }
+            }
         }
 
         // ── input ──────────────────────────────────────────────

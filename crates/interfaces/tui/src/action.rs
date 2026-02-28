@@ -49,6 +49,9 @@ pub enum Action {
     /// Select a file from the picker and splice it into the input.
     AcceptFilePick(String),
 
+    /// Switch the active sidebar tab (Sessions ↔ Context).
+    SwitchSidebarTab,
+
     /// Request quit.
     Quit,
 }

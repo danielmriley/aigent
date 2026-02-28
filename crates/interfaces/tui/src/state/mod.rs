@@ -6,5 +6,6 @@
 mod message;
 
 pub use message::{
-    AppState, CommandPaletteState, FilePopupState, Focus, Message, UiCommand,
+    AppState, CommandPaletteState, FilePopupState, Focus, Message, SidebarTab,
+    ToolCallEntry, UiCommand,
 };

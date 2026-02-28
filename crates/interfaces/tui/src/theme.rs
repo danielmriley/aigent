@@ -14,6 +14,7 @@ pub struct Theme {
     pub success: Color,
     pub error: Color,
     pub warning: Color,
+    pub info: Color,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,6 +50,7 @@ impl Theme {
                 success: Color::Rgb(166, 227, 161),
                 error: Color::Rgb(243, 139, 168),
                 warning: Color::Rgb(249, 226, 175),
+                info: Color::Rgb(116, 199, 236),
             },
             ThemeName::TokyoNight => Self {
                 background: Color::Rgb(26, 27, 38),
@@ -61,6 +63,7 @@ impl Theme {
                 success: Color::Rgb(158, 206, 106),
                 error: Color::Rgb(247, 118, 142),
                 warning: Color::Rgb(224, 175, 104),
+                info: Color::Rgb(125, 207, 255),
             },
             ThemeName::Nord => Self {
                 background: Color::Rgb(46, 52, 64),
@@ -73,6 +76,7 @@ impl Theme {
                 success: Color::Rgb(163, 190, 140),
                 error: Color::Rgb(191, 97, 106),
                 warning: Color::Rgb(235, 203, 139),
+                info: Color::Rgb(129, 161, 193),
             },
         }
     }

@@ -28,6 +28,24 @@ impl SidebarPanel {
     pub fn draw(&self, frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
         let mut lines = Vec::new();
 
+        // ── tab indicator ───────────────────────────────────────
+        let sessions_style = if state.sidebar_tab == crate::state::SidebarTab::Sessions {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        let context_style = if state.sidebar_tab == crate::state::SidebarTab::Context {
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(" Sessions ", sessions_style),
+            Span::styled("│", Style::default().fg(theme.border)),
+            Span::styled(" Context ", context_style),
+        ]));
+        lines.push(Line::from(""));
+
         // ── sessions ────────────────────────────────────────────
         lines.push(Line::from(Span::styled(
             " Sessions",

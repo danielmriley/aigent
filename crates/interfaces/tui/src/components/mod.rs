@@ -5,6 +5,7 @@
 
 pub mod chat;
 pub mod command_palette;
+pub mod context_panel;
 pub mod file_picker;
 pub mod footer;
 pub mod input;

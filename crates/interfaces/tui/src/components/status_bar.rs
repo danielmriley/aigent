@@ -51,13 +51,40 @@ impl StatusBar {
                 .add_modifier(Modifier::BOLD),
         );
         let sep = Span::styled(" │ ", Style::default().fg(theme.border));
-        let status_span = Span::styled(status_display, Style::default().fg(theme.foreground));
-        let hints = Span::styled(
-            " │ Ctrl+S sidebar │ Esc history",
-            Style::default().fg(theme.muted),
-        );
 
-        let header = Paragraph::new(Line::from(vec![name_span, sep, status_span, hints]));
+        // ── model badge (if available) ──────────────────────────
+        let mut spans = vec![name_span, sep.clone()];
+
+        if let Some(ref model) = state.model_name {
+            spans.push(Span::styled(
+                format!(" {} ", model),
+                Style::default()
+                    .fg(theme.background)
+                    .bg(theme.info),
+            ));
+            spans.push(sep.clone());
+        }
+
+        spans.push(Span::styled(status_display, Style::default().fg(theme.foreground)));
+
+        // ── token counter ───────────────────────────────────────
+        if let Some(total) = state.token_total {
+            spans.push(Span::styled(
+                format!(" │ tok:{}", total),
+                Style::default().fg(theme.muted),
+            ));
+        }
+
+        let tab_hint = match state.sidebar_tab {
+            crate::state::SidebarTab::Sessions => "sessions",
+            crate::state::SidebarTab::Context => "context",
+        };
+        spans.push(Span::styled(
+            format!(" │ Ctrl+S sidebar │ Ctrl+Tab {} │ Esc history", tab_hint),
+            Style::default().fg(theme.muted),
+        ));
+
+        let header = Paragraph::new(Line::from(spans));
         frame.render_widget(header, area);
     }
 }
