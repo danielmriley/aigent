@@ -4,6 +4,7 @@
 # Usage:
 #   ./build.sh              # build all tools in release mode
 #   ./build.sh read-file    # build a single tool
+#   ./build.sh --watch      # rebuild on changes (requires inotifywait or fswatch)
 #
 # Prerequisites:
 #   rustup target add wasm32-wasip1
@@ -16,6 +17,34 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# ── Watch mode ────────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "--watch" ]]; then
+    shift
+    echo "▸ Watching for changes (Ctrl+C to stop)..."
+    if command -v inotifywait &>/dev/null; then
+        while true; do
+            "$0" "$@"
+            echo ""
+            echo "Watching for changes..."
+            inotifywait -r -e modify,create,delete \
+                --include '.*\.(rs|toml|json)$' \
+                --exclude 'target/' \
+                . 2>/dev/null
+            echo ""
+        done
+    elif command -v fswatch &>/dev/null; then
+        fswatch -r --include '.*\.(rs|toml|json)$' --exclude 'target/' . | while read -r _; do
+            "$0" "$@"
+        done
+    else
+        echo "Error: --watch requires 'inotifywait' (inotify-tools) or 'fswatch'"
+        echo "Install: sudo apt install inotify-tools  (Linux)"
+        echo "         brew install fswatch             (macOS)"
+        exit 1
+    fi
+    exit 0
+fi
 
 # Ensure the WASI target is installed.
 if ! rustup target list --installed | grep -q wasm32-wasip1; then

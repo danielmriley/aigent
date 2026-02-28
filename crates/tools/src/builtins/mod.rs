@@ -1,11 +1,14 @@
 //! Built-in tool implementations.
 
+mod browse;
+pub(crate) mod cache;
 mod fs;
 mod shell;
 mod web;
 mod calendar;
 mod web_browse;
 
+pub use browse::BrowsePageTool;
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use shell::RunShellTool;
 pub use web::{WebSearchTool, FetchPageTool};

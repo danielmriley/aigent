@@ -160,10 +160,18 @@ pub struct ToolsConfig {
     /// Can also be set via `SEARXNG_BASE_URL` env var (env takes precedence).
     #[serde(default)]
     pub searxng_base_url: String,
+    /// Serper (Google Search) API key.
+    /// Can also be set via `SERPER_API_KEY` env var (env takes precedence).
+    #[serde(default)]
+    pub serper_api_key: String,
+    /// Exa.ai API key for semantic/neural search.
+    /// Can also be set via `EXA_API_KEY` env var (env takes precedence).
+    #[serde(default)]
+    pub exa_api_key: String,
     /// Preferred search provider ordering.  The agent tries providers in order
     /// and uses the first one that has valid credentials configured.
-    /// Options: "brave", "tavily", "searxng", "duckduckgo".
-    /// Default: ["brave", "tavily", "searxng", "duckduckgo"]
+    /// Options: "brave", "tavily", "serper", "exa", "searxng", "duckduckgo".
+    /// Default: ["brave", "tavily", "serper", "exa", "searxng", "duckduckgo"]
     #[serde(default = "default_search_providers")]
     pub search_providers: Vec<String>,
     /// Automatically run `git add -A && git commit` after every successful
@@ -200,6 +208,8 @@ impl Default for ToolsConfig {
             brave_api_key: String::new(),
             tavily_api_key: String::new(),
             searxng_base_url: String::new(),
+            serper_api_key: String::new(),
+            exa_api_key: String::new(),
             search_providers: default_search_providers(),
             git_auto_commit: false,
             sandbox_enabled: true,
@@ -213,6 +223,8 @@ fn default_search_providers() -> Vec<String> {
     vec![
         "brave".to_string(),
         "tavily".to_string(),
+        "serper".to_string(),
+        "exa".to_string(),
         "searxng".to_string(),
         "duckduckgo".to_string(),
     ]
@@ -287,6 +299,8 @@ impl Default for SafetyConfig {
                 "remind_me".to_string(),
                 "draft_email".to_string(),
                 "web_search".to_string(),
+                "browse_page".to_string(),
+                "fetch_page".to_string(),
             ],
             max_security_level: "high".to_string(),
             tool_overrides: std::collections::HashMap::new(),
@@ -519,7 +533,7 @@ mod tests {
     #[test]
     fn default_safety_exempt_tools() {
         let safety = SafetyConfig::default();
-        assert_eq!(safety.approval_exempt_tools.len(), 4);
+        assert_eq!(safety.approval_exempt_tools.len(), 6);
         assert!(safety.approval_exempt_tools.contains(&"web_search".to_string()));
         assert!(safety.approval_exempt_tools.contains(&"remind_me".to_string()));
     }

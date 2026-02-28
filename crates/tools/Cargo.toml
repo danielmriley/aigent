@@ -15,4 +15,7 @@ tokio.workspace = true
 scraper.workspace = true
 fs2.workspace = true
 percent-encoding.workspace = true
+futures.workspace = true
+url.workspace = true
+lru.workspace = true
 

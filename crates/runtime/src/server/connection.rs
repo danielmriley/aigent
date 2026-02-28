@@ -336,6 +336,7 @@ pub(super) async fn handle_connection(
                     name: call.tool.clone(),
                     success,
                     output: output.clone(),
+                    duration_ms: 0,
                 }));
                 info!(tool = %call.tool, success, output_len = output.len(), "tool call executed");
                 Some((call.tool.clone(), output))
@@ -459,6 +460,7 @@ pub(super) async fn handle_connection(
                                 name: call.tool.clone(),
                                 success,
                                 output: output.clone(),
+                                duration_ms: 0,
                             }));
 
                             // Build a grounded follow-up prompt and re-stream.

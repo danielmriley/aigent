@@ -178,12 +178,15 @@ dependencies = [
  "async-trait",
  "chrono",
  "fs2",
+ "futures",
+ "lru",
  "percent-encoding",
  "reqwest",
  "scraper",
  "serde",
  "serde_json",
  "tokio",
+ "url",
 ]
 
 [[package]]

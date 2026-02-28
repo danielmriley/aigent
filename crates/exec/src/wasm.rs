@@ -94,6 +94,62 @@ struct ManifestMetadata {
     group: Option<String>,
 }
 
+/// Validate a tool manifest for common issues.
+///
+/// Returns `Ok(())` if valid, or an error string describing the problems.
+/// Problems are warnings (the tool still loads) to be lenient with user manifests.
+fn validate_manifest(manifest: &ToolManifest, path: &Path) -> std::result::Result<(), String> {
+    let mut warnings: Vec<String> = Vec::new();
+
+    if manifest.name.is_empty() {
+        warnings.push("'name' is empty".to_string());
+    }
+    if manifest.name.contains(' ') {
+        warnings.push(format!("'name' contains spaces: '{}'", manifest.name));
+    }
+    if manifest.description.is_empty() {
+        warnings.push("'description' is empty".to_string());
+    }
+
+    for (i, param) in manifest.params.iter().enumerate() {
+        if param.name.is_empty() {
+            warnings.push(format!("param[{i}] has empty 'name'"));
+        }
+        if let Some(ref pt) = param.param_type {
+            let valid = ["string", "number", "integer", "boolean", "array", "object"];
+            if !valid.contains(&pt.as_str()) {
+                warnings.push(format!(
+                    "param '{}' has unknown param_type '{pt}' (expected: {})",
+                    param.name,
+                    valid.join(", ")
+                ));
+            }
+        }
+    }
+
+    if let Some(ref m) = manifest.metadata {
+        if let Some(ref sl) = m.security_level {
+            let valid = ["low", "medium", "high"];
+            if !valid.contains(&sl.as_str()) {
+                warnings.push(format!(
+                    "metadata.security_level '{sl}' is invalid (expected: {})",
+                    valid.join(", ")
+                ));
+            }
+        }
+    }
+
+    if warnings.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: {}",
+            path.display(),
+            warnings.join("; ")
+        ))
+    }
+}
+
 /// Try to load a `<stem>.tool.json` manifest next to the `.wasm` file.
 fn load_manifest(wasm_path: &Path) -> Option<ToolSpec> {
     let stem = wasm_path.file_stem()?.to_str()?;
@@ -116,6 +172,10 @@ fn load_manifest(wasm_path: &Path) -> Option<ToolSpec> {
                 Ok(json_str) => {
                     match serde_json::from_str::<ToolManifest>(&json_str) {
                         Ok(manifest) => {
+                            // Validate manifest before accepting.
+                            if let Err(err) = validate_manifest(&manifest, path) {
+                                warn!(%err, ?path, "wasm: tool manifest validation failed");
+                            }
                             debug!(?path, "wasm: loaded tool manifest");
                             let metadata = if let Some(m) = manifest.metadata {
                                 use aigent_tools::SecurityLevel;

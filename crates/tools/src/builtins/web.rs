@@ -9,9 +9,8 @@
 //!
 //! Search results are cached with a configurable TTL to avoid redundant API calls.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,6 +19,7 @@ use scraper::{Html, Selector};
 
 use crate::{Tool, ToolSpec, ToolParam, ToolOutput, ToolMetadata, SecurityLevel};
 use super::fs::truncate_byte_boundary;
+use super::cache::TtlCache;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -33,89 +33,9 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 /// Maximum number of cached search entries.
 const CACHE_MAX_ENTRIES: usize = 64;
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Search Result Cache — LRU with TTL
-// ═══════════════════════════════════════════════════════════════════════════
-
-struct CacheEntry {
-    output: ToolOutput,
-    inserted: Instant,
-}
-
-/// A simple in-memory LRU cache with TTL for search results.
-///
-/// Thread-safe via `Mutex`.  Eviction on insert: removes expired entries first,
-/// then evicts the oldest if still over capacity.
-struct SearchCache {
-    entries: HashMap<String, CacheEntry>,
-    order: VecDeque<String>,  // oldest first
-    max_entries: usize,
-    ttl: Duration,
-}
-
-impl SearchCache {
-    fn new(max_entries: usize, ttl: Duration) -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            max_entries,
-            ttl,
-        }
-    }
-
-    fn get(&mut self, key: &str) -> Option<ToolOutput> {
-        let expired = self.entries
-            .get(key)
-            .map(|e| e.inserted.elapsed() >= self.ttl)
-            .unwrap_or(false);
-
-        if expired {
-            self.entries.remove(key);
-            self.order.retain(|k| k != key);
-            return None;
-        }
-
-        self.entries.get(key).map(|e| e.output.clone())
-    }
-
-    fn insert(&mut self, key: String, output: ToolOutput) {
-        // Remove expired entries.
-        while let Some(oldest_key) = self.order.front() {
-            if let Some(entry) = self.entries.get(oldest_key) {
-                if entry.inserted.elapsed() >= self.ttl {
-                    let k = self.order.pop_front().unwrap();
-                    self.entries.remove(&k);
-                    continue;
-                }
-            }
-            break;
-        }
-
-        // Evict oldest if over capacity.
-        while self.entries.len() >= self.max_entries {
-            if let Some(k) = self.order.pop_front() {
-                self.entries.remove(&k);
-            } else {
-                break;
-            }
-        }
-
-        // Remove existing entry if present (to refresh position).
-        if self.entries.contains_key(&key) {
-            self.order.retain(|k| k != &key);
-        }
-
-        self.order.push_back(key.clone());
-        self.entries.insert(key, CacheEntry {
-            output,
-            inserted: Instant::now(),
-        });
-    }
-}
-
 /// Global search result cache.
-static SEARCH_CACHE: std::sync::LazyLock<Mutex<SearchCache>> =
-    std::sync::LazyLock::new(|| Mutex::new(SearchCache::new(CACHE_MAX_ENTRIES, CACHE_TTL)));
+static SEARCH_CACHE: std::sync::LazyLock<TtlCache> =
+    std::sync::LazyLock::new(|| TtlCache::new(CACHE_MAX_ENTRIES, CACHE_TTL));
 
 /// Cache key: combine query + max_results for uniqueness.
 fn cache_key(query: &str, max_results: usize) -> String {
@@ -185,10 +105,8 @@ impl Tool for WebSearchTool {
 
         // Check cache first.
         let key = cache_key(query, max_results);
-        if let Ok(mut cache) = SEARCH_CACHE.lock() {
-            if let Some(cached) = cache.get(&key) {
-                return Ok(cached.clone());
-            }
+        if let Some(cached) = SEARCH_CACHE.get(&key) {
+            return Ok(cached);
         }
 
         // Resolve credentials from struct fields (config) or env vars.
@@ -246,9 +164,7 @@ impl Tool for WebSearchTool {
         // Cache successful results.
         if let Ok(ref output) = result {
             if output.success {
-                if let Ok(mut cache) = SEARCH_CACHE.lock() {
-                    cache.insert(key, output.clone());
-                }
+                SEARCH_CACHE.insert(key, output.clone());
             }
         }
 

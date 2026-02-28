@@ -1,114 +1,84 @@
-use arboard::Clipboard;
-use chrono::Local;
-use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
-use fuzzy_matcher::FuzzyMatcher;
-use fuzzy_matcher::skim::SkimMatcherV2;
-use ignore::WalkBuilder;
-use ratatui::{
-    Frame,
-    layout::{Constraint, Direction, Layout},
-    text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
-};
-use std::fs;
-use std::path::Path;
+//! Root application orchestrator.
+//!
+//! `App` owns the component tree, the shared [`AppState`], and the
+//! [`BackendEvent`] receiver.  It implements the public API expected by
+//! the CLI host crate and the terminal event loop in `tui.rs`.
+//!
+//! # Architecture (MVU)
+//!
+//! ```text
+//!   AppEvent ──▶ App::update() ──▶ Option<UiCommand>
+//!                     │
+//!                     ▼
+//!              mutate AppState
+//!              dispatch to components
+//!
+//!   App::draw() ──▶ layout::root_layout()
+//!                     │
+//!                ┌────┼────┬────────┬────────┐
+//!             StatusBar  Chat   Sidebar   Input  Footer
+//!                        (+overlays: CommandPalette, FilePicker)
+//! ```
+
+use crossterm::event::{KeyCode, KeyModifiers};
+use ratatui::style::Style;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
+use ratatui::Frame;
 use tokio::sync::mpsc;
-use tracing::debug;
-use tui_textarea::{Input, Key, TextArea};
+use tui_textarea::{Input, Key};
 
 use aigent_config::AppConfig;
 use aigent_runtime::BackendEvent;
 
-use crate::{
-    events::AppEvent,
-    theme::Theme,
-    widgets::{
-        chat::{chat_visual_line_count, draw_chat, message_visual_line_start},
-        input::draw_input,
-        markdown::render_markdown_lines,
-        sidebar::draw_sidebar,
-    },
-};
+use crate::components::chat::ChatPanel;
+use crate::components::command_palette::CommandPalette;
+use crate::components::file_picker::FilePicker;
+use crate::components::footer::Footer;
+use crate::components::input::InputBar;
+use crate::components::sidebar::SidebarPanel;
+use crate::components::status_bar::StatusBar;
+use crate::events::AppEvent;
+use crate::layout;
+use crate::theme::Theme;
+use crate::widgets::markdown::render_markdown_lines;
 
-#[derive(Debug, Clone)]
-pub enum UiCommand {
-    Quit,
-    Submit(String),
-}
+// Re-export state types so `crate::app::UiCommand` etc. keep working
+// (tui.rs and external crates import from this path).
+pub use crate::state::{AppState, Focus, Message, UiCommand};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Focus {
-    Sidebar,
-    Chat,
-    Input,
-}
-
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub role: String,
-    pub content: String,
-    pub rendered_md: Option<Vec<ratatui::text::Line<'static>>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AppState {
-    pub bot_name: String,
-    pub sessions: Vec<String>,
-    pub current_session: usize,
-    pub messages: Vec<Message>,
-    pub status: String,
-    pub memory_peek: Vec<String>,
-    pub selected_message: Option<usize>,
-    pub history_mode: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct FilePopup {
-    pub visible: bool,
-    pub query: String,
-    pub candidates: Vec<String>,
-    pub selected: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct CommandPalette {
-    pub visible: bool,
-    pub selected: usize,
-    pub commands: Vec<&'static str>,
-}
+// ── constants ──────────────────────────────────────────────────
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+// ── App ────────────────────────────────────────────────────────
+
 pub struct App {
+    // ── shared state ───────────────────────────────────────────
     pub state: AppState,
-    pub textarea: TextArea<'static>,
-    /// True while the daemon is formulating a reply.
-    pub is_thinking: bool,
-    /// True while a manual sleep cycle is running in the background.
-    pub is_sleeping: bool,
-    /// Name of the tool currently executing (shown in the spinner header).
-    pub active_tool: Option<String>,
     pub backend_rx: mpsc::UnboundedReceiver<BackendEvent>,
     pub focus: Focus,
     pub theme: Theme,
-    pub scroll: usize,
-    pub max_scroll: usize,
-    pub auto_follow: bool,
-    pub show_sidebar: bool,
-    pub spinner_tick: usize,
+
+    // ── streaming / activity state ─────────────────────────────
+    pub is_thinking: bool,
+    pub is_sleeping: bool,
+    pub active_tool: Option<String>,
     pub pending_stream: String,
-    pub pending_stream_suppressed: bool,
-    pub input_wrap_width: usize,
-    pub workspace_files: Vec<String>,
-    pub file_popup: FilePopup,
+    pub spinner_tick: usize,
+
+    // ── components ─────────────────────────────────────────────
+    pub chat: ChatPanel,
+    pub sidebar: SidebarPanel,
+    pub input: InputBar,
+    pub status_bar: StatusBar,
+    pub footer: Footer,
     pub command_palette: CommandPalette,
+    pub file_picker: FilePicker,
 }
 
 impl App {
     pub fn new(backend_rx: mpsc::UnboundedReceiver<BackendEvent>, config: &AppConfig) -> Self {
-        let mut textarea = TextArea::default();
-        textarea.set_cursor_line_style(Default::default());
-
         Self {
             state: AppState {
                 bot_name: config.agent.name.clone(),
@@ -118,61 +88,38 @@ impl App {
                 status: format!(
                     "model={} provider={}",
                     config.active_model(),
-                    config.llm.provider
+                    config.llm.provider,
                 ),
                 memory_peek: Vec::new(),
                 selected_message: None,
                 history_mode: false,
             },
-            textarea,
             backend_rx,
             focus: Focus::Input,
             theme: Theme::default(),
-            scroll: 0,
-            max_scroll: 0,
-            auto_follow: true,
-            show_sidebar: true,
-            spinner_tick: 0,
             is_thinking: false,
             is_sleeping: false,
             active_tool: None,
             pending_stream: String::new(),
-            pending_stream_suppressed: false,
-            input_wrap_width: 60,
-            workspace_files: collect_workspace_files(Path::new(".")),
-            file_popup: FilePopup {
-                visible: false,
-                query: String::new(),
-                candidates: Vec::new(),
-                selected: 0,
-            },
-            command_palette: CommandPalette {
-                visible: false,
-                selected: 0,
-                commands: vec![
-                    "/new",
-                    "/switch",
-                    "/memory",
-                    "/sleep",
-                    "/dedup",
-                    "/doctor",
-                    "/status",
-                    "/context",
-                    "/tools",
-                    "/model show",
-                    "/model list",
-                    "/exit",
-                ],
-            },
+            spinner_tick: 0,
+            chat: ChatPanel::new(),
+            sidebar: SidebarPanel::new(),
+            input: InputBar::new(),
+            status_bar: StatusBar::new(),
+            footer: Footer::new(),
+            command_palette: CommandPalette::new(),
+            file_picker: FilePicker::new(),
         }
     }
 
+    // ── public helpers (API contract with CLI crate) ───────────
+
     pub fn input_text(&self) -> String {
-        self.textarea.lines().join("\n")
+        self.input.text()
     }
 
     pub fn clear_input(&mut self) {
-        self.textarea = TextArea::default();
+        self.input.clear();
     }
 
     pub fn push_user_message(&mut self, text: String) {
@@ -195,247 +142,6 @@ impl App {
         self.state.status = status.into();
     }
 
-    pub fn update(&mut self, event: AppEvent) -> Option<UiCommand> {
-        match event {
-            AppEvent::Tick => {
-                self.spinner_tick = self.spinner_tick.wrapping_add(1);
-                self.refresh_file_popup();
-                None
-            }
-            AppEvent::Mouse(mouse) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        self.auto_follow = false;
-                        self.scroll = self.scroll.saturating_sub(3);
-                    }
-                    MouseEventKind::ScrollDown => {
-                        self.scroll = self.scroll.saturating_add(3).min(self.max_scroll);
-                        self.auto_follow = self.scroll >= self.max_scroll;
-                    }
-                    _ => {}
-                }
-                None
-            }
-            AppEvent::Resize(_, _) => None,
-            AppEvent::Backend(be) => {
-                self.apply_backend(be);
-                None
-            }
-            AppEvent::Key(key) => {
-                debug!(?key, "ui key event");
-
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    return Some(UiCommand::Quit);
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-                    self.show_sidebar = !self.show_sidebar;
-                    return None;
-                }
-                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
-                    self.command_palette.visible = !self.command_palette.visible;
-                    return None;
-                }
-
-                match key.code {
-                    KeyCode::PageUp => {
-                        self.auto_follow = false;
-                        self.scroll = self.scroll.saturating_sub(5);
-                        return None;
-                    }
-                    KeyCode::PageDown => {
-                        self.scroll = self.scroll.saturating_add(5).min(self.max_scroll);
-                        self.auto_follow = self.scroll >= self.max_scroll;
-                        return None;
-                    }
-                    KeyCode::End => {
-                        self.auto_follow = true;
-                        self.scroll = self.max_scroll;
-                        return None;
-                    }
-                    _ => {}
-                }
-
-                if self.command_palette.visible {
-                    match key.code {
-                        KeyCode::Esc => self.command_palette.visible = false,
-                        KeyCode::Up => {
-                            self.command_palette.selected =
-                                self.command_palette.selected.saturating_sub(1);
-                        }
-                        KeyCode::Down | KeyCode::Tab => {
-                            self.command_palette.selected = (self.command_palette.selected + 1)
-                                .min(self.command_palette.commands.len().saturating_sub(1));
-                        }
-                        KeyCode::Enter => {
-                            if let Some(cmd) = self
-                                .command_palette
-                                .commands
-                                .get(self.command_palette.selected)
-                            {
-                                self.textarea = TextArea::default();
-                                self.textarea.insert_str(cmd);
-                                self.command_palette.visible = false;
-                            }
-                        }
-                        _ => {}
-                    }
-                    return None;
-                }
-
-                if self.file_popup.visible {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.file_popup.visible = false;
-                            return None;
-                        }
-                        KeyCode::Up => {
-                            self.file_popup.selected = self.file_popup.selected.saturating_sub(1);
-                            return None;
-                        }
-                        KeyCode::Down | KeyCode::Tab => {
-                            self.file_popup.selected = (self.file_popup.selected + 1)
-                                .min(self.file_popup.candidates.len().saturating_sub(1));
-                            return None;
-                        }
-                        KeyCode::Enter => {
-                            if let Some(path) =
-                                self.file_popup.candidates.get(self.file_popup.selected)
-                            {
-                                let updated = replace_last_at_token(&self.input_text(), path);
-                                self.clear_input();
-                                self.textarea.insert_str(&updated);
-                                self.file_popup.visible = false;
-                            }
-                            return None;
-                        }
-                        _ => {}
-                    }
-                }
-
-                if self.state.history_mode {
-                    match key.code {
-                        KeyCode::Esc => {
-                            self.state.history_mode = false;
-                            self.state.selected_message = None;
-                            self.auto_follow = true;
-                        }
-                        KeyCode::Up => {
-                            let current = self
-                                .state
-                                .selected_message
-                                .unwrap_or_else(|| self.state.messages.len().saturating_sub(1));
-                            self.state.selected_message = Some(current.saturating_sub(1));
-                            self.auto_follow = false;
-                        }
-                        KeyCode::Down => {
-                            let current = self.state.selected_message.unwrap_or(0);
-                            self.state.selected_message = Some(
-                                (current + 1).min(self.state.messages.len().saturating_sub(1)),
-                            );
-                            self.auto_follow = false;
-                        }
-                        KeyCode::Char('c') => {
-                            if let Some(code) = self.selected_code_block() {
-                                match Clipboard::new().and_then(|mut cb| cb.set_text(code)) {
-                                    Ok(_) => self.push_assistant_message(
-                                        "copied code block to clipboard".to_string(),
-                                    ),
-                                    Err(err) => self
-                                        .push_assistant_message(format!("clipboard error: {err}")),
-                                }
-                            }
-                        }
-                        KeyCode::Char('a') => {
-                            if let Some(code) = self.selected_code_block() {
-                                let dir = Path::new(".aigent").join("snippets");
-                                if let Err(err) = fs::create_dir_all(&dir) {
-                                    self.push_assistant_message(format!("apply error: {err}"));
-                                } else {
-                                    let file_name = format!(
-                                        "applied_{}.txt",
-                                        Local::now().format("%Y%m%d_%H%M%S")
-                                    );
-                                    let path = dir.join(file_name);
-                                    match fs::write(&path, code) {
-                                        Ok(_) => self.push_assistant_message(format!(
-                                            "applied code block to {}",
-                                            path.display()
-                                        )),
-                                        Err(err) => self
-                                            .push_assistant_message(format!("apply error: {err}")),
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                    return None;
-                }
-
-                match key.code {
-                    KeyCode::Esc => {
-                        self.state.history_mode = true;
-                        self.state.selected_message =
-                            Some(self.state.messages.len().saturating_sub(1));
-                        self.auto_follow = false;
-                        None
-                    }
-                    KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
-                        let text = normalize_for_submit(&self.input_text());
-                        if text.is_empty() {
-                            return None;
-                        }
-                        if text == "/exit" {
-                            self.push_assistant_message("session closed".to_string());
-                            self.clear_input();
-                            return Some(UiCommand::Quit);
-                        }
-                        self.push_user_message(text.clone());
-                        self.auto_follow = true;
-                        self.clear_input();
-                        self.state.status = "thinking...".to_string();
-                        Some(UiCommand::Submit(text))
-                    }
-                    _ => {
-                        self.textarea.input(Input {
-                            key: match key.code {
-                                KeyCode::Char(c) => Key::Char(c),
-                                KeyCode::Enter => Key::Enter,
-                                KeyCode::Backspace => Key::Backspace,
-                                KeyCode::Delete => Key::Delete,
-                                KeyCode::Left => Key::Left,
-                                KeyCode::Right => Key::Right,
-                                KeyCode::Up => Key::Up,
-                                KeyCode::Down => Key::Down,
-                                KeyCode::Tab => Key::Tab,
-                                KeyCode::Home => Key::Home,
-                                KeyCode::End => Key::End,
-                                KeyCode::PageUp => Key::PageUp,
-                                KeyCode::PageDown => Key::PageDown,
-                                _ => return None,
-                            },
-                            ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
-                            alt: key.modifiers.contains(KeyModifiers::ALT),
-                            shift: key.modifiers.contains(KeyModifiers::SHIFT),
-                        });
-                        self.apply_input_soft_wrap();
-                        self.refresh_file_popup();
-                        None
-                    }
-                }
-            }
-        }
-    }
-
-    fn apply_input_soft_wrap(&mut self) {
-        let raw = self.input_text();
-        let wrapped = soft_wrap_text(&raw, self.input_wrap_width);
-        if wrapped != raw {
-            self.textarea = TextArea::default();
-            self.textarea.insert_str(&wrapped);
-        }
-    }
-
     pub fn selected_code_block(&self) -> Option<String> {
         let idx = self.state.selected_message?;
         let msg = self.state.messages.get(idx)?;
@@ -445,26 +151,238 @@ impl App {
         extract_first_code_block(&msg.content)
     }
 
+    // ── MVU update ─────────────────────────────────────────────
+
+    pub fn update(&mut self, event: AppEvent) -> Option<UiCommand> {
+        match event {
+            AppEvent::Tick => {
+                self.spinner_tick = self.spinner_tick.wrapping_add(1);
+                None
+            }
+            AppEvent::Backend(be) => {
+                self.apply_backend(be);
+                None
+            }
+            AppEvent::Key(key) => self.handle_key(key),
+            AppEvent::Mouse(mouse) => {
+                use crossterm::event::MouseEventKind;
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.chat.auto_follow = false;
+                        self.chat.scroll = self.chat.scroll.saturating_sub(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.chat.scroll = self
+                            .chat
+                            .scroll
+                            .saturating_add(3)
+                            .min(self.chat.max_scroll);
+                        self.chat.auto_follow = self.chat.scroll >= self.chat.max_scroll;
+                    }
+                    _ => {}
+                }
+                None
+            }
+            AppEvent::Resize(_, _) => None,
+        }
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> Option<UiCommand> {
+        // ── global shortcuts ───────────────────────────────────
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Some(UiCommand::Quit);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.sidebar.visible = !self.sidebar.visible;
+            return None;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
+            self.command_palette.state.visible = !self.command_palette.state.visible;
+            return None;
+        }
+
+        // ── scroll shortcuts ───────────────────────────────────
+        match key.code {
+            KeyCode::PageUp => {
+                self.chat.auto_follow = false;
+                self.chat.scroll = self.chat.scroll.saturating_sub(5);
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.chat.scroll = self
+                    .chat
+                    .scroll
+                    .saturating_add(5)
+                    .min(self.chat.max_scroll);
+                self.chat.auto_follow = self.chat.scroll >= self.chat.max_scroll;
+                return None;
+            }
+            KeyCode::End => {
+                self.chat.auto_follow = true;
+                self.chat.scroll = self.chat.max_scroll;
+                return None;
+            }
+            _ => {}
+        }
+
+        // ── command palette ────────────────────────────────────
+        if self.command_palette.state.visible {
+            match key.code {
+                KeyCode::Esc => self.command_palette.state.visible = false,
+                KeyCode::Up => {
+                    self.command_palette.state.selected =
+                        self.command_palette.state.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.command_palette.state.selected =
+                        (self.command_palette.state.selected + 1)
+                            .min(self.command_palette.state.commands.len().saturating_sub(1));
+                }
+                KeyCode::Enter => {
+                    if let Some(cmd) = self
+                        .command_palette
+                        .state
+                        .commands
+                        .get(self.command_palette.state.selected)
+                    {
+                        self.input.clear();
+                        self.input.textarea.insert_str(cmd);
+                        self.command_palette.state.visible = false;
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // ── history mode ───────────────────────────────────────
+        if self.state.history_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.state.history_mode = false;
+                    self.state.selected_message = None;
+                    self.chat.auto_follow = true;
+                }
+                KeyCode::Up => {
+                    let current = self
+                        .state
+                        .selected_message
+                        .unwrap_or_else(|| self.state.messages.len().saturating_sub(1));
+                    self.state.selected_message = Some(current.saturating_sub(1));
+                    self.chat.auto_follow = false;
+                }
+                KeyCode::Down => {
+                    let current = self.state.selected_message.unwrap_or(0);
+                    self.state.selected_message = Some(
+                        (current + 1).min(self.state.messages.len().saturating_sub(1)),
+                    );
+                    self.chat.auto_follow = false;
+                }
+                KeyCode::Char('c') => {
+                    if let Some(code) = self.selected_code_block() {
+                        match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(code)) {
+                            Ok(_) => self
+                                .push_assistant_message("copied code block to clipboard".into()),
+                            Err(err) => {
+                                self.push_assistant_message(format!("clipboard error: {err}"))
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('a') => {
+                    if let Some(code) = self.selected_code_block() {
+                        let dir = std::path::Path::new(".aigent").join("snippets");
+                        if let Err(err) = std::fs::create_dir_all(&dir) {
+                            self.push_assistant_message(format!("apply error: {err}"));
+                        } else {
+                            let file_name = format!(
+                                "applied_{}.txt",
+                                chrono::Local::now().format("%Y%m%d_%H%M%S")
+                            );
+                            let path = dir.join(file_name);
+                            match std::fs::write(&path, code) {
+                                Ok(_) => self.push_assistant_message(format!(
+                                    "applied code block to {}",
+                                    path.display()
+                                )),
+                                Err(err) => {
+                                    self.push_assistant_message(format!("apply error: {err}"))
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return None;
+        }
+
+        // ── normal input mode ──────────────────────────────────
+        match key.code {
+            KeyCode::Esc => {
+                self.state.history_mode = true;
+                self.state.selected_message =
+                    Some(self.state.messages.len().saturating_sub(1));
+                self.chat.auto_follow = false;
+                None
+            }
+            KeyCode::Enter if !key.modifiers.contains(KeyModifiers::ALT) => {
+                let text = normalize_for_submit(&self.input_text());
+                if text.is_empty() {
+                    return None;
+                }
+                if text == "/exit" {
+                    self.push_assistant_message("session closed".into());
+                    self.clear_input();
+                    return Some(UiCommand::Quit);
+                }
+                self.push_user_message(text.clone());
+                self.chat.auto_follow = true;
+                self.clear_input();
+                self.state.status = "thinking...".to_string();
+                Some(UiCommand::Submit(text))
+            }
+            _ => {
+                // Forward every other key to the textarea widget.
+                self.input.textarea.input(Input {
+                    key: match key.code {
+                        KeyCode::Char(c) => Key::Char(c),
+                        KeyCode::Enter => Key::Enter,
+                        KeyCode::Backspace => Key::Backspace,
+                        KeyCode::Delete => Key::Delete,
+                        KeyCode::Left => Key::Left,
+                        KeyCode::Right => Key::Right,
+                        KeyCode::Up => Key::Up,
+                        KeyCode::Down => Key::Down,
+                        KeyCode::Tab => Key::Tab,
+                        KeyCode::Home => Key::Home,
+                        KeyCode::End => Key::End,
+                        KeyCode::PageUp => Key::PageUp,
+                        KeyCode::PageDown => Key::PageDown,
+                        _ => return None,
+                    },
+                    ctrl: key.modifiers.contains(KeyModifiers::CONTROL),
+                    alt: key.modifiers.contains(KeyModifiers::ALT),
+                    shift: key.modifiers.contains(KeyModifiers::SHIFT),
+                });
+                None
+            }
+        }
+    }
+
+    // ── backend event handling ──────────────────────────────────
+
     fn apply_backend(&mut self, event: BackendEvent) {
         match event {
             BackendEvent::Token(chunk) => {
                 self.pending_stream.push_str(&chunk);
-                // Suppress rendering if the accumulating stream looks like raw
-                // tool JSON — the fallback path will fire ClearStream shortly.
-                if self.pending_stream_suppressed
-                    || self.pending_stream.trim_start().starts_with('{')
-                {
-                    self.pending_stream_suppressed = true;
-                    return;
-                }
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
                         last.content = format!("[stream]{}", self.pending_stream);
                         return;
                     }
                 }
-                // New stream message started — ensure viewport follows.
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
                 self.state.messages.push(Message {
                     role: "assistant".to_string(),
                     content: format!("[stream]{}", self.pending_stream),
@@ -480,7 +398,7 @@ impl App {
                 self.is_sleeping = true;
                 self.is_thinking = false;
                 self.state.status = "sleep cycle running".to_string();
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
                 self.state.messages.push(Message {
                     role: "system".to_string(),
                     content: "Starting sleep cycle\u{2026}".to_string(),
@@ -489,7 +407,7 @@ impl App {
             }
             BackendEvent::SleepProgress(msg) => {
                 self.state.status = format!("sleep: {msg}");
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
                 self.state.messages.push(Message {
                     role: "system".to_string(),
                     content: msg,
@@ -499,7 +417,6 @@ impl App {
             BackendEvent::Done => {
                 self.is_thinking = false;
                 self.is_sleeping = false;
-                self.pending_stream_suppressed = false;
                 self.state.status = "idle".to_string();
                 if let Some(last) = self.state.messages.last_mut() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
@@ -508,8 +425,7 @@ impl App {
                     }
                 }
                 self.pending_stream.clear();
-                // Markdown rendering may expand the message height; re-follow.
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
             }
             BackendEvent::Error(err) => {
                 self.is_thinking = false;
@@ -527,24 +443,31 @@ impl App {
             BackendEvent::ToolCallStart(info) => {
                 self.active_tool = Some(info.name.clone());
                 self.state.status = format!("\u{1f527} {}", info.name);
-                // Show as a dimmed inline transcript entry so the user can
-                // see which tool is running without leaving the chat.
                 self.state.messages.push(Message {
-                    role: "⚙".to_string(),
-                    content: format!("calling {}…", info.name),
+                    role: "\u{2699}".to_string(),
+                    content: format!("calling {}\u{2026}", info.name),
                     rendered_md: None,
                 });
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
             }
             BackendEvent::ToolCallEnd(result) => {
                 self.active_tool = None;
-                // Update the last ⚙ message to reflect the outcome.
-                if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| m.role == "⚙") {
+                if let Some(msg) = self
+                    .state
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.role == "\u{2699}")
+                {
                     msg.content = if result.success {
-                        let snip = safe_truncate_ui(&result.output, 80);
-                        format!("✓ {} — {}", result.name, snip)
+                        let snip = if result.output.len() > 80 {
+                            format!("{}\u{2026}", &result.output[..80])
+                        } else {
+                            result.output.clone()
+                        };
+                        format!("\u{2713} {} \u{2014} {}", result.name, snip)
                     } else {
-                        format!("✗ {} failed", result.name)
+                        format!("\u{2717} {} failed", result.name)
                     };
                 }
                 self.state.status = if result.success {
@@ -552,8 +475,7 @@ impl App {
                 } else {
                     "tool failed".to_string()
                 };
-                // Scroll down to show the updated tool result.
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
             }
             BackendEvent::ExternalTurn { source, content } => {
                 self.state.messages.push(Message {
@@ -562,13 +484,11 @@ impl App {
                     rendered_md: None,
                 });
                 self.pending_stream.clear();
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
             }
             BackendEvent::ReflectionInsight(insight) => {
-                // Trim to a single line for the status bar; long insights are
-                // truncated with an ellipsis so the header stays compact.
                 let display = if insight.len() > 80 {
-                    format!("{}…", &insight[..80])
+                    format!("{}\u{2026}", &insight[..80])
                 } else {
                     insight.clone()
                 };
@@ -576,7 +496,7 @@ impl App {
             }
             BackendEvent::BeliefAdded { claim, confidence } => {
                 let display = if claim.len() > 70 {
-                    format!("{}…", &claim[..70])
+                    format!("{}\u{2026}", &claim[..70])
                 } else {
                     claim.clone()
                 };
@@ -590,12 +510,9 @@ impl App {
                     rendered_md: Some(rendered),
                 });
                 self.pending_stream.clear();
-                self.auto_follow = true;
+                self.chat.auto_follow = true;
             }
             BackendEvent::ClearStream => {
-                // Discard the partially-streamed assistant message (typically
-                // raw tool JSON that leaked before fallback detection kicked in).
-                self.pending_stream_suppressed = false;
                 if let Some(last) = self.state.messages.last() {
                     if last.role == "assistant" && last.content.starts_with("[stream]") {
                         self.state.messages.pop();
@@ -606,360 +523,210 @@ impl App {
         }
     }
 
+    // ── draw ───────────────────────────────────────────────────
+
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
-        self.input_wrap_width = usize::from(frame.area().width.saturating_sub(4)).max(8);
-        self.apply_input_soft_wrap();
-        let input_line_count = self.textarea.lines().len().max(1);
+        let input_line_count = self.input.textarea.lines().len().max(1);
         let input_height = (input_line_count as u16 + 2).clamp(3, 8);
 
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(5),
-                Constraint::Length(input_height),
-                Constraint::Length(1),
-            ])
-            .split(frame.area());
+        let [header_area, middle_area, input_area, footer_area] =
+            layout::root_layout(frame.area(), input_height);
+        let [chat_area, sidebar_area] =
+            layout::middle_layout(middle_area, self.sidebar.visible);
 
+        // ── header ─────────────────────────────────────────────
         let status_display = if self.is_thinking || self.is_sleeping {
-            let frame = SPINNER_FRAMES[self.spinner_tick / 2 % SPINNER_FRAMES.len()];
-            format!("{} {}", frame, self.state.status)
+            let f = SPINNER_FRAMES[self.spinner_tick / 2 % SPINNER_FRAMES.len()];
+            format!("{} {}", f, self.state.status)
         } else {
             self.state.status.clone()
         };
         let header = Paragraph::new(Line::from(format!(
-            "{} • {} • Ctrl+S sidebar • Esc history",
-            self.state.bot_name, status_display
+            " {} \u{2022} {} \u{2022} Ctrl+S sidebar \u{2022} Esc history",
+            self.state.bot_name, status_display,
         )));
-        frame.render_widget(header, outer[0]);
+        frame.render_widget(header, header_area);
 
-        let middle = if self.show_sidebar {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
-                .split(outer[1])
-        } else {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(100), Constraint::Length(0)])
-                .split(outer[1])
-        };
+        // ── chat (temporary inline render — component takes over in Step 2)
+        self.draw_chat_inline(frame, chat_area);
 
+        // ── sidebar ────────────────────────────────────────────
+        if self.sidebar.visible {
+            let sidebar_lines = vec![
+                Line::from("Sessions"),
+                Line::from(format!("  > default")),
+                Line::from(""),
+                Line::from(format!("Messages: {}", self.state.messages.len())),
+            ];
+            let sidebar_widget = Paragraph::new(sidebar_lines).block(
+                Block::default()
+                    .title(" Sidebar ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
+            frame.render_widget(sidebar_widget, sidebar_area);
+        }
+
+        // ── input ──────────────────────────────────────────────
+        self.input.textarea.set_block(
+            Block::default()
+                .title(" Input (Alt+Enter newline) ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        );
+        self.input.textarea.set_style(Style::default());
+        frame.render_widget(&self.input.textarea, input_area);
+
+        // ── footer ─────────────────────────────────────────────
+        let footer = Paragraph::new(Line::from(
+            " Enter send \u{2022} Alt+Enter newline \u{2022} Ctrl+K commands \u{2022} Alt+S select/copy \u{2022} @ file picker \u{2022} Esc history",
+        ));
+        frame.render_widget(footer, footer_area);
+
+        // ── overlays ───────────────────────────────────────────
+        if self.command_palette.state.visible {
+            self.draw_command_palette_inline(frame);
+        }
+    }
+
+    /// Temporary inline chat renderer.  Replaced by `ChatPanel::draw` in Step 2.
+    fn draw_chat_inline(&mut self, frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
+        let bot = self.state.bot_name.clone();
         let selected = if self.state.history_mode {
             self.state.selected_message
         } else {
             None
         };
-        let chat_content_width = middle[0].width.saturating_sub(2);
-        let line_count = chat_visual_line_count(
-            &self.state.messages,
-            &self.theme,
-            selected,
-            &self.state.bot_name,
-            chat_content_width,
-        );
-        let chat_body_height = middle[0].height.saturating_sub(2) as usize;
-        self.max_scroll = line_count.saturating_sub(chat_body_height);
-        if self.state.history_mode {
-            if let Some(selected_message) = self.state.selected_message {
-                let selected_start = message_visual_line_start(
-                    &self.state.messages,
-                    &self.theme,
-                    &self.state.bot_name,
-                    selected_message,
-                    chat_content_width,
-                );
-                self.scroll = selected_start.min(self.max_scroll);
-            }
-        }
-        if self.auto_follow {
-            self.scroll = self.max_scroll;
-        } else {
-            self.scroll = self.scroll.min(self.max_scroll);
-        }
 
-        draw_chat(
-            frame,
-            middle[0],
-            &self.state.messages,
-            &self.theme,
-            selected,
-            &self.state.bot_name,
-            self.scroll,
-        );
-
-        if self.show_sidebar {
-            draw_sidebar(frame, middle[1], &self.state, &self.theme);
-        }
-
-        draw_input(frame, outer[2], &mut self.textarea);
-
-        if self.file_popup.visible {
-            let area = centered_popup(frame.area(), 70, 45);
-            frame.render_widget(Clear, area);
-            let mut lines = vec![Line::from(Span::styled(
-                format!("@{}", self.file_popup.query),
-                ratatui::style::Style::default().fg(self.theme.muted),
-            ))];
-            lines.push(Line::from(""));
-            if self.file_popup.candidates.is_empty() {
-                lines.push(Line::from("(no matches)"));
+        let mut chat_lines: Vec<Line<'static>> = Vec::new();
+        for (idx, msg) in self.state.messages.iter().enumerate() {
+            let is_selected = selected == Some(idx);
+            let accent = self.theme.accent;
+            let prefix_style = if is_selected {
+                Style::default().fg(accent).bg(self.theme.muted)
             } else {
-                for (idx, item) in self.file_popup.candidates.iter().enumerate() {
-                    let style = if idx == self.file_popup.selected {
-                        ratatui::style::Style::default()
-                            .fg(self.theme.background)
-                            .bg(self.theme.accent)
-                    } else {
-                        ratatui::style::Style::default().fg(self.theme.foreground)
-                    };
-                    lines.push(Line::from(Span::styled(item.clone(), style)));
+                Style::default().fg(accent)
+            };
+            let body_style = if is_selected {
+                Style::default().fg(self.theme.foreground).bg(self.theme.muted)
+            } else {
+                Style::default().fg(self.theme.foreground)
+            };
+
+            if let Some(streaming) = msg.content.strip_prefix("[stream]") {
+                chat_lines.push(Line::from(vec![
+                    Span::styled(format!("{}> ", bot), prefix_style),
+                    Span::raw(streaming.to_string()),
+                ]));
+            } else if msg.role == "user" {
+                chat_lines.push(Line::from(vec![
+                    Span::styled("you> ", prefix_style),
+                    Span::styled(msg.content.clone(), body_style),
+                ]));
+            } else if msg.role == "\u{2699}" {
+                let tool_style = Style::default().fg(self.theme.muted);
+                chat_lines.push(Line::from(vec![
+                    Span::styled("  ", tool_style),
+                    Span::styled(msg.content.clone(), tool_style),
+                ]));
+            } else if msg.role == "system" {
+                let sys_style = Style::default()
+                    .fg(self.theme.muted)
+                    .add_modifier(ratatui::style::Modifier::ITALIC);
+                chat_lines.push(Line::from(Span::styled(
+                    format!("  {}", msg.content),
+                    sys_style,
+                )));
+            } else if msg.role == "assistant" || msg.role == "aigent" {
+                if let Some(ref rendered) = msg.rendered_md {
+                    if let Some(first) = rendered.first() {
+                        chat_lines.push(Line::from(vec![
+                            Span::styled(format!("{}> ", bot), prefix_style),
+                            Span::raw(first.to_string()),
+                        ]));
+                        for extra in rendered.iter().skip(1) {
+                            chat_lines.push(extra.clone());
+                        }
+                    }
+                } else {
+                    chat_lines.push(Line::from(vec![
+                        Span::styled(format!("{}> ", bot), prefix_style),
+                        Span::styled(msg.content.clone(), body_style),
+                    ]));
                 }
+            } else {
+                // External source
+                chat_lines.push(Line::from(vec![
+                    Span::styled(format!("{}> ", msg.role), prefix_style),
+                    Span::styled(msg.content.clone(), body_style),
+                ]));
             }
-            let widget = Paragraph::new(lines)
-                .block(
-                    Block::default()
-                        .title(" File Context ")
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded),
-                )
-                .wrap(Wrap { trim: false });
-            frame.render_widget(widget, area);
+            chat_lines.push(Line::from(""));
         }
 
-        if self.command_palette.visible {
-            let area = centered_popup(frame.area(), 60, 40);
-            frame.render_widget(Clear, area);
-            let lines = self
-                .command_palette
-                .commands
-                .iter()
-                .enumerate()
-                .map(|(idx, command)| {
-                    if idx == self.command_palette.selected {
-                        Line::from(Span::styled(
-                            (*command).to_string(),
-                            ratatui::style::Style::default()
-                                .fg(self.theme.background)
-                                .bg(self.theme.accent),
-                        ))
-                    } else {
-                        Line::from((*command).to_string())
-                    }
-                })
-                .collect::<Vec<_>>();
-            let widget = Paragraph::new(lines).block(
+        let chat_body_height = area.height.saturating_sub(2) as usize;
+        let total_lines = chat_lines.len();
+        self.chat.max_scroll = total_lines.saturating_sub(chat_body_height);
+        if self.chat.auto_follow {
+            self.chat.scroll = self.chat.max_scroll;
+        } else {
+            self.chat.scroll = self.chat.scroll.min(self.chat.max_scroll);
+        }
+
+        let chat_widget = Paragraph::new(chat_lines)
+            .block(
                 Block::default()
-                    .title(" Commands ")
+                    .title(" Chat ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
-            );
-            frame.render_widget(widget, area);
-        }
-
-        let footer = Paragraph::new(Line::from(
-            "Enter send • Alt+Enter newline • Ctrl+K commands • Alt+S select/copy • @ file picker • history: Esc/Up/Down",
-        ));
-        frame.render_widget(footer, outer[3]);
+            )
+            .scroll((self.chat.scroll as u16, 0))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(chat_widget, area);
     }
 
-    fn refresh_file_popup(&mut self) {
-        let input = self.input_text();
-        let Some(query) = active_at_query(&input) else {
-            self.file_popup.visible = false;
-            self.file_popup.query.clear();
-            self.file_popup.candidates.clear();
-            self.file_popup.selected = 0;
-            return;
-        };
-
-        self.file_popup.visible = true;
-        self.file_popup.query = query.to_string();
-        if query.is_empty() {
-            self.file_popup.candidates = self.workspace_files.iter().take(8).cloned().collect();
-            self.file_popup.selected = 0;
-            return;
-        }
-
-        let matcher = SkimMatcherV2::default();
-        let mut scored = self
-            .workspace_files
+    /// Temporary inline command palette renderer.
+    fn draw_command_palette_inline(&self, frame: &mut Frame<'_>) {
+        let area = layout::centered_popup(frame.area(), 60, 40);
+        frame.render_widget(ratatui::widgets::Clear, area);
+        let lines = self
+            .command_palette
+            .state
+            .commands
             .iter()
-            .filter_map(|path| {
-                matcher
-                    .fuzzy_match(path, query)
-                    .map(|score| (score, path.clone()))
+            .enumerate()
+            .map(|(idx, command)| {
+                if idx == self.command_palette.state.selected {
+                    Line::from(Span::styled(
+                        (*command).to_string(),
+                        Style::default()
+                            .fg(self.theme.background)
+                            .bg(self.theme.accent),
+                    ))
+                } else {
+                    Line::from((*command).to_string())
+                }
             })
             .collect::<Vec<_>>();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-        self.file_popup.candidates = scored.into_iter().take(8).map(|(_, p)| p).collect();
-        self.file_popup.selected = 0;
+        let widget = Paragraph::new(lines).block(
+            Block::default()
+                .title(" Commands ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        );
+        frame.render_widget(widget, area);
     }
 }
 
-fn soft_wrap_text(input: &str, width: usize) -> String {
-    let width = width.max(8);
-    input
-        .lines()
-        .map(|line| soft_wrap_line(line, width))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn soft_wrap_line(line: &str, width: usize) -> String {
-    if line.chars().count() <= width {
-        return line.to_string();
-    }
-
-    let mut out = String::new();
-    let mut current = String::new();
-
-    for word in line.split_whitespace() {
-        let current_len = current.chars().count();
-        let word_len = word.chars().count();
-        if current_len == 0 {
-            if word_len <= width {
-                current.push_str(word);
-            } else {
-                for chunk in split_hard(word, width) {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&chunk);
-                }
-            }
-            continue;
-        }
-
-        if current_len + 1 + word_len <= width {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&current);
-            current.clear();
-
-            if word_len <= width {
-                current.push_str(word);
-            } else {
-                for chunk in split_hard(word, width) {
-                    if !out.is_empty() {
-                        out.push('\n');
-                    }
-                    out.push_str(&chunk);
-                }
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&current);
-    }
-
-    if out.is_empty() {
-        line.to_string()
-    } else {
-        out
-    }
-}
-
-fn split_hard(input: &str, width: usize) -> Vec<String> {
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for ch in input.chars() {
-        current.push(ch);
-        if current.chars().count() >= width {
-            chunks.push(current);
-            current = String::new();
-        }
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
-}
+// ── free helpers ───────────────────────────────────────────────
 
 fn normalize_for_submit(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn collect_workspace_files(root: &Path) -> Vec<String> {
-    let mut files = Vec::new();
-    for entry in WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .build()
-    {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else {
-            continue;
-        };
-        files.push(rel.display().to_string());
-    }
-    files.sort();
-    files
-}
-
-fn active_at_query(input: &str) -> Option<&str> {
-    let token = input.split_whitespace().last()?;
-    if !token.starts_with('@') {
-        return None;
-    }
-    Some(token.trim_start_matches('@'))
-}
-
-fn replace_last_at_token(input: &str, replacement: &str) -> String {
-    let end = input.len();
-    let start = input
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| ch.is_whitespace())
-        .map(|(idx, ch)| idx + ch.len_utf8())
-        .unwrap_or(0);
-
-    if !input[start..end].starts_with('@') {
-        return input.to_string();
-    }
-
-    let mut out = input.to_string();
-    out.replace_range(start..end, &format!("@{} ", replacement));
-    out
-}
-
-fn centered_popup(area: ratatui::layout::Rect, w_pct: u16, h_pct: u16) -> ratatui::layout::Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - h_pct) / 2),
-            Constraint::Percentage(h_pct),
-            Constraint::Percentage((100 - h_pct) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - w_pct) / 2),
-            Constraint::Percentage(w_pct),
-            Constraint::Percentage((100 - w_pct) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
 pub fn extract_first_code_block(message: &str) -> Option<String> {
     let mut in_code = false;
     let mut buf = Vec::new();
-
     for line in message.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
@@ -973,22 +740,9 @@ pub fn extract_first_code_block(message: &str) -> Option<String> {
             buf.push(line);
         }
     }
-
     if buf.is_empty() {
         None
     } else {
         Some(buf.join("\n"))
-    }
-}
-
-/// Truncate `text` to at most `max_chars` characters, appending `…` when cut.
-/// Safe for multi-byte UTF-8 — counts characters, not bytes.
-fn safe_truncate_ui(text: &str, max_chars: usize) -> String {
-    let mut chars = text.chars();
-    let taken: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{taken}…")
-    } else {
-        taken
     }
 }

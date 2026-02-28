@@ -481,7 +481,7 @@ pub fn default_registry(
     search_providers: Vec<String>,
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
-        CalendarAddEventTool, DraftEmailTool, GitRollbackTool, ReadFileTool, RemindMeTool,
+        BrowsePageTool, CalendarAddEventTool, DraftEmailTool, GitRollbackTool, ReadFileTool, RemindMeTool,
         RunShellTool, WebBrowseTool, WebSearchTool, WriteFileTool, FetchPageTool,
     };
 
@@ -557,6 +557,10 @@ pub fn default_registry(
         (
             "git_rollback",
             Box::new(GitRollbackTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "browse_page",
+            Box::new(BrowsePageTool),
         ),
     ];
 

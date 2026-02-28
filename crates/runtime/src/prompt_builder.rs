@@ -256,7 +256,11 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
             The markers are your contract: if they are present, the data IS present.\n\
          10. For git operations, ALWAYS prefer `perform_gait` over `run_shell git …`. \
              `perform_gait` is safer (enforces write boundaries), faster (in-process), \
-             and more expressive. Use run_shell only if gait lacks the needed action."
+             and more expressive. Use run_shell only if gait lacks the needed action.\n\
+         11. When synthesizing information from multiple tool results, clearly attribute \
+             which source each fact comes from.\n\
+         12. If a tool call fails or returns an error, acknowledge the failure honestly \
+             and suggest an alternative approach."
     );
 
     if tool_specs.is_empty() {
@@ -273,10 +277,32 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
                     .params
                     .iter()
                     .map(|p| {
-                        format!(
-                            "\"{}\" ({}){}", p.name, p.description,
-                            if p.required { " *required" } else { "" },
-                        )
+                        let mut parts = vec![format!("\"{}\" ({}", p.name, p.description)];
+                        // Show param_type only when it's not the default (String)
+                        if p.param_type != aigent_tools::ParamType::String {
+                            let ty = match p.param_type {
+                                aigent_tools::ParamType::Number  => "number",
+                                aigent_tools::ParamType::Integer => "integer",
+                                aigent_tools::ParamType::Boolean => "boolean",
+                                aigent_tools::ParamType::Array   => "array",
+                                aigent_tools::ParamType::Object  => "object",
+                                aigent_tools::ParamType::String  => unreachable!(),
+                            };
+                            parts.push(format!(", {ty}"));
+                        }
+                        // Show allowed enum values if present
+                        if !p.enum_values.is_empty() {
+                            parts.push(format!(", values: {}", p.enum_values.join("|")));
+                        }
+                        // Show default if present
+                        if let Some(ref default) = p.default {
+                            parts.push(format!(", default: \"{default}\""));
+                        }
+                        parts.push(")".to_string());
+                        if p.required {
+                            parts.push(" *required".to_string());
+                        }
+                        parts.concat()
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -286,6 +312,18 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
+    let tool_selection_guide = "\
+TOOL SELECTION GUIDE:\n\
+\u{2022} For quick factual lookups (prices, weather, dates, stats) \u{2192} web_search (includes structured data from top results)\n\
+\u{2022} For reading full articles, docs, or pages \u{2192} browse_page (supports batch URLs, structured extraction)\n\
+\u{2022} For deep research tasks \u{2192} web_search first, then browse_page on the most relevant URLs\n\
+\u{2022} browse_page supports modes: \"markdown\" (default, preserves structure), \"text\" (plain), \"structured\" (metadata + content)\n\
+\u{2022} Prefer the fewest tool calls needed. Do not re-search what\u{2019}s already in context.";
+
+    let reflection_nudge = "After receiving tool results, SYNTHESIZE them into a coherent, \
+well-structured answer. Do not merely repeat tool output verbatim \u{2014} add context, \
+highlight key findings, and organize information logically for the user.";
+
     format!(
         "\n\nAVAILABLE TOOLS (handled automatically — do NOT output raw JSON):\n\
          {list}\n\
@@ -293,7 +331,9 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
          appears in the prompt below, use it directly. You do NOT need to \
          invoke tools yourself — they are managed externally. Never output \
          raw JSON like {{\"tool\":...}} in your response.\n\n\
-         {grounding}"
+         {tool_selection_guide}\n\n\
+         {grounding}\n\n\
+         {reflection_nudge}"
     )
 }
 

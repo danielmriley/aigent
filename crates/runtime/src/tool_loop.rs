@@ -9,6 +9,7 @@
 //! the model doesn't support native tool calling.
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -46,6 +47,8 @@ pub struct ToolExecution {
     pub args: HashMap<String, serde_json::Value>,
     pub success: bool,
     pub output: String,
+    /// Wall-clock duration of the tool invocation in milliseconds.
+    pub duration_ms: u64,
 }
 
 /// Run the structured tool calling loop.
@@ -185,7 +188,9 @@ async fn execute_tool_calls(
             let args = call.function.arguments.clone();
             async move {
                 let string_args = json_value_to_string_map(&args);
+                let start = Instant::now();
                 let result = executor.execute(registry, &tool_name, &string_args).await;
+                let duration_ms = start.elapsed().as_millis() as u64;
                 let (success, output) = match result {
                     Ok(ref o) => (o.success, o.output.clone()),
                     Err(ref e) => (false, e.to_string()),
@@ -202,6 +207,7 @@ async fn execute_tool_calls(
                         .unwrap_or_default(),
                     success,
                     output,
+                    duration_ms,
                 }
             }
         })
@@ -215,6 +221,7 @@ async fn execute_tool_calls(
             name: exec.tool_name.clone(),
             success: exec.success,
             output: exec.output.clone(),
+            duration_ms: exec.duration_ms,
         };
         if let Some(tx) = event_tx {
             let _ = tx.send(BackendEvent::ToolCallEnd(result_event));

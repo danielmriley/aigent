@@ -11,6 +11,9 @@ pub struct ToolResult {
     pub name: String,
     pub success: bool,
     pub output: String,
+    /// Wall-clock duration of the tool invocation in milliseconds.
+    #[serde(default)]
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
