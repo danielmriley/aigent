@@ -12,11 +12,38 @@ use crate::theme::Theme;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Cached visual metrics to avoid recomputing line widths every frame.
+struct VisCache {
+    msg_count: usize,
+    last_content_len: usize,
+    selected: Option<usize>,
+    width: usize,
+    visual_total: usize,
+    /// Visual (wrapped) line offset for each message start index.
+    msg_visual_offsets: Vec<usize>,
+}
+
+impl VisCache {
+    fn matches(
+        &self,
+        msg_count: usize,
+        last_content_len: usize,
+        selected: Option<usize>,
+        width: usize,
+    ) -> bool {
+        self.msg_count == msg_count
+            && self.last_content_len == last_content_len
+            && self.selected == selected
+            && self.width == width
+    }
+}
+
 /// Scroll and viewport state for the chat panel.
 pub struct ChatPanel {
     pub scroll: usize,
     pub max_scroll: usize,
     pub auto_follow: bool,
+    vis_cache: Option<VisCache>,
 }
 
 impl Default for ChatPanel {
@@ -31,6 +58,7 @@ impl ChatPanel {
             scroll: 0,
             max_scroll: 0,
             auto_follow: true,
+            vis_cache: None,
         }
     }
 
@@ -58,28 +86,54 @@ impl ChatPanel {
         // ── scroll bookkeeping ──────────────────────────────────
         let chat_body_height = area.height.saturating_sub(2) as usize;
         let content_width = area.width.saturating_sub(2) as usize;
-        let visual_lines: usize = chat_lines
-            .iter()
-            .map(|line| {
-                let chars = line.to_string().chars().count().max(1);
-                chars.div_ceil(content_width.max(1))
-            })
-            .sum();
+        let last_content_len = state
+            .messages
+            .last()
+            .map_or(0, |m| m.content.len());
 
-        self.max_scroll = visual_lines.saturating_sub(chat_body_height);
+        // Use cached visual metrics when nothing changed.
+        let cache_hit = self
+            .vis_cache
+            .as_ref()
+            .map_or(false, |c| {
+                c.matches(
+                    state.messages.len(),
+                    last_content_len,
+                    selected,
+                    content_width,
+                )
+            });
+
+        if !cache_hit {
+            let cw = content_width.max(1);
+            // Use Line::width() — no allocation, unlike .to_string().chars().count().
+            let heights: Vec<usize> = chat_lines
+                .iter()
+                .map(|line| line.width().max(1).div_ceil(cw))
+                .collect();
+            let visual_total: usize = heights.iter().sum();
+            let msg_visual_offsets: Vec<usize> = msg_starts
+                .iter()
+                .map(|&start| heights[..start].iter().sum())
+                .collect();
+            self.vis_cache = Some(VisCache {
+                msg_count: state.messages.len(),
+                last_content_len,
+                selected,
+                width: content_width,
+                visual_total,
+                msg_visual_offsets,
+            });
+        }
+
+        let vis = self.vis_cache.as_ref().unwrap();
+        self.max_scroll = vis.visual_total.saturating_sub(chat_body_height);
 
         // In history mode, scroll to selected message.
         if state.history_mode {
             if let Some(sel_idx) = state.selected_message {
-                if let Some(&logical_start) = msg_starts.get(sel_idx) {
-                    let visual_start: usize = chat_lines[..logical_start]
-                        .iter()
-                        .map(|line| {
-                            let chars = line.to_string().chars().count().max(1);
-                            chars.div_ceil(content_width.max(1))
-                        })
-                        .sum();
-                    self.scroll = visual_start.min(self.max_scroll);
+                if let Some(&offset) = vis.msg_visual_offsets.get(sel_idx) {
+                    self.scroll = offset.min(self.max_scroll);
                 }
             }
         }
@@ -197,10 +251,16 @@ fn build_chat_lines(
         else if msg.role == "assistant" || msg.role == "aigent" {
             if let Some(ref rendered) = msg.rendered_md {
                 if let Some(first) = rendered.first() {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{assistant_label}> "), prefix_style),
-                        Span::styled(first.to_string(), body_style),
-                    ]));
+                    // Preserve markdown styling from the rendered first line
+                    // instead of flattening with .to_string().
+                    let mut first_spans =
+                        Vec::with_capacity(1 + first.spans.len());
+                    first_spans.push(Span::styled(
+                        format!("{assistant_label}> "),
+                        prefix_style,
+                    ));
+                    first_spans.extend(first.spans.iter().cloned());
+                    lines.push(Line::from(first_spans));
                     for extra in rendered.iter().skip(1) {
                         lines.push(extra.clone());
                     }

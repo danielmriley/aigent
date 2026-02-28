@@ -228,6 +228,12 @@ fn parse_inline_spans(text: &str) -> Line<'static> {
 }
 
 // ── syntect-powered code highlighting ──────────────────────────
+
+/// Maximum source lines to syntax-highlight per code block.  Beyond
+/// this threshold, remaining lines render as plain dimmed text to
+/// avoid blocking the UI on very large blocks.
+const MAX_HIGHLIGHT_LINES: usize = 150;
+
 fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
     let ss = syntax_set();
     let syntax = if lang.is_empty() {
@@ -247,18 +253,32 @@ fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
         Style::default().fg(Color::DarkGray),
     )));
 
-    for src_line in LinesWithEndings::from(code) {
+    let gutter = Span::styled(" │ ", Style::default().fg(Color::DarkGray));
+
+    for (line_no, src_line) in LinesWithEndings::from(code).enumerate() {
+        // Past the highlight cap — render plain dimmed text (much cheaper).
+        if line_no >= MAX_HIGHLIGHT_LINES {
+            lines.push(Line::from(vec![
+                gutter.clone(),
+                Span::styled(
+                    src_line.trim_end_matches('\n').to_string(),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]));
+            continue;
+        }
+
         let Ok(ranges) = h.highlight_line(src_line, ss) else {
             // fallback: plain dimmed text
             lines.push(Line::from(vec![
-                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                gutter.clone(),
                 Span::raw(src_line.trim_end_matches('\n').to_string()),
             ]));
             continue;
         };
 
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(ranges.len() + 1);
-        spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        spans.push(gutter.clone());
 
         for (style, fragment) in ranges {
             let fg = syntect_to_ratatui_color(style.foreground);
