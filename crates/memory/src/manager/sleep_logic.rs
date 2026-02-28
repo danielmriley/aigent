@@ -210,6 +210,44 @@ impl MemoryManager {
             ).await?;
         }
 
+        // Non-Core memory retirements (Episodic/Semantic/Reflective/Procedural).
+        // Delete outright from store + event log so entry counts stay bounded.
+        if !insights.retire_memory_ids.is_empty() {
+            let retire_ids: Vec<uuid::Uuid> = self
+                .store
+                .all()
+                .iter()
+                .filter(|e| {
+                    e.tier != MemoryTier::Core
+                        && e.tier != MemoryTier::UserProfile
+                        && insights
+                            .retire_memory_ids
+                            .iter()
+                            .any(|prefix| e.id.to_string().starts_with(prefix.as_str()))
+                })
+                .map(|e| e.id)
+                .collect();
+            if !retire_ids.is_empty() {
+                let id_set: std::collections::HashSet<uuid::Uuid> =
+                    retire_ids.iter().copied().collect();
+                let removed = self.store.retain(|e| !id_set.contains(&e.id));
+                if let Some(log) = &self.event_log {
+                    let kept = log
+                        .load()
+                        .await?
+                        .into_iter()
+                        .filter(|ev| !id_set.contains(&ev.entry.id))
+                        .collect::<Vec<_>>();
+                    log.overwrite(&kept).await?;
+                }
+                info!(
+                    requested = insights.retire_memory_ids.len(),
+                    removed,
+                    "non-Core memory retirement applied"
+                );
+            }
+        }
+
         // Core rewrites: retire old entry + record rewritten version
         for (id_prefix, new_content) in &insights.rewrite_core {
             retire_core_by_prefix(

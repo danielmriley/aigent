@@ -200,6 +200,11 @@ pub struct AgenticSleepInsights {
     /// `"sleep:retired"` so they are excluded from future context assembly
     /// but remain in the event log for audit.
     pub retire_core_ids: Vec<String>,
+    /// Short IDs of Episodic / Semantic / Reflective / Procedural entries
+    /// that the LLM considers redundant, mundane, or fully consolidated
+    /// into higher-tier memories.  These are **deleted outright** from the
+    /// store and event log to keep active entry counts bounded.
+    pub retire_memory_ids: Vec<String>,
     /// Core entry rewrites: `(id_short, new_content)`. Each rewrite is run
     /// through the consistency firewall before it is committed.
     pub rewrite_core: Vec<(String, String)>,
@@ -281,8 +286,10 @@ pub fn agentic_sleep_prompt(
                 MemoryTier::Procedural => 300,
                 _ => 200,
             };
+            let id_short = &e.id.to_string()[..8];
             format!(
-                "  [{:?}] {} :: {}",
+                "  [{}] [{:?}] {} :: {}",
+                id_short,
                 e.tier,
                 e.created_at.format("%Y-%m-%d %H:%M"),
                 truncate_str(&e.content, max_len)
@@ -398,6 +405,8 @@ GOAL_ADD: <one new long-term goal to pursue based on patterns you noticed today,
 VALENCE: <id_short :: score> (correct the emotional tone of one important memory to a value in [-1.0, 1.0]; use sparingly — only when the emotional significance was clearly wrong or missed, or NONE)
 PROMOTE: <id_short :: target_tier> (promote an existing entry to a higher tier: Semantic, Procedural, Reflective, UserProfile, or Core; use when an entry has proven its lasting value, or NONE)
 PROMOTE: <optionally promote additional entries, or omit>
+RETIRE: <id_short> (delete a redundant, mundane, or fully-consolidated Episodic/Semantic/Reflective/Procedural entry — use aggressively to prune entries whose information has been absorbed into higher-tier memories, or NONE)
+RETIRE: <optionally retire additional entries, or omit>
 MEMORY: <tier :: content :: tags> (create any new memory that doesn't fit the fields above; tier is one of Episodic/Semantic/Procedural/Reflective/UserProfile/Core; tags are comma-separated labels like 'agent_belief,opinion' or 'user_fact,preference' or 'relationship,dynamic'; this is your creative freedom to form any memory you want, or NONE)
 MEMORY: <optionally create additional memories, or omit>
 
@@ -536,6 +545,13 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
                     }
                 }
             }
+        } else if let Some(rest) = strip_key(line, "RETIRE:") {
+            if !is_none(rest) {
+                let id_short = rest.split_whitespace().next().unwrap_or("").to_string();
+                if !id_short.is_empty() {
+                    insights.retire_memory_ids.push(id_short);
+                }
+            }
         } else if let Some(rest) = strip_key(line, "MEMORY:") {
             if !is_none(rest) {
                 // Format: "tier :: content :: tags"
@@ -564,6 +580,7 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
         profile_updates = insights.user_profile_updates.len(),
         contradictions = insights.contradictions.len(),
         retire_core = insights.retire_core_ids.len(),
+        retire_memory = insights.retire_memory_ids.len(),
         rewrite_core = insights.rewrite_core.len(),
         consolidate_core = insights.consolidate_core.len(),
         tool_insights = insights.tool_insights.len(),
@@ -651,6 +668,8 @@ PROFILE_UPDATE: language_preference :: Rust
 PROFILE_UPDATE: project :: Rust web service
 CONTRADICTION: Earlier memory says user prefers Python but today they mentioned Rust.
 RETIRE_CORE: abcd1234
+RETIRE: 11112222
+RETIRE: 33334444
 REWRITE_CORE: ef567890 :: I am Aigent, always concise and truth-seeking.
 CONSOLIDATE_CORE: abcd1234,ef567890 :: Aigent is concise, truth-seeking, and deeply helpful.
 TOOL_INSIGHT: The user frequently requests shell commands; pre-check workspace safety settings.
@@ -669,6 +688,9 @@ VALENCE: abcd1234 :: 0.8
         assert_eq!(insights.contradictions.len(), 1);
         assert_eq!(insights.retire_core_ids.len(), 1);
         assert_eq!(insights.retire_core_ids[0], "abcd1234");
+        assert_eq!(insights.retire_memory_ids.len(), 2);
+        assert_eq!(insights.retire_memory_ids[0], "11112222");
+        assert_eq!(insights.retire_memory_ids[1], "33334444");
         assert_eq!(insights.rewrite_core.len(), 1);
         assert_eq!(insights.rewrite_core[0].0, "ef567890");
         assert_eq!(insights.consolidate_core.len(), 1);

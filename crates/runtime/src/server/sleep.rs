@@ -139,9 +139,9 @@ pub(super) fn spawn_passive_distillation(
 pub(super) fn spawn_nightly_consolidation(
     state: Arc<Mutex<DaemonState>>,
     shutdown_tx: &watch::Sender<bool>,
-    sleep_quiet_start: u32,
-    sleep_quiet_end: u32,
-    sleep_tz: Tz,
+    default_quiet_start: u32,
+    default_quiet_end: u32,
+    default_tz: Tz,
 ) {
     let mut rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
@@ -157,9 +157,29 @@ pub(super) fn spawn_nightly_consolidation(
                 }
             }
 
+            // ── Dynamic quiet-window resolution ──────────────────────
+            // Read timezone and quiet-window hours from UserProfile
+            // entries (written during onboarding).  Fall back to the
+            // config defaults if the profile hasn't been populated yet.
+            let (sleep_tz, sleep_quiet_start, sleep_quiet_end) = {
+                let s = state.lock().await;
+                let tz = profile_tz(&s.memory, default_tz);
+                let (qs, qe) = profile_quiet_window(
+                    &s.memory,
+                    default_quiet_start,
+                    default_quiet_end,
+                );
+                (tz, qs, qe)
+            };
+
             // Time-of-day guard: only consolidate in the quiet window.
             if !is_in_window(Utc::now(), sleep_tz, sleep_quiet_start, sleep_quiet_end) {
-                debug!("nightly consolidation: outside quiet window, skipping");
+                debug!(
+                    tz = %sleep_tz,
+                    start = sleep_quiet_start,
+                    end = sleep_quiet_end,
+                    "nightly consolidation: outside quiet window, skipping"
+                );
                 continue;
             }
 
@@ -454,4 +474,95 @@ pub(super) fn spawn_vault_watcher_task(
             }
         }
     });
+}
+
+
+// ── Profile-based quiet window helpers ───────────────────────────────────────
+
+/// Read the user's IANA timezone from `UserProfile` entries, falling back to
+/// `default_tz` if nothing is found or the value doesn't parse.
+///
+/// Looks for profile entries whose source contains `timezone` or whose content
+/// starts with `timezone:`.
+fn profile_tz(memory: &aigent_memory::MemoryManager, default_tz: Tz) -> Tz {
+    for e in memory.all().iter().rev() {
+        if e.tier != aigent_memory::MemoryTier::UserProfile {
+            continue;
+        }
+        let low = e.content.to_lowercase();
+        let src_low = e.source.to_lowercase();
+        if low.starts_with("timezone:") || src_low.contains("timezone") {
+            let val = e
+                .content
+                .splitn(2, ':')
+                .nth(1)
+                .unwrap_or(&e.content)
+                .trim();
+            if let Ok(tz) = val.parse::<Tz>() {
+                return tz;
+            }
+        }
+    }
+    default_tz
+}
+
+/// Read the user's preferred quiet-window hours from `UserProfile` entries.
+///
+/// Scans for entries whose source or content contains the keys
+/// `sleep_start` / `sleep_end` (or `quiet_start` / `quiet_end`).
+/// Returns `(start_hour, end_hour)` falling back to config defaults.
+fn profile_quiet_window(
+    memory: &aigent_memory::MemoryManager,
+    default_start: u32,
+    default_end: u32,
+) -> (u32, u32) {
+    let mut start: Option<u32> = None;
+    let mut end: Option<u32> = None;
+
+    for e in memory.all().iter().rev() {
+        if e.tier != aigent_memory::MemoryTier::UserProfile {
+            continue;
+        }
+        let low = e.content.to_lowercase();
+        let src_low = e.source.to_lowercase();
+
+        let is_start = src_low.contains("sleep_start")
+            || src_low.contains("quiet_start")
+            || low.starts_with("sleep_start_hour:")
+            || low.starts_with("quiet_start:");
+        let is_end = src_low.contains("sleep_end")
+            || src_low.contains("quiet_end")
+            || low.starts_with("sleep_end_hour:")
+            || low.starts_with("quiet_end:");
+
+        if is_start && start.is_none() {
+            if let Some(val) = extract_trailing_u32(&e.content) {
+                if val < 24 {
+                    start = Some(val);
+                }
+            }
+        }
+        if is_end && end.is_none() {
+            if let Some(val) = extract_trailing_u32(&e.content) {
+                if val < 24 {
+                    end = Some(val);
+                }
+            }
+        }
+        if start.is_some() && end.is_some() {
+            break;
+        }
+    }
+
+    (start.unwrap_or(default_start), end.unwrap_or(default_end))
+}
+
+/// Extract a trailing integer from a "key: value" or "key :: value" string.
+fn extract_trailing_u32(s: &str) -> Option<u32> {
+    let val_str = s
+        .splitn(2, "::")
+        .nth(1)
+        .or_else(|| s.splitn(2, ':').nth(1))?
+        .trim();
+    val_str.parse().ok()
 }

@@ -264,10 +264,16 @@ pub fn specialist_prompt(
     let role_framing = match role {
         SpecialistRole::Archivist => format!(
             "You are the Archivist aspect of {bot_name}'s sleeping mind.\n\
-Your role: assess factual durability. Which memories contain facts worth keeping \
-long-term? Which are redundant, superseded, or too vague to be useful? You are not \
-making emotional judgments — only factual ones.\n\
-Focus on: LEARNED, PROFILE_UPDATE, SYNTHESIZE, RETIRE_CORE, CONSOLIDATE_CORE, TOOL_INSIGHT. \
+Your role: assess factual durability AND aggressively prune redundant memories. \
+Which memories contain facts worth keeping long-term? Which are redundant, superseded, \
+trivial, or fully consolidated into higher-tier entries? You are not making emotional \
+judgments — only factual ones.\n\
+CRITICAL: after each sleep cycle, Episodic/Semantic entries accumulate unboundedly. \
+Use RETIRE liberally to delete entries whose content has been absorbed into Semantic, \
+Reflective, or Core entries. Delete mundane turn-by-turn conversation noise, duplicate \
+facts, and any entry whose value is now captured by a SYNTHESIZE, LEARNED, or MEMORY \
+output. Aim to retire at least 30-50% of stale Episodic entries per cycle.\n\
+Focus on: LEARNED, PROFILE_UPDATE, SYNTHESIZE, RETIRE_CORE, CONSOLIDATE_CORE, TOOL_INSIGHT, RETIRE. \
 Use NONE for fields outside your role."
         ),
         SpecialistRole::Psychologist => format!(
@@ -285,10 +291,12 @@ Use NONE for fields outside your role."
         ),
         SpecialistRole::Strategist => format!(
             "You are the Strategist aspect of {bot_name}'s sleeping mind.\n\
-Your role: plan future action. What should {bot_name} do differently? What follow-ups \
-matter? What behavioural patterns should be reinforced or changed? What new long-term \
-goals have emerged?\n\
-Focus on: FOLLOW_UP, REFLECT, GOAL_ADD, TOOL_INSIGHT, SYNTHESIZE, REINFORCE. \
+Your role: plan future action AND trim forward-looking noise. What should {bot_name} \
+do differently? What follow-ups matter? What behavioural patterns should be reinforced \
+or changed? What new long-term goals have emerged?\n\
+Use RETIRE to clean up old follow-up entries, stale reflections, and Episodic entries \
+that no longer inform future planning.\n\
+Focus on: FOLLOW_UP, REFLECT, GOAL_ADD, TOOL_INSIGHT, SYNTHESIZE, REINFORCE, RETIRE. \
 Use NONE for fields outside your role."
         ),
         SpecialistRole::Critic => format!(
@@ -360,7 +368,9 @@ Your decisions must reflect the accumulated identity shown at the top of this pr
 Where specialists agree, honour their consensus. Where they conflict, use your judgment \
 as {bot_name} to decide what best serves {user_name} and your long-term relationship. \
 Produce a single final answer using the structured format below. Be conservative with \
-Core mutations — only retire or rewrite when multiple specialists agree."
+Core mutations — only retire or rewrite when multiple specialists agree. \
+However, be AGGRESSIVE with RETIRE for non-Core entries: delete Episodic and Semantic \
+entries that have been consolidated, are redundant, or contain mundane conversation noise."
     );
 
     let response_format = response_format_instructions(bot_name, user_name);
@@ -420,6 +430,7 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
     let mut reflective_seen: std::collections::HashSet<String> = Default::default();
     let mut contradictions_seen: std::collections::HashSet<String> = Default::default();
     let mut retire_seen: std::collections::HashSet<String> = Default::default();
+    let mut retire_memory_seen: std::collections::HashSet<String> = Default::default();
     let mut tool_insights_seen: std::collections::HashSet<String> = Default::default();
     let mut synthesis_seen: std::collections::HashSet<String> = Default::default();
     let mut relationship_seen: std::collections::HashSet<String> = Default::default();
@@ -523,6 +534,13 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
             }
         }
 
+        // retire_memory_ids: dedup by id_short
+        for id in insight.retire_memory_ids {
+            if retire_memory_seen.insert(id.to_lowercase()) {
+                merged.retire_memory_ids.push(id);
+            }
+        }
+
         // Scalars: keep last Some
         if insight.personality_reinforcement.is_some() {
             merged.personality_reinforcement = insight.personality_reinforcement;
@@ -563,8 +581,10 @@ fn format_memory_block(entries: &[MemoryEntry]) -> String {
                 MemoryTier::Procedural => 300,
                 _ => 200,
             };
+            let id_short = &e.id.to_string()[..8];
             format!(
-                "  [{:?}] {} :: {}",
+                "  [{}] [{:?}] {} :: {}",
+                id_short,
                 e.tier,
                 e.created_at.format("%Y-%m-%d %H:%M"),
                 truncate_str(&e.content, max_len)
@@ -634,6 +654,8 @@ GOAL_ADD: <one new long-term goal to pursue based on patterns you noticed today,
 VALENCE: <id_short :: score> (correct the emotional tone of one important memory to a value in [-1.0, 1.0]; use sparingly — only when the emotional significance was clearly wrong or missed, or NONE)\n\
 PROMOTE: <id_short :: target_tier> (promote an existing entry to a higher tier: Semantic, Procedural, Reflective, UserProfile, or Core; use when an entry has proven its lasting value, or NONE)\n\
 PROMOTE: <optionally promote additional entries, or omit>\n\
+RETIRE: <id_short> (delete a redundant, mundane, or fully-consolidated Episodic/Semantic/Reflective/Procedural entry — use aggressively to prune entries whose information has been absorbed into higher-tier memories, or NONE)\n\
+RETIRE: <optionally retire additional entries, or omit>\n\
 MEMORY: <tier :: content :: tags> (create any new memory that doesn't fit the fields above; tier is one of Episodic/Semantic/Procedural/Reflective/UserProfile/Core; tags are comma-separated labels like 'agent_belief,opinion' or 'user_fact,preference' or 'relationship,dynamic'; this is your creative freedom to form any memory you want, or NONE)\n\
 MEMORY: <optionally create additional memories, or omit>\n\n\
 Remember: you are {bot_name} — truth-seeking, proactive, deeply caring about {user_name}. \
