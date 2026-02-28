@@ -110,6 +110,7 @@ fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
         approval_exempt_tools: config.safety.approval_exempt_tools.clone(),
         git_auto_commit: config.tools.git_auto_commit,
         sandbox_enabled: config.tools.sandbox_enabled,
+        max_calls_per_tool: config.safety.max_calls_per_tool.unwrap_or(25),
         max_security_level: parse_security_level(&config.safety.max_security_level),
         tool_overrides: config.safety.tool_overrides.clone(),
     }
@@ -225,12 +226,22 @@ pub async fn run_unified_daemon(
         let u = &config.tools.searxng_base_url;
         if u.is_empty() { None } else { Some(u.clone()) }
     };
+    let serper_api_key = {
+        let k = &config.tools.serper_api_key;
+        if k.is_empty() { None } else { Some(k.clone()) }
+    };
+    let exa_api_key = {
+        let k = &config.tools.exa_api_key;
+        if k.is_empty() { None } else { Some(k.clone()) }
+    };
     let tool_registry = aigent_exec::default_registry(
         workspace_root,
         agent_data_dir,
         brave_api_key,
         tavily_api_key,
         searxng_base_url,
+        serper_api_key,
+        exa_api_key,
         config.tools.search_providers.clone(),
     );
     let tool_executor = ToolExecutor::new(policy);

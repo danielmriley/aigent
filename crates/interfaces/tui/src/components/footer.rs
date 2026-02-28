@@ -11,6 +11,12 @@ use crate::theme::Theme;
 /// Footer component showing keyboard shortcut hints.
 pub struct Footer;
 
+impl Default for Footer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Footer {
     pub fn new() -> Self {
         Self

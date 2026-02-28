@@ -44,6 +44,10 @@ pub struct ExecutionPolicy {
     /// Requires the `sandbox` Cargo feature to be compiled in, otherwise
     /// this field has no effect.
     pub sandbox_enabled: bool,
+    /// Maximum number of times any single tool may be called per
+    /// conversation/session.  Acts as a safety guard against infinite
+    /// tool-call loops.  `0` means unlimited.
+    pub max_calls_per_tool: usize,
     /// Maximum security level allowed for tool execution.
     /// Tools with `metadata.security_level` above this threshold are denied.
     /// Default: `SecurityLevel::High` (permits everything).
@@ -68,9 +72,12 @@ impl Default for ExecutionPolicy {
                 "remind_me".to_string(),
                 "draft_email".to_string(),
                 "web_search".to_string(),
+                "browse_page".to_string(),
+                "fetch_page".to_string(),
             ],
             git_auto_commit: false,
             sandbox_enabled: true,
+            max_calls_per_tool: 25,
             max_security_level: SecurityLevel::High,
             tool_overrides: HashMap::new(),
         }
@@ -111,6 +118,8 @@ pub fn approval_channel() -> (ApprovalSender, ApprovalReceiver) {
 pub struct ToolExecutor {
     policy: ExecutionPolicy,
     approval_tx: Option<ApprovalSender>,
+    /// Per-tool invocation counter for rate-limiting within a session.
+    call_counts: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>,
 }
 
 impl ToolExecutor {
@@ -118,6 +127,7 @@ impl ToolExecutor {
         Self {
             policy,
             approval_tx: None,
+            call_counts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -125,6 +135,12 @@ impl ToolExecutor {
     pub fn with_approval(mut self, tx: ApprovalSender) -> Self {
         self.approval_tx = Some(tx);
         self
+    }
+
+    /// Reset per-tool call counters.  Call this when starting a new
+    /// conversation/session to allow tools to be invoked again.
+    pub fn reset_call_counts(&self) {
+        self.call_counts.lock().unwrap().clear();
     }
 
     /// Execute a tool by name from the registry, applying safety policy.
@@ -144,6 +160,21 @@ impl ToolExecutor {
         // 2. Enforce capability gates (deny-list / allow-list / shell guard / security level)
         self.check_capability(registry, tool_name, &metadata)?;
 
+        // 2b. Per-tool rate limit
+        if self.policy.max_calls_per_tool > 0 {
+            let count = {
+                let counts = self.call_counts.lock().unwrap();
+                *counts.get(tool_name).unwrap_or(&0)
+            };
+            if count >= self.policy.max_calls_per_tool {
+                bail!(
+                    "tool '{}' has reached its per-session rate limit ({} calls)",
+                    tool_name,
+                    self.policy.max_calls_per_tool
+                );
+            }
+        }
+
         // 3. Approval flow — governed by ApprovalMode + metadata
         if self.requires_approval(tool_name, &metadata) {
             let approved = self.request_approval(tool_name, args, &metadata).await?;
@@ -156,7 +187,13 @@ impl ToolExecutor {
             }
         }
 
-        // 4. Run the tool
+        // 4. Increment rate-limit counter.
+        {
+            let mut counts = self.call_counts.lock().unwrap();
+            *counts.entry(tool_name.to_string()).or_insert(0) += 1;
+        }
+
+        // 5. Run the tool
         info!(tool = tool_name, "executing tool");
 
         // For run_shell with the `sandbox` feature active we spawn the child
@@ -478,6 +515,8 @@ pub fn default_registry(
     brave_api_key: Option<String>,
     tavily_api_key: Option<String>,
     searxng_base_url: Option<String>,
+    serper_api_key: Option<String>,
+    exa_api_key: Option<String>,
     search_providers: Vec<String>,
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
@@ -535,6 +574,8 @@ pub fn default_registry(
                 brave_api_key: brave_api_key.clone(),
                 tavily_api_key: tavily_api_key.clone(),
                 searxng_base_url: searxng_base_url.clone(),
+                serper_api_key: serper_api_key.clone(),
+                exa_api_key: exa_api_key.clone(),
                 search_providers: search_providers.clone(),
             }),
         ),
@@ -773,7 +814,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, None, None, vec![]);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, None, None, None, None, vec![]);
 
         let mut args = HashMap::new();
         args.insert("command".to_string(), "echo hi".to_string());
@@ -801,7 +842,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, None, None, vec![]);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, None, None, None, None, vec![]);
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), "hello.txt".to_string());
@@ -824,7 +865,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, None, None, vec![]);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, None, None, None, None, vec![]);
 
         let result = executor
             .execute(&registry, "nonexistent_tool", &HashMap::new())

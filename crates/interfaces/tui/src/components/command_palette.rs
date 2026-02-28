@@ -14,6 +14,12 @@ pub struct CommandPalette {
     pub state: CommandPaletteState,
 }
 
+impl Default for CommandPalette {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommandPalette {
     pub fn new() -> Self {
         Self {

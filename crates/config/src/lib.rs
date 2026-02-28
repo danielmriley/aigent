@@ -266,6 +266,10 @@ pub struct SafetyConfig {
     #[serde(default = "default_max_security_level")]
     pub max_security_level: String,
     /// Per-tool policy overrides keyed by tool name.
+    /// Maximum number of times any single tool may be called per session.
+    /// `0` means unlimited.  Default: 25.
+    #[serde(default)]
+    pub max_calls_per_tool: Option<usize>,
     #[serde(default)]
     pub tool_overrides: std::collections::HashMap<String, ToolPolicyOverride>,
 }
@@ -303,6 +307,7 @@ impl Default for SafetyConfig {
                 "fetch_page".to_string(),
             ],
             max_security_level: "high".to_string(),
+            max_calls_per_tool: None,
             tool_overrides: std::collections::HashMap::new(),
         }
     }

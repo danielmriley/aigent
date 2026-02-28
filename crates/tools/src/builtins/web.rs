@@ -57,6 +57,10 @@ pub struct WebSearchTool {
     pub tavily_api_key: Option<String>,
     /// SearXNG instance base URL (e.g. "http://localhost:8080").
     pub searxng_base_url: Option<String>,
+    /// Serper (Google Search) API key.
+    pub serper_api_key: Option<String>,
+    /// Exa.ai API key for semantic/neural search.
+    pub exa_api_key: Option<String>,
     /// Provider priority order.  Default: ["brave", "tavily", "searxng", "duckduckgo"]
     pub search_providers: Vec<String>,
 }
@@ -125,10 +129,20 @@ impl Tool for WebSearchTool {
             .clone()
             .filter(|u| !u.trim().is_empty())
             .or_else(|| std::env::var("SEARXNG_BASE_URL").ok().filter(|u| !u.trim().is_empty()));
+        let serper_key: Option<String> = self
+            .serper_api_key
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| std::env::var("SERPER_API_KEY").ok().filter(|k| !k.trim().is_empty()));
+        let exa_key: Option<String> = self
+            .exa_api_key
+            .clone()
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| std::env::var("EXA_API_KEY").ok().filter(|k| !k.trim().is_empty()));
 
         // Try providers in configured priority order.
         let providers = if self.search_providers.is_empty() {
-            vec!["brave".to_string(), "tavily".to_string(), "searxng".to_string(), "duckduckgo".to_string()]
+            vec!["brave".to_string(), "tavily".to_string(), "serper".to_string(), "exa".to_string(), "searxng".to_string(), "duckduckgo".to_string()]
         } else {
             self.search_providers.clone()
         };
@@ -144,6 +158,16 @@ impl Tool for WebSearchTool {
                     "tavily" => {
                         if let Some(ref key) = tavily_key {
                             break 'provider search_tavily(query, max_results, key).await;
+                        }
+                    }
+                    "serper" => {
+                        if let Some(ref key) = serper_key {
+                            break 'provider search_serper(query, max_results, key).await;
+                        }
+                    }
+                    "exa" => {
+                        if let Some(ref key) = exa_key {
+                            break 'provider search_exa(query, max_results, key).await;
                         }
                     }
                     "searxng" => {
@@ -713,6 +737,186 @@ async fn search_searxng(
     Ok(ToolOutput {
         success: true,
         output,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Serper (Google Search) — via serper.dev API
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn search_serper(
+    query: &str,
+    max_results: usize,
+    api_key: &str,
+) -> Result<ToolOutput> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    let payload = serde_json::json!({
+        "q": query,
+        "num": max_results
+    });
+
+    let resp = client
+        .post("https://google.serper.dev/search")
+        .header("X-API-KEY", api_key)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Serper API error {}: {}", status, body);
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let mut parts: Vec<String> = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
+
+    // Answer box (direct answer from Google).
+    if let Some(ab) = json.get("answerBox") {
+        let answer = ab.get("answer")
+            .or_else(|| ab.get("snippet"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let title = ab.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        if !answer.is_empty() {
+            parts.push(format!("[Answer Box] {title}\n  {answer}"));
+        }
+    }
+
+    // Knowledge graph.
+    if let Some(kg) = json.get("knowledgeGraph") {
+        let title = kg.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let desc = kg.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        if !title.is_empty() && !desc.is_empty() {
+            let mut kg_text = format!("[Knowledge Graph] {title}\n  {desc}");
+            if let Some(attrs) = kg.get("attributes").and_then(|v| v.as_object()) {
+                for (k, v) in attrs.iter().take(5) {
+                    if let Some(val) = v.as_str() {
+                        kg_text.push_str(&format!("\n  {k}: {val}"));
+                    }
+                }
+            }
+            parts.push(kg_text);
+        }
+    }
+
+    // Organic results.
+    if let Some(results) = json.get("organic").and_then(|v| v.as_array()) {
+        for item in results.iter().take(max_results) {
+            let title = item["title"].as_str().unwrap_or("").trim();
+            let link = item["link"].as_str().unwrap_or("").trim();
+            let snippet = item["snippet"].as_str().unwrap_or("").trim();
+            let position = item["position"].as_u64().unwrap_or(0);
+            if !title.is_empty() {
+                parts.push(format!("{title} (#{position})\n  {link}\n  {snippet}"));
+                if link.starts_with("http") {
+                    urls.push(link.to_string());
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Ok(ToolOutput {
+            success: true,
+            output: format!("No Serper results for: {query}"),
+        });
+    }
+
+    // Enrich top results with structured data.
+    let enrichment = enrich_with_structured_data(&urls, 2).await;
+    let mut output = parts.join("\n\n");
+    if !enrichment.is_empty() {
+        output.push_str("\n\n--- Data extracted from top results ---\n");
+        output.push_str(&enrichment);
+    }
+
+    Ok(ToolOutput {
+        success: true,
+        output,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Exa.ai — neural / semantic web search
+// ═══════════════════════════════════════════════════════════════════════════
+
+async fn search_exa(
+    query: &str,
+    max_results: usize,
+    api_key: &str,
+) -> Result<ToolOutput> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let payload = serde_json::json!({
+        "query": query,
+        "numResults": max_results,
+        "type": "auto",
+        "useAutoprompt": true,
+        "contents": {
+            "text": {
+                "maxCharacters": 1000
+            }
+        }
+    });
+
+    let resp = client
+        .post("https://api.exa.ai/search")
+        .header("Authorization", format!("Bearer {api_key}"))
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Exa.ai API error {}: {}", status, body);
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(results) = json.get("results").and_then(|v| v.as_array()) {
+        for item in results.iter().take(max_results) {
+            let title = item["title"].as_str().unwrap_or("").trim();
+            let url = item["url"].as_str().unwrap_or("").trim();
+            let text = item["text"].as_str().unwrap_or("").trim();
+            let score = item["score"].as_f64().unwrap_or(0.0);
+            let published = item["publishedDate"].as_str().unwrap_or("");
+            if !title.is_empty() {
+                let mut entry = format!("{title} (relevance: {score:.2})");
+                if !published.is_empty() {
+                    entry.push_str(&format!(" [published: {published}]"));
+                }
+                entry.push_str(&format!("\n  {url}"));
+                if !text.is_empty() {
+                    // Truncate text to ~500 chars for conciseness.
+                    let snippet = if text.len() > 500 { &text[..500] } else { text };
+                    entry.push_str(&format!("\n  {snippet}"));
+                }
+                parts.push(entry);
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Ok(ToolOutput {
+            success: true,
+            output: format!("No Exa results for: {query}"),
+        });
+    }
+
+    Ok(ToolOutput {
+        success: true,
+        output: parts.join("\n\n"),
     })
 }
 

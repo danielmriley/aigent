@@ -14,6 +14,12 @@ pub struct SidebarPanel {
     pub visible: bool,
 }
 
+impl Default for SidebarPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SidebarPanel {
     pub fn new() -> Self {
         Self { visible: true }

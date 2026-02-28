@@ -14,6 +14,12 @@ pub struct InputBar {
     pub wrap_width: usize,
 }
 
+impl Default for InputBar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InputBar {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();

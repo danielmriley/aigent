@@ -19,6 +19,12 @@ pub struct ChatPanel {
     pub auto_follow: bool,
 }
 
+impl Default for ChatPanel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChatPanel {
     pub fn new() -> Self {
         Self {
@@ -29,6 +35,7 @@ impl ChatPanel {
     }
 
     /// Render the chat panel.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         frame: &mut Frame<'_>,

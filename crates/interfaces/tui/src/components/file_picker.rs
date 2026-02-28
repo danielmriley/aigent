@@ -19,6 +19,12 @@ pub struct FilePicker {
     pub workspace_files: Vec<String>,
 }
 
+impl Default for FilePicker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FilePicker {
     pub fn new() -> Self {
         Self {

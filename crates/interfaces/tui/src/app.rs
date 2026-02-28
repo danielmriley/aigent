@@ -534,10 +534,10 @@ impl App {
                     .find(|m| m.role == "\u{2699}")
                 {
                     msg.content = if result.success {
-                        let snip = if result.output.len() > 80 {
+                        let snip = if result.output.chars().count() > 80 {
                             format!(
                                 "{}\u{2026}",
-                                &result.output[..80]
+                                truncate_chars(&result.output, 80)
                             )
                         } else {
                             result.output.clone()
@@ -567,16 +567,16 @@ impl App {
                 self.chat.auto_follow = true;
             }
             BackendEvent::ReflectionInsight(insight) => {
-                let display = if insight.len() > 80 {
-                    format!("{}\u{2026}", &insight[..80])
+                let display = if insight.chars().count() > 80 {
+                    format!("{}\u{2026}", truncate_chars(&insight, 80))
                 } else {
                     insight.clone()
                 };
                 self.state.status = format!("\u{1f4a1} {}", display);
             }
             BackendEvent::BeliefAdded { claim, confidence } => {
-                let display = if claim.len() > 70 {
-                    format!("{}\u{2026}", &claim[..70])
+                let display = if claim.chars().count() > 70 {
+                    format!("{}\u{2026}", truncate_chars(&claim, 70))
                 } else {
                     claim.clone()
                 };
@@ -666,6 +666,14 @@ impl App {
 }
 
 // ── free helpers ───────────────────────────────────────────────
+
+/// Truncate string at a char boundary, returning at most `max_chars` characters.
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
 
 fn normalize_for_submit(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")

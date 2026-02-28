@@ -60,7 +60,10 @@ tool_allowlist = []
 tool_denylist = []
 # Tools that bypass interactive approval even when approval_required = true.
 # The four safe built-in tools are exempt by default.
-approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search"]
+approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search", "browse_page", "fetch_page"]
+# Maximum number of times any single tool may be called per session.
+# 0 = unlimited.  Default: 25.
+# max_calls_per_tool = 25
 # Maximum security level allowed for any tool.  Tools above this level are
 # blocked outright.  Values: "low", "medium", "high".  Default: "high".
 max_security_level = "high"
@@ -121,10 +124,18 @@ tavily_api_key = ""
 # Example: "http://localhost:8080"
 searxng_base_url = ""
 
+# Serper (Google Search) API key.  Uses the Google Search API via serper.dev.
+# Get a key at https://serper.dev
+serper_api_key = ""
+
+# Exa.ai API key for semantic/neural web search.
+# Get a key at https://exa.ai
+exa_api_key = ""
+
 # Ordered list of search providers to try.  The agent tries each in order and
 # returns results from the first that succeeds.
-# Available: "brave", "tavily", "searxng", "duckduckgo"
-search_providers = ["brave", "tavily", "searxng", "duckduckgo"]
+# Available: "brave", "tavily", "serper", "exa", "searxng", "duckduckgo"
+search_providers = ["brave", "tavily", "serper", "exa", "searxng", "duckduckgo"]
 
 
 log_level = "info"
