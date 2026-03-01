@@ -19,7 +19,7 @@ pub use client::DaemonClient;
 pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, SleepStatusPayload, ServerEvent};
 pub use events::{BackendEvent, ToolCallInfo, ToolResult};
 pub use react_loop::{ReactConfig, ReactLoopResult, SubAgentResult};
-pub use scheduler::{ScheduledTask, SchedulerState, spawn_scheduler};
+pub use scheduler::{ScheduledTask, SchedulerState, TaskSchedule, spawn_scheduler};
 pub use runtime::{AgentRuntime, ConversationTurn, SleepGenerationResult};
 pub use server::run_unified_daemon;
 pub use tool_loop::{ToolLoopResult, ToolExecution, run_tool_loop, build_tools_json};

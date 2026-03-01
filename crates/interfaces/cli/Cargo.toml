@@ -9,6 +9,8 @@ default = []
 candle = ["aigent-llm/candle"]
 qdrant = ["aigent-memory/qdrant"]
 tui-advanced = ["aigent-ui/advanced"]
+uutils = ["aigent-exec/uutils"]
+marketplace = ["aigent-exec/marketplace"]
 
 [dependencies]
 anyhow.workspace = true

@@ -2,27 +2,112 @@
 //!
 //! Extends the existing proactive loop with a generic scheduler that can
 //! manage multiple named tasks with independent intervals, DND windows,
-//! and cooldowns.
+//! cooldowns, and **cron expressions**.
 //!
-//! Built on top of `tokio::time` — no external cron library needed.
+//! Supports two scheduling modes:
+//! - **Interval**: fixed `Duration` between runs (original mode)
+//! - **Cron**: standard 6-field cron expressions via the `cron` crate
+//!   (`sec min hour day-of-month month day-of-week`)
+//!
+//! Built on top of `tokio::time` with the `cron` crate for expression parsing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use cron::Schedule as CronSchedule;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-// ── Configuration ──────────────────────────────────────────────────────────────
+// ── Schedule type ────────────────────────────────────────────────────────────
+
+/// How a task's timing is determined.
+#[derive(Debug, Clone)]
+pub enum TaskSchedule {
+    /// Fixed interval between runs.
+    Interval(Duration),
+    /// Cron expression (6-field: sec min hour dom month dow).
+    ///
+    /// Example: `"0 */15 * * * *"` = every 15 minutes.
+    Cron(CronSchedule),
+}
+
+impl TaskSchedule {
+    /// Parse a cron expression string.
+    ///
+    /// Accepts standard 6-field cron syntax:
+    /// ```text
+    /// sec  min  hour  day-of-month  month  day-of-week
+    /// 0    */5  *     *             *      *
+    /// ```
+    pub fn cron(expr: &str) -> Result<Self, cron::error::Error> {
+        let schedule: CronSchedule = expr.parse()?;
+        Ok(Self::Cron(schedule))
+    }
+
+    /// Create a fixed-interval schedule.
+    pub fn interval(d: Duration) -> Self {
+        Self::Interval(d)
+    }
+
+    /// Check if the task is due given the last run time.
+    ///
+    /// For interval-based tasks, returns true if `now - last_run >= interval`.
+    /// For cron-based tasks, returns true if there is a scheduled occurrence
+    /// between `last_run` and `now`.
+    pub fn is_due(&self, last_run: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::Interval(d) => {
+                match last_run {
+                    None => true, // Never run before.
+                    Some(last) => {
+                        let elapsed = (now - last).to_std().unwrap_or(Duration::ZERO);
+                        elapsed >= *d
+                    }
+                }
+            }
+            Self::Cron(schedule) => {
+                let after = last_run.unwrap_or_else(|| now - chrono::Duration::hours(1));
+                // Check if there's at least one upcoming occurrence between
+                // `after` and `now`.
+                schedule
+                    .after(&after)
+                    .take(1)
+                    .any(|next| next <= now)
+            }
+        }
+    }
+
+    /// For interval-based tasks, return the interval in seconds.
+    /// For cron-based tasks, estimate the minimum gap.
+    pub fn min_interval_secs(&self) -> u64 {
+        match self {
+            Self::Interval(d) => d.as_secs().max(10),
+            Self::Cron(schedule) => {
+                // Sample the next two occurrences to estimate the gap.
+                let _now = Utc::now();
+                let mut upcoming = schedule.upcoming(Utc).take(2);
+                if let (Some(a), Some(b)) = (upcoming.next(), upcoming.next()) {
+                    let gap = (b - a).num_seconds().unsigned_abs();
+                    gap.max(10)
+                } else {
+                    60 // Fallback.
+                }
+            }
+        }
+    }
+}
+
+// ── Configuration ────────────────────────────────────────────────────────────
 
 /// A single scheduled task definition.
 #[derive(Debug, Clone)]
 pub struct ScheduledTask {
     /// Unique task name (e.g. `"sleep-cycle"`, `"proactive"`, `"embedding-backfill"`).
     pub name: String,
-    /// How often to run the task.
-    pub interval: Duration,
+    /// How & when to run the task.
+    pub schedule: TaskSchedule,
     /// Minimum time between executions (cooldown).
     pub cooldown: Duration,
     /// Do-not-disturb window: `(start_hour, end_hour)` in 24h format.
@@ -33,15 +118,30 @@ pub struct ScheduledTask {
 }
 
 impl ScheduledTask {
-    /// Create a new task with the given name and interval.
+    /// Create a new task with the given name and fixed interval.
     pub fn new(name: impl Into<String>, interval: Duration) -> Self {
         Self {
             name: name.into(),
-            interval,
+            schedule: TaskSchedule::Interval(interval),
             cooldown: Duration::ZERO,
             dnd_window: None,
             enabled: true,
         }
+    }
+
+    /// Create a new task from a cron expression.
+    ///
+    /// ```rust,ignore
+    /// ScheduledTask::from_cron("nightly-cleanup", "0 0 3 * * *")?;
+    /// ```
+    pub fn from_cron(name: impl Into<String>, cron_expr: &str) -> Result<Self, cron::error::Error> {
+        Ok(Self {
+            name: name.into(),
+            schedule: TaskSchedule::cron(cron_expr)?,
+            cooldown: Duration::ZERO,
+            dnd_window: None,
+            enabled: true,
+        })
     }
 
     /// Set the cooldown period.
@@ -61,9 +161,17 @@ impl ScheduledTask {
         self.enabled = enabled;
         self
     }
+
+    /// Backward-compatible accessor: approximate interval as Duration.
+    pub fn interval(&self) -> Duration {
+        match &self.schedule {
+            TaskSchedule::Interval(d) => *d,
+            TaskSchedule::Cron(_) => Duration::from_secs(self.schedule.min_interval_secs()),
+        }
+    }
 }
 
-// ── Runtime state ──────────────────────────────────────────────────────────────
+// ── Runtime state ────────────────────────────────────────────────────────────
 
 /// Per-task execution state.
 #[derive(Debug, Clone)]
@@ -144,7 +252,7 @@ impl Default for SchedulerState {
     }
 }
 
-// ── Scheduler ──────────────────────────────────────────────────────────────────
+// ── Scheduler ────────────────────────────────────────────────────────────────
 
 /// The heartbeat callback type.  The scheduler calls this function for each
 /// task that is due.  The function receives the task name and should return
@@ -158,6 +266,8 @@ pub type HeartbeatFn = Arc<
 /// Spawn a scheduler loop that periodically checks which tasks are due and
 /// invokes the heartbeat callback for each one.
 ///
+/// Supports both fixed-interval and cron-expression tasks.
+///
 /// Returns a `JoinHandle` that can be aborted to stop the scheduler.
 pub fn spawn_scheduler(
     tasks: Vec<ScheduledTask>,
@@ -170,7 +280,7 @@ pub fn spawn_scheduler(
         let tick = tasks
             .iter()
             .filter(|t| t.enabled)
-            .map(|t| t.interval.as_secs().max(10))
+            .map(|t| t.schedule.min_interval_secs())
             .fold(60u64, gcd);
         let tick = Duration::from_secs(tick.clamp(10, 60));
 
@@ -209,13 +319,14 @@ pub fn spawn_scheduler(
                     continue;
                 }
 
-                // Interval check.
+                // Check if the task is due (works for both interval and cron).
+                if !task.schedule.is_due(task_state.last_run, now) {
+                    continue;
+                }
+
+                // Cooldown check.
                 if let Some(last) = task_state.last_run {
                     let elapsed = (now - last).to_std().unwrap_or(Duration::ZERO);
-                    if elapsed < task.interval {
-                        continue;
-                    }
-                    // Cooldown check.
                     if elapsed < task.cooldown {
                         debug!(task = %task.name, "skipping — cooldown");
                         continue;
@@ -265,7 +376,7 @@ fn gcd(a: u64, b: u64) -> u64 {
 // Bring Timelike into scope for .hour()
 use chrono::Timelike;
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -300,10 +411,61 @@ mod tests {
             .with_enabled(true);
 
         assert_eq!(task.name, "test");
-        assert_eq!(task.interval.as_secs(), 60);
+        assert_eq!(task.interval().as_secs(), 60);
         assert_eq!(task.cooldown.as_secs(), 30);
         assert_eq!(task.dnd_window, Some((22, 6)));
         assert!(task.enabled);
+    }
+
+    #[test]
+    fn cron_task_creation() {
+        let task = ScheduledTask::from_cron("nightly", "0 0 3 * * *").unwrap();
+        assert_eq!(task.name, "nightly");
+        assert!(task.enabled);
+        assert!(matches!(task.schedule, TaskSchedule::Cron(_)));
+    }
+
+    #[test]
+    fn cron_invalid_expression() {
+        let result = ScheduledTask::from_cron("bad", "not a cron");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn interval_is_due() {
+        let sched = TaskSchedule::Interval(Duration::from_secs(60));
+        let now = Utc::now();
+
+        // Never run before → due.
+        assert!(sched.is_due(None, now));
+
+        // Ran 30s ago → not due.
+        let recent = now - chrono::Duration::seconds(30);
+        assert!(!sched.is_due(Some(recent), now));
+
+        // Ran 90s ago → due.
+        let old = now - chrono::Duration::seconds(90);
+        assert!(sched.is_due(Some(old), now));
+    }
+
+    #[test]
+    fn cron_is_due() {
+        // Every second ("* * * * * *").
+        let sched = TaskSchedule::cron("* * * * * *").unwrap();
+        let now = Utc::now();
+
+        // Last ran 2 seconds ago → should be due.
+        let last = now - chrono::Duration::seconds(2);
+        assert!(sched.is_due(Some(last), now));
+    }
+
+    #[test]
+    fn cron_min_interval() {
+        // Every 5 minutes.
+        let sched = TaskSchedule::cron("0 */5 * * * *").unwrap();
+        let gap = sched.min_interval_secs();
+        // Should be ~300 seconds.
+        assert!(gap >= 290 && gap <= 310, "gap was {}", gap);
     }
 
     #[tokio::test]

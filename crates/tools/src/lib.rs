@@ -4,11 +4,12 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use schemars::JsonSchema;
 
 // ── Tool trait and registry ──────────────────────────────────────────────────
 
 /// JSON-friendly type hint for a tool parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ParamType {
     String,
@@ -26,7 +27,7 @@ impl Default for ParamType {
 }
 
 /// Security classification for a tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SecurityLevel {
     Low,
@@ -41,7 +42,7 @@ impl Default for SecurityLevel {
 }
 
 /// Optional rich metadata about a tool (security, grouping, cost).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct ToolMetadata {
     pub security_level: SecurityLevel,
     pub read_only: bool,
@@ -51,7 +52,7 @@ pub struct ToolMetadata {
 }
 
 /// Describes a single parameter that a tool accepts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolParam {
     pub name: String,
     pub description: String,
@@ -107,7 +108,7 @@ impl ToolParam {
 }
 
 /// Static metadata about a tool, used by the LLM to decide which tool to call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
@@ -319,6 +320,29 @@ impl ToolSpec {
     }
 }
 
+
+/// Generate a JSON Schema document describing all tool-related types.
+///
+/// This uses `schemars` to produce a proper `$schema`-annotated document
+/// suitable for IDE tooling, validation, and marketplace manifests.
+pub fn tool_registry_schema() -> schemars::schema::RootSchema {
+    schemars::schema_for!(ToolSpec)
+}
+
+/// Generate an array of JSON Schema documents, one per tool.
+pub fn export_schemars_schemas(specs: &[ToolSpec]) -> serde_json::Value {
+    let mut arr: Vec<serde_json::Value> = Vec::new();
+    for spec in specs {
+        let root = schemars::schema_for!(ToolSpec);
+        arr.push(serde_json::json!({
+            "tool": spec.name,
+            "spec_schema": root,
+            "params_schema": spec.to_json_schema(),
+        }));
+    }
+    serde_json::Value::Array(arr)
+}
+
 /// Export all tool schemas to a JSON manifest.
 ///
 /// Produces an object keyed by tool name with both OpenAI and standalone
@@ -347,14 +371,14 @@ pub fn specs_to_openai_tools(specs: &[ToolSpec]) -> serde_json::Value {
 }
 
 /// The result returned after a tool runs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolOutput {
     pub success: bool,
     pub output: String,
 }
 
 /// Describes the source/origin of a registered tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ToolSource {
     /// Built-in Rust implementation (native fallback).
     Native,
@@ -381,7 +405,7 @@ struct ToolEntry {
 }
 
 /// Summary information about a registered tool, including its origin.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ToolInfo {
     pub spec: ToolSpec,
     pub source: ToolSource,
@@ -522,6 +546,9 @@ impl ToolRegistry {
 // ── Built-in tools ───────────────────────────────────────────────────────────
 
 pub mod builtins;
+
+#[cfg(feature = "marketplace")]
+pub mod marketplace;
 pub use builtins::{
     BrowsePageTool,
     CalendarAddEventTool, CpTool, CutTool, DraftEmailTool, EchoTool,

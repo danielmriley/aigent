@@ -13,6 +13,9 @@ default = ["wasm", "sandbox"]
 sandbox = ["dep:libc"]
 ## Enable wasmtime WASM tool loading.
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:bytes"]
+## Forward uutils feature to aigent-tools for POSIX-compliant coreutils.
+uutils = ["aigent-tools/uutils"]
+marketplace = ["aigent-tools/marketplace"]
 
 [dependencies]
 anyhow.workspace = true

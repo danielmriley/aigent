@@ -1654,3 +1654,130 @@ allow_system_read   = true
 - [ ] `cargo test --workspace` — all tests pass
 - [ ] Manual: ask the agent to check workspace git status — verify it uses `perform_gait`
 - [ ] Manual: attempt clone outside trusted paths — verify rejection
+
+## 2026-02-28 — Coreutils Upgrade: Structured Output & uutils Feature
+
+### Summary
+
+All 19 pure-Rust coreutils tools now support two new output modes in addition to
+the existing plain-text output:
+
+- **`--aigent-jsonl`** (`jsonl=true`): One JSON object per line. Ideal for LLM
+  consumption and programmatic downstream parsing.
+- **`--aigent-semantic`** (`semantic=true`): Lightweight XML-style tags
+  (`<entry>`, `<match>`, `<line>`, etc.). Ideal for retrieval-augmented
+  generation and prompt assembly.
+
+A new **`uutils`** feature flag gates delegation to system `sort` and `head`
+binaries for locale-aware and key-based sorting when available. The pure-Rust
+implementations remain the default and serve as fallback.
+
+### New feature flag
+
+```
+cargo build --features uutils     # or: cargo build -p aigent-app --features uutils
+```
+
+Feature chain: `aigent-app/uutils` → `aigent-exec/uutils` → `aigent-tools/uutils`
+
+### Affected tools (all 19 coreutils)
+
+`ls`, `mkdir`, `touch`, `rm`, `cp`, `mv`, `find_files`, `grep`, `head`, `tail`,
+`wc`, `tree`, `workspace_status`, `sort_lines`, `uniq`, `cut`, `sed`, `echo`,
+`seq`
+
+Each tool's `ToolSpec.params` now includes two additional boolean parameters:
+- `jsonl` (default: `"false"`)
+- `semantic` (default: `"false"`)
+
+### Output format examples
+
+**JSONL** (`jsonl=true` on `ls`):
+```json
+{"name":"src","type":"dir","size":4096,"modified":"2026-02-28T12:00:00"}
+{"name":"Cargo.toml","type":"file","size":1234,"modified":"2026-02-28T11:30:00"}
+```
+
+**Semantic** (`semantic=true` on `grep`):
+```xml
+<match file="src/main.rs" line="42">fn main() {</match>
+<match file="src/lib.rs" line="10">pub fn init() -> Result<()> {</match>
+```
+
+### Changes
+
+| File | Change |
+|---|---|
+| `crates/tools/src/builtins/coreutils.rs` | **Rewritten.** `OutputMode` enum (Plain/Jsonl/Semantic), `output_mode()` parser, `push_output_params()` helper, `iso_date()` helper. All 19 tools branch on output mode. `grep_file()` accepts `OutputMode`. Tree has dedicated `tree_recurse_jsonl` and `tree_recurse_semantic`. `#[cfg(feature = "uutils")]` guards on `run_uutils_head`, `format_line_output`, `sort_lines_uutils`. 24 new tests. |
+| `crates/tools/Cargo.toml` | Added `[features]` section with `uutils = []`. |
+| `crates/exec/Cargo.toml` | Added `uutils = ["aigent-tools/uutils"]` feature. |
+| `crates/interfaces/cli/Cargo.toml` | Added `uutils = ["aigent-exec/uutils"]` feature. |
+
+### Verification
+
+- [x] `cargo check` — 0 errors, 0 warnings
+- [x] `cargo check --features uutils` — 0 errors, 0 warnings
+- [x] `cargo test --workspace` — 333 tests pass, 0 failures
+
+## 2026-02-28 — Final Polish: Schemars, Marketplace, Cron Scheduler
+
+### Summary
+
+Three complementary improvements:
+
+1. **Schemars JSON Schemas** — All public tool types (`ToolSpec`, `ToolParam`,
+   `ParamType`, `SecurityLevel`, `ToolMetadata`, `ToolOutput`, `ToolSource`,
+   `ToolInfo`) now derive `schemars::JsonSchema`. New functions:
+   - `tool_registry_schema()` — root JSON Schema for `ToolSpec`
+   - `export_schemars_schemas(specs)` — per-tool schema array
+
+2. **Marketplace Directory** (`extensions/marketplace/`) — Feature-gated
+   (`marketplace`) extension discovery and management:
+   - `manifest.toml` format for extension metadata and tool parameters
+   - `MarketplaceRegistry` for install/remove/list operations
+   - `discover_extensions()` scans for subdirectories with manifests
+   - `manifest_to_tool_spec()` converts manifests to runtime `ToolSpec`
+
+3. **Cron Expression Scheduler** — The runtime scheduler now supports
+   standard 6-field cron expressions via the `cron` crate alongside the
+   existing fixed `Duration` intervals:
+   - New `TaskSchedule` enum: `Interval(Duration)` | `Cron(CronSchedule)`
+   - `ScheduledTask::from_cron("name", "0 */5 * * * *")` constructor
+   - Backward-compatible: `ScheduledTask::new()` still works with Duration
+
+### New dependencies
+
+| Crate | Version | Scope |
+|---|---|---|
+| `schemars` | 0.8 | workspace + aigent-tools |
+| `cron` | 0.15 | workspace + aigent-runtime |
+| `toml` | 0.8 | aigent-tools |
+
+### New feature flags
+
+| Feature | Chain | Purpose |
+|---|---|---|
+| `marketplace` | cli → exec → tools | Extension discovery & management |
+
+### Changes
+
+| File | Change |
+|---|---|
+| `Cargo.toml` | Added `schemars`, `cron` workspace deps. |
+| `crates/tools/Cargo.toml` | Added `schemars`, `toml` deps. `marketplace` feature. |
+| `crates/tools/src/lib.rs` | `JsonSchema` derive on 8 types. `tool_registry_schema()`, `export_schemars_schemas()`. `marketplace` module gate. |
+| `crates/tools/src/marketplace.rs` | **New file.** `ExtensionManifest`, `MarketplaceRegistry`, `discover_extensions()`, `manifest_to_tool_spec()`. 4 tests. |
+| `crates/exec/Cargo.toml` | Added `marketplace` feature forwarding. |
+| `crates/interfaces/cli/Cargo.toml` | Added `marketplace` feature forwarding. |
+| `crates/runtime/Cargo.toml` | Added `cron` dep. |
+| `crates/runtime/src/scheduler.rs` | **Rewritten.** `TaskSchedule` enum (Interval/Cron), `is_due()` unified check, `from_cron()` constructor. 5 new tests. |
+| `crates/runtime/src/lib.rs` | Added `TaskSchedule` to re-exports. |
+| `extensions/marketplace/README.md` | **New file.** Marketplace documentation. |
+| `extensions/marketplace/registry.json` | **New file.** Empty registry seed. |
+
+### Verification
+
+- [x] `cargo check` — 0 errors, 0 warnings
+- [x] `cargo check --features marketplace` — 0 errors, 0 warnings
+- [x] `cargo test --workspace` — 338 tests pass, 0 failures
+- [x] `cargo test --features marketplace` — 99 tests pass (tools crate)

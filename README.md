@@ -6,6 +6,10 @@ Aigent is a persistent, self-improving AI agent written in Rust. It runs as a ba
 
 | Change | Details |
 |---|---|
+| **Schemars JSON Schemas** | All public tool types (`ToolSpec`, `ToolParam`, `ParamType`, `SecurityLevel`, `ToolMetadata`, `ToolOutput`, `ToolSource`, `ToolInfo`) derive `schemars::JsonSchema` for auto-generated JSON Schema documents. `tool_registry_schema()` and `export_schemars_schemas()` functions for IDE tooling and marketplace validation. |
+| **Marketplace extensions** | Feature-gated (`marketplace`) extension system under `extensions/marketplace/`. `manifest.toml` declarative format, `MarketplaceRegistry` for install/remove/list, `discover_extensions()` scanner, `manifest_to_tool_spec()` converter. CLI commands: `aigent marketplace list/install/build/remove`. |
+| **Cron expression scheduler** | Runtime scheduler now accepts standard 6-field cron expressions (`"0 */5 * * * *"`) via the `cron` crate alongside fixed-interval `Duration` scheduling. `ScheduledTask::from_cron()` constructor. `TaskSchedule` enum unifies both modes. Backward-compatible with existing interval-based tasks. |
+| **Coreutils structured output** | All 19 pure-Rust coreutils tools (`ls`, `grep`, `head`, `tree`, `wc`, etc.) now support `jsonl=true` (one JSON object per line) and `semantic=true` (XML-style tags) output modes. New `uutils` feature flag delegates to system `sort`/`head` binaries for locale-aware sorting. Feature chain: cli → exec → tools. |
 | **gait — safe native git** | New `perform_gait` tool powered by libgit2 (`git2` crate). All git writes restricted to `trusted_write_paths`; reads broadly allowed. Grounding rule 10 instructs the LLM to prefer gait over `run_shell git …`. Config: `[git]` section with `trusted_repos`, `trusted_write_paths`, `allow_system_read`. WIT `git-operation` record + `perform-gait` export added. |
 | **Sandbox seccomp expansion** | Added `uname` (160), `sethostname` (170), and `clone3` (435) to the seccomp BPF allow-list so git / build tools work inside the sandbox. |
 | **Tool-result propagation v2** | Rule 9 added to grounding block: LLM is contractually bound by the ===== TOOL RESULT ===== markers. Fallback follow-up prompt cleaned up. TUI now suppresses raw tool-JSON tokens before `ClearStream` fires. Telegram `ClearStream` handler clears streamed output before second pass. |
@@ -230,7 +234,9 @@ Built-in tools registered in the daemon and accessible via `/tools` slash comman
 | `remind_me` | Add a reminder to `.aigent/reminders.json` for proactive surfacing |
 | `git_rollback` | Revert the last git commit in the workspace (`git revert HEAD`) |
 
-All 8 tools run in **WASM mode** when a compiled `.wasm` binary is present (see `aigent tools status`); otherwise they run as native Rust code with an identical API. All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
+In addition, **19 coreutils tools** are registered: `ls`, `mkdir`, `touch`, `rm`, `cp`, `mv`, `find_files`, `grep`, `head`, `tail`, `wc`, `tree`, `workspace_status`, `sort_lines`, `uniq`, `cut`, `sed`, `echo`, `seq`. All support `jsonl=true` and `semantic=true` output modes for structured LLM consumption.
+
+All tools run in **WASM mode** when a compiled `.wasm` binary is present (see `aigent tools status`); otherwise they run as native Rust code with an identical API. All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
 
 **LLM-driven tool calling**: before each streaming response, the daemon asks the LLM whether the user’s message requires a tool. If yes, the daemon executes the tool, records the result to Procedural memory, emits `ToolCallStart` / `ToolCallEnd` events, and injects the result into the main LLM prompt so the reply is grounded in the actual output.
 ### Daemon / IPC
