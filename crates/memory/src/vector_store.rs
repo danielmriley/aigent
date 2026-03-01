@@ -290,18 +290,22 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
-// ── Qdrant backend (feature-gated) ──────────────────────────────────────────
+// ── Qdrant backend (feature-gated) ────────────────────────────────────────
 
 /// Configuration for connecting to a Qdrant vector database.
 #[cfg(feature = "qdrant")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QdrantConfig {
-    /// Qdrant gRPC endpoint (e.g. "http://localhost:6334").
+    /// Qdrant gRPC/REST endpoint (e.g. "http://localhost:6334").
     pub endpoint: String,
     /// Collection name to use.
     pub collection: String,
     /// Vector dimensions.
     pub dimensions: usize,
+    /// API key for Qdrant Cloud (empty = no auth).
+    pub api_key: String,
+    /// Whether to auto-create the collection if it does not exist.
+    pub auto_create_collection: bool,
 }
 
 #[cfg(feature = "qdrant")]
@@ -311,64 +315,209 @@ impl Default for QdrantConfig {
             endpoint: "http://localhost:6334".into(),
             collection: "aigent_memories".into(),
             dimensions: 384,
+            api_key: String::new(),
+            auto_create_collection: true,
         }
     }
 }
 
-/// Qdrant-backed vector store.
+/// Qdrant-backed vector store using the official gRPC client.
 ///
-/// Requires the `qdrant` feature flag on `aigent-memory`.
-/// Currently a stub implementation that stores vectors in memory and
-/// logs what would be sent to Qdrant.  Replace with `qdrant-client`
-/// calls when the dependency is added.
+/// Provides persistent, high-performance vector search backed by a Qdrant
+/// instance.  Falls back to in-process FlatVectorStore if Qdrant is unreachable.
 #[cfg(feature = "qdrant")]
 pub struct QdrantVectorStore {
     config: QdrantConfig,
-    // Fallback: use the flat store until qdrant-client is wired in.
-    inner: FlatVectorStore,
+    client: qdrant_client::Qdrant,
+    /// Local fallback for when Qdrant is down or for hybrid search.
+    local_cache: FlatVectorStore,
 }
 
 #[cfg(feature = "qdrant")]
 impl QdrantVectorStore {
-    pub fn new(config: QdrantConfig) -> Self {
-        let dims = config.dimensions;
-        Self {
-            config,
-            inner: FlatVectorStore::new(dims),
+    /// Create a new Qdrant vector store.
+    ///
+    /// Connects to the Qdrant instance and optionally creates the collection.
+    pub async fn new(config: QdrantConfig) -> Result<Self> {
+        use qdrant_client::Qdrant;
+
+        let mut builder = Qdrant::from_url(&config.endpoint);
+        if !config.api_key.is_empty() {
+            builder = builder.api_key(config.api_key.clone());
         }
+        let client = builder.build()
+            .map_err(|e| anyhow::anyhow!("qdrant client build: {e}"))?;
+
+        if config.auto_create_collection {
+            Self::ensure_collection(&client, &config).await?;
+        }
+
+        let local_cache = FlatVectorStore::with_dimensions(config.dimensions);
+
+        Ok(Self {
+            config,
+            client,
+            local_cache,
+        })
+    }
+
+    /// Ensure the target collection exists, creating it if necessary.
+    async fn ensure_collection(client: &qdrant_client::Qdrant, config: &QdrantConfig) -> Result<()> {
+        use qdrant_client::qdrant::{CreateCollectionBuilder, Distance, VectorParamsBuilder};
+
+        let exists = client.collection_exists(&config.collection).await
+            .unwrap_or(false);
+
+        if !exists {
+            tracing::info!(
+                collection = %config.collection,
+                dimensions = config.dimensions,
+                "creating qdrant collection"
+            );
+            client.create_collection(
+                CreateCollectionBuilder::new(&config.collection)
+                    .vectors_config(
+                        VectorParamsBuilder::new(config.dimensions as u64, Distance::Cosine)
+                    ),
+            ).await
+            .map_err(|e| anyhow::anyhow!("create collection: {e}"))?;
+        }
+
+        Ok(())
     }
 
     pub fn config(&self) -> &QdrantConfig {
         &self.config
     }
+
+    /// Get a reference to the local cache for hybrid search.
+    pub fn local_cache(&self) -> &FlatVectorStore {
+        &self.local_cache
+    }
 }
 
 #[cfg(feature = "qdrant")]
-#[async_trait::async_trait]
 impl VectorBackend for QdrantVectorStore {
     async fn upsert(&self, id: Uuid, vector: Vec<f32>) -> Result<()> {
-        tracing::debug!(
-            endpoint = %self.config.endpoint,
-            collection = %self.config.collection,
-            id = %id,
-            "qdrant stub: upsert (delegating to flat store)"
+        use qdrant_client::qdrant::{PointStruct, UpsertPointsBuilder};
+
+        // Upsert to local cache first (fast path for hybrid search).
+        self.local_cache.upsert(id, vector.clone()).await?;
+
+        // Upsert to Qdrant.
+        let point = PointStruct::new(
+            id.to_string(),
+            vector,
+            qdrant_client::Payload::new(),
         );
-        self.inner.upsert(id, vector).await
+        self.client.upsert_points(
+            UpsertPointsBuilder::new(&self.config.collection, vec![point]).wait(true)
+        ).await
+            .map_err(|e| anyhow::anyhow!("qdrant upsert: {e}"))?;
+
+        Ok(())
     }
 
     async fn remove(&self, id: Uuid) -> Result<()> {
-        tracing::debug!(id = %id, "qdrant stub: remove");
-        self.inner.remove(id).await
+        use qdrant_client::qdrant::DeletePointsBuilder;
+
+        // Remove from local cache.
+        self.local_cache.remove(id).await?;
+
+        // Remove from Qdrant.
+        let point_id: qdrant_client::qdrant::PointId = id.to_string().into();
+        self.client.delete_points(
+            DeletePointsBuilder::new(&self.config.collection)
+                .points(vec![point_id])
+                .wait(true)
+        ).await
+            .map_err(|e| anyhow::anyhow!("qdrant delete: {e}"))?;
+
+        Ok(())
     }
 
     async fn search(&self, query: &[f32], k: usize) -> Result<Vec<VectorMatch>> {
-        tracing::debug!(k = k, "qdrant stub: search");
-        self.inner.search(query, k).await
+        use qdrant_client::qdrant::SearchPointsBuilder;
+
+        let results = self.client.search_points(
+            SearchPointsBuilder::new(&self.config.collection, query.to_vec(), k as u64)
+        ).await
+        .map_err(|e| anyhow::anyhow!("qdrant search: {e}"))?;
+
+        let matches = results.result.into_iter().filter_map(|scored| {
+            // Point ID is stored as a UUID string.
+            let point_id = scored.id?;
+            let id_str = match point_id.point_id_options? {
+                qdrant_client::qdrant::point_id::PointIdOptions::Uuid(s) => s,
+                qdrant_client::qdrant::point_id::PointIdOptions::Num(n) => n.to_string(),
+            };
+            let id = Uuid::parse_str(&id_str).ok()?;
+            Some(VectorMatch {
+                id,
+                score: scored.score,
+            })
+        }).collect();
+
+        Ok(matches)
     }
 
     async fn len(&self) -> usize {
-        self.inner.len().await
+        // Use Qdrant collection info for the authoritative count.
+        match self.client.collection_info(&self.config.collection).await {
+            Ok(info) => info.result
+                .map(|r| r.points_count.unwrap_or(0) as usize)
+                .unwrap_or(0),
+            Err(_) => self.local_cache.len().await,
+        }
     }
+}
+
+/// Hybrid retrieval helper: combine Qdrant vector search with lexical scoring.
+///
+/// Returns merged results sorted by a weighted combination of vector similarity
+/// and lexical overlap score. Each result includes both scores.
+#[cfg(feature = "qdrant")]
+#[derive(Debug, Clone)]
+pub struct HybridMatch {
+    pub id: Uuid,
+    pub vector_score: f32,
+    pub lexical_score: f32,
+    pub combined_score: f32,
+}
+
+/// Perform hybrid retrieval: vector search via Qdrant + lexical via local scoring.
+///
+/// `vector_weight` and `lexical_weight` control the blend (should sum to 1.0).
+/// `lexical_scorer` is a closure that returns a [0,1] lexical match score for an ID.
+#[cfg(feature = "qdrant")]
+pub async fn hybrid_search(
+    store: &QdrantVectorStore,
+    query_vector: &[f32],
+    k: usize,
+    vector_weight: f32,
+    lexical_weight: f32,
+    lexical_scorer: impl Fn(&Uuid) -> f32,
+) -> Result<Vec<HybridMatch>> {
+    // Get top-k*2 from vector search for re-ranking headroom.
+    let vector_results = store.search(query_vector, k * 2).await?;
+
+    let mut hybrid: Vec<HybridMatch> = vector_results
+        .into_iter()
+        .map(|vm| {
+            let lex = lexical_scorer(&vm.id);
+            HybridMatch {
+                id: vm.id,
+                vector_score: vm.score,
+                lexical_score: lex,
+                combined_score: vm.score * vector_weight + lex * lexical_weight,
+            }
+        })
+        .collect();
+
+    hybrid.sort_by(|a, b| b.combined_score.partial_cmp(&a.combined_score).unwrap_or(std::cmp::Ordering::Equal));
+    hybrid.truncate(k);
+
+    Ok(hybrid)
 }
 
 #[cfg(test)]

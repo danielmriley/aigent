@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+candle = ["aigent-llm/candle"]
+qdrant = ["aigent-memory/qdrant"]
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true

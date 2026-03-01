@@ -4,9 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("candle-cuda", "candle-metal"))'] }
+
 [features]
 default = []
-candle = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:tokenizers"]
+candle = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:tokenizers", "dep:hf-hub"]
 
 [dependencies]
 anyhow.workspace = true
@@ -23,4 +26,5 @@ candle-core         = { version = "0.8", optional = true }
 candle-transformers = { version = "0.8", optional = true }
 candle-nn           = { version = "0.8", optional = true }
 tokenizers          = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+hf-hub              = { version = "0.5", optional = true }
 
