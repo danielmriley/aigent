@@ -47,18 +47,20 @@ impl HotRegistry {
         self.inner.read().unwrap().list_specs()
     }
 
-    /// Acquire a read lock and execute a tool by name.
+    /// Acquire a read lock, look up the tool, then release the lock before
+    /// the async call so the `RwLockReadGuard` is not held across `.await`.
     pub async fn execute(
         &self,
         name: &str,
         args: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<ToolOutput> {
-        // We can't hold the RwLock across await — clone the Arc and grab the
-        // tool reference inside a sync block.
-        let registry = self.inner.read().unwrap();
-        let tool = registry
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+        let tool = {
+            let registry = self.inner.read().unwrap();
+            registry
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?
+        };
+        // Guard dropped — safe to await.
         tool.run(args).await
     }
 
@@ -180,7 +182,7 @@ mod tests {
         let hot = HotRegistry::new(reg);
         assert!(hot.list_specs().is_empty());
 
-        let mut new_reg = ToolRegistry::default();
+        let new_reg = ToolRegistry::default();
         // We can't easily create a dummy tool here without the async_trait,
         // so just verify the swap mechanism works with empty registries.
         hot.swap(new_reg);

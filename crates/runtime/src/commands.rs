@@ -28,6 +28,9 @@ pub enum ClientCommand {
     ExecuteTool { name: String, args: HashMap<String, String> },
     ListTools,
     ReloadConfig,
+    /// Hot-reload dynamic skills from the skills directory without touching
+    /// the main config.
+    ReloadTools,
     Shutdown,
     Ping,
     /// Open a persistent connection that receives broadcast events from all turns.
@@ -75,6 +78,8 @@ pub enum ServerEvent {
     Status(DaemonStatus),
     MemoryPeek(Vec<String>),
     ToolList(Vec<aigent_tools::ToolSpec>),
+    /// Detailed tool listing with source metadata.
+    ToolInfoList(Vec<aigent_tools::ToolInfo>),
     ToolResult { success: bool, output: String },
     Ack(String),
     /// Incremental status line emitted during a long-running sleep cycle.

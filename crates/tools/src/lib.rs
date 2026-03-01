@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -283,7 +284,7 @@ impl ToolSpec {
                     ParamType::Integer => {
                         if val.parse::<i64>().is_err() {
                             errors.push(format!(
-                                "param \'{}\' expected integer, got '{}'",
+                                "param '{}' expected integer, got '{}'",
                                 p.name, val
                             ));
                         }
@@ -291,7 +292,7 @@ impl ToolSpec {
                     ParamType::Number => {
                         if val.parse::<f64>().is_err() {
                             errors.push(format!(
-                                "param \'{}\' expected number, got '{}'",
+                                "param '{}' expected number, got '{}'",
                                 p.name, val
                             ));
                         }
@@ -299,7 +300,7 @@ impl ToolSpec {
                     ParamType::Boolean => {
                         if val != "true" && val != "false" {
                             errors.push(format!(
-                                "param \'{}\' expected boolean, got '{}'",
+                                "param '{}' expected boolean, got '{}'",
                                 p.name, val
                             ));
                         }
@@ -308,7 +309,7 @@ impl ToolSpec {
                 }
                 if !p.enum_values.is_empty() && !p.enum_values.contains(val) {
                     errors.push(format!(
-                        "param \'{}\' must be one of {:?}, got '{}'",
+                        "param '{}' must be one of {:?}, got '{}'",
                         p.name, p.enum_values, val
                     ));
                 }
@@ -352,6 +353,40 @@ pub struct ToolOutput {
     pub output: String,
 }
 
+/// Describes the source/origin of a registered tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolSource {
+    /// Built-in Rust implementation (native fallback).
+    Native,
+    /// Compiled WASM guest loaded from `extensions/`.
+    Wasm,
+    /// Dynamically loaded at runtime (e.g. from the skills directory).
+    Dynamic,
+}
+
+impl std::fmt::Display for ToolSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Native => write!(f, "native"),
+            Self::Wasm => write!(f, "wasm"),
+            Self::Dynamic => write!(f, "dynamic"),
+        }
+    }
+}
+
+/// An entry in the tool registry, associating a tool with its source metadata.
+struct ToolEntry {
+    tool: Arc<dyn Tool>,
+    source: ToolSource,
+}
+
+/// Summary information about a registered tool, including its origin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolInfo {
+    pub spec: ToolSpec,
+    pub source: ToolSource,
+}
+
 /// Trait implemented by every tool (built-in or WASM-loaded).
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -360,33 +395,110 @@ pub trait Tool: Send + Sync {
 }
 
 /// Central registry for all available tools.
-#[derive(Default)]
+///
+/// Thread-safe via interior `RwLock` — all methods take `&self` so the
+/// registry can be shared behind `Arc<ToolRegistry>` without external
+/// locking.  Read-path methods (`get`, `list_specs`, `list_tools`) acquire
+/// a read lock; mutating methods (`register`, `unregister`) acquire a
+/// write lock.
 pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: RwLock<Vec<ToolEntry>>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: RwLock::new(Vec::new()),
+        }
+    }
 }
 
 impl ToolRegistry {
-    pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+    /// Register a tool.  Defaults to [`ToolSource::Native`].
+    ///
+    /// This is the backward-compatible entry point used by `default_registry`.
+    pub fn register(&self, tool: Box<dyn Tool>) {
+        self.register_with_source(tool, ToolSource::Native);
     }
 
+    /// Register a tool with an explicit [`ToolSource`] tag.
+    pub fn register_with_source(&self, tool: Box<dyn Tool>, source: ToolSource) {
+        let entry = ToolEntry {
+            tool: Arc::from(tool),
+            source,
+        };
+        self.tools.write().unwrap().push(entry);
+    }
+
+    /// Unregister all tools with the given name.
+    ///
+    /// Returns `true` if at least one tool was removed.
+    pub fn unregister(&self, name: &str) -> bool {
+        let mut tools = self.tools.write().unwrap();
+        let before = tools.len();
+        tools.retain(|e| e.tool.spec().name != name);
+        tools.len() < before
+    }
+
+    /// Return specs for all registered tools.
     pub fn list_specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|t| t.spec()).collect()
+        self.tools.read().unwrap().iter().map(|e| e.tool.spec()).collect()
     }
 
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
+    /// Detailed listing including source metadata.
+    pub fn list_tools(&self) -> Vec<ToolInfo> {
         self.tools
+            .read()
+            .unwrap()
             .iter()
-            .find(|t| t.spec().name == name)
-            .map(|t| t.as_ref())
+            .map(|e| ToolInfo {
+                spec: e.tool.spec(),
+                source: e.source,
+            })
+            .collect()
+    }
+
+    /// Look up a tool by name (first-match wins, preserving WASM-first
+    /// semantics).  Returns an `Arc` so the caller owns the handle and
+    /// can safely hold it across `.await` points.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.tool.spec().name == name)
+            .map(|e| Arc::clone(&e.tool))
+    }
+
+    /// Number of currently registered tools.
+    pub fn len(&self) -> usize {
+        self.tools.read().unwrap().len()
+    }
+
+    /// Returns `true` when no tools are registered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Return the names of all dynamically-registered tools.
+    pub fn dynamic_tool_names(&self) -> Vec<String> {
+        self.tools
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|e| e.source == ToolSource::Dynamic)
+            .map(|e| e.tool.spec().name)
+            .collect()
     }
 
     /// Return the names of all tools belonging to the given group.
     pub fn tools_in_group(&self, group: &str) -> Vec<String> {
         self.tools
+            .read()
+            .unwrap()
             .iter()
-            .filter(|t| t.spec().metadata.group == group)
-            .map(|t| t.spec().name)
+            .filter(|e| e.tool.spec().metadata.group == group)
+            .map(|e| e.tool.spec().name)
             .collect()
     }
 
@@ -458,7 +570,7 @@ mod registry_tests {
 
     #[test]
     fn register_and_get() {
-        let mut reg = ToolRegistry::default();
+        let reg = ToolRegistry::default();
         reg.register(Box::new(DummyTool { name: "alpha".into() }));
         reg.register(Box::new(DummyTool { name: "beta".into() }));
 
@@ -469,7 +581,7 @@ mod registry_tests {
 
     #[test]
     fn list_specs_returns_all() {
-        let mut reg = ToolRegistry::default();
+        let reg = ToolRegistry::default();
         reg.register(Box::new(DummyTool { name: "one".into() }));
         reg.register(Box::new(DummyTool { name: "two".into() }));
         reg.register(Box::new(DummyTool { name: "three".into() }));
@@ -484,7 +596,7 @@ mod registry_tests {
 
     #[test]
     fn get_returns_correct_tool_spec() {
-        let mut reg = ToolRegistry::default();
+        let reg = ToolRegistry::default();
         reg.register(Box::new(DummyTool { name: "finder".into() }));
 
         let tool = reg.get("finder").unwrap();
@@ -496,7 +608,7 @@ mod registry_tests {
 
     #[tokio::test]
     async fn run_registered_tool() {
-        let mut reg = ToolRegistry::default();
+        let reg = ToolRegistry::default();
         reg.register(Box::new(DummyTool { name: "runner".into() }));
 
         let tool = reg.get("runner").unwrap();
@@ -510,7 +622,7 @@ mod registry_tests {
     /// backend later doesn't silently change the semantics.
     #[test]
     fn duplicate_name_get_returns_first_registered() {
-        let mut reg = ToolRegistry::default();
+        let reg = ToolRegistry::default();
         reg.register(Box::new(DummyTool { name: "dup".into() }));
         reg.register(Box::new(DummyTool { name: "dup".into() }));
 
@@ -521,5 +633,125 @@ mod registry_tests {
 
         // get should return the first one (deterministic for Vec+find)
         assert!(reg.get("dup").is_some());
+    }
+
+    // ── New tests for dynamic registration features ────────────────────────
+
+    #[test]
+    fn unregister_removes_tool() {
+        let reg = ToolRegistry::default();
+        reg.register(Box::new(DummyTool { name: "removable".into() }));
+        reg.register(Box::new(DummyTool { name: "keeper".into() }));
+
+        assert!(reg.unregister("removable"));
+        assert!(reg.get("removable").is_none());
+        assert!(reg.get("keeper").is_some());
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn unregister_nonexistent_returns_false() {
+        let reg = ToolRegistry::default();
+        assert!(!reg.unregister("ghost"));
+    }
+
+    #[test]
+    fn register_with_source_and_list_tools() {
+        let reg = ToolRegistry::default();
+        reg.register_with_source(
+            Box::new(DummyTool { name: "native_tool".into() }),
+            ToolSource::Native,
+        );
+        reg.register_with_source(
+            Box::new(DummyTool { name: "wasm_tool".into() }),
+            ToolSource::Wasm,
+        );
+        reg.register_with_source(
+            Box::new(DummyTool { name: "dyn_tool".into() }),
+            ToolSource::Dynamic,
+        );
+
+        let infos = reg.list_tools();
+        assert_eq!(infos.len(), 3);
+        assert_eq!(infos[0].source, ToolSource::Native);
+        assert_eq!(infos[1].source, ToolSource::Wasm);
+        assert_eq!(infos[2].source, ToolSource::Dynamic);
+    }
+
+    #[test]
+    fn dynamic_tool_names_filters_correctly() {
+        let reg = ToolRegistry::default();
+        reg.register_with_source(
+            Box::new(DummyTool { name: "builtin".into() }),
+            ToolSource::Native,
+        );
+        reg.register_with_source(
+            Box::new(DummyTool { name: "skill_a".into() }),
+            ToolSource::Dynamic,
+        );
+        reg.register_with_source(
+            Box::new(DummyTool { name: "skill_b".into() }),
+            ToolSource::Dynamic,
+        );
+
+        let dyn_names = reg.dynamic_tool_names();
+        assert_eq!(dyn_names.len(), 2);
+        assert!(dyn_names.contains(&"skill_a".to_string()));
+        assert!(dyn_names.contains(&"skill_b".to_string()));
+    }
+
+    #[test]
+    fn unregister_all_duplicates() {
+        let reg = ToolRegistry::default();
+        reg.register(Box::new(DummyTool { name: "dup".into() }));
+        reg.register(Box::new(DummyTool { name: "dup".into() }));
+        reg.register(Box::new(DummyTool { name: "other".into() }));
+
+        assert!(reg.unregister("dup"));
+        assert_eq!(reg.len(), 1);
+        assert!(reg.get("dup").is_none());
+        assert!(reg.get("other").is_some());
+    }
+
+    #[test]
+    fn tool_source_display() {
+        assert_eq!(ToolSource::Native.to_string(), "native");
+        assert_eq!(ToolSource::Wasm.to_string(), "wasm");
+        assert_eq!(ToolSource::Dynamic.to_string(), "dynamic");
+    }
+
+    /// The registry can be shared across threads via Arc.
+    #[test]
+    fn concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let reg = Arc::new(ToolRegistry::default());
+        reg.register(Box::new(DummyTool { name: "shared".into() }));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let r = Arc::clone(&reg);
+                thread::spawn(move || {
+                    assert!(r.get("shared").is_some());
+                    r.list_specs().len()
+                })
+            })
+            .collect();
+
+        for h in handles {
+            assert_eq!(h.join().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn len_and_is_empty() {
+        let reg = ToolRegistry::default();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+
+        reg.register(Box::new(DummyTool { name: "x".into() }));
+        assert!(!reg.is_empty());
+        assert_eq!(reg.len(), 1);
     }
 }

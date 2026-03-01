@@ -162,6 +162,8 @@ enum ToolCommands {
     Build,
     /// Show per-tool runtime status: WASM binary present or native fallback.
     Status,
+    /// Hot-reload dynamic skills from the skills directory.
+    Reload,
 }
 
 async fn fetch_available_models() -> aigent_ui::onboard::AvailableModels {
@@ -410,6 +412,12 @@ async fn main() -> Result<()> {
                         "  effective       : {}",
                         if compiled_in && config.tools.sandbox_enabled { "ACTIVE" } else { "disabled" }
                     );
+                }
+                ToolCommands::Reload => {
+                    match client.reload_tools().await {
+                        Ok(msg) => println!("{msg}"),
+                        Err(err) => eprintln!("error reloading tools: {err}"),
+                    }
                 }
             }
         },

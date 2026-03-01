@@ -199,6 +199,38 @@ pub struct ToolsConfig {
     /// Prevents infinite tool-calling loops.  Default: 5.
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
+    /// Dynamic skills subsystem configuration.
+    #[serde(default)]
+    pub skills: SkillsConfig,
+}
+
+/// Configuration for the dynamic skills subsystem.
+///
+/// Skills are WASM (or future native-plugin) tools that the agent can
+/// discover and hot-load at runtime from a dedicated directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// Master switch — when `false` the skills directory is never scanned.
+    pub enabled: bool,
+    /// Path to the skills directory, relative to the workspace root.
+    pub skills_dir: String,
+    /// Automatically reload skills when `ReloadConfig` is triggered.
+    pub auto_reload: bool,
+    /// Hard cap on the number of dynamic skills that may be loaded.
+    /// Acts as a safety guard.  `0` means unlimited.
+    pub max_skills: usize,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            skills_dir: "extensions/skills".to_string(),
+            auto_reload: true,
+            max_skills: 64,
+        }
+    }
 }
 
 impl Default for ToolsConfig {
@@ -215,6 +247,7 @@ impl Default for ToolsConfig {
             sandbox_enabled: true,
             use_native_calling: true,
             max_tool_rounds: 5,
+            skills: SkillsConfig::default(),
         }
     }
 }

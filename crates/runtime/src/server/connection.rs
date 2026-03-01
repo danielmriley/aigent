@@ -691,10 +691,37 @@ pub(super) async fn handle_connection(
             // requiring a daemon restart.
             let _ = dotenvy::from_path_override(std::path::Path::new(".env"));
             let updated = AppConfig::load_from("config/default.toml")?;
+
+            // Hot-reload dynamic skills when the skills subsystem is enabled
+            // and auto_reload is on.
+            let skills_msg = if updated.tools.skills.enabled && updated.tools.skills.auto_reload {
+                reload_dynamic_skills(&state.tool_registry, &updated)
+            } else {
+                String::new()
+            };
+
             state.runtime.config = updated;
+            let msg = if skills_msg.is_empty() {
+                "config reloaded".to_string()
+            } else {
+                format!("config reloaded; {skills_msg}")
+            };
             send_event(
                 &mut write_half,
-                ServerEvent::Ack("config reloaded".to_string()),
+                ServerEvent::Ack(msg),
+            )
+            .await?;
+        }
+        ClientCommand::ReloadTools => {
+            let state = state.lock().await;
+            let msg = if state.runtime.config.tools.skills.enabled {
+                reload_dynamic_skills(&state.tool_registry, &state.runtime.config)
+            } else {
+                "skills subsystem is disabled".to_string()
+            };
+            send_event(
+                &mut write_half,
+                ServerEvent::Ack(msg),
             )
             .await?;
         }
@@ -965,4 +992,80 @@ async fn send_event(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+// ── Dynamic skill reload ─────────────────────────────────────────────────────
+
+/// Scan the configured skills directory for `.wasm` files and register them
+/// as dynamic tools (replacing any previously loaded dynamic skills).
+///
+/// This is a *synchronous* registry mutation — safe to call while holding
+/// the `DaemonState` mutex because the RwLock inside `ToolRegistry` is a
+/// `std::sync::RwLock`, not a tokio one.
+fn reload_dynamic_skills(
+    registry: &aigent_tools::ToolRegistry,
+    config: &aigent_config::AppConfig,
+) -> String {
+    use std::path::Path;
+
+    let skills_cfg = &config.tools.skills;
+    let workspace = Path::new(&config.agent.workspace_path);
+    let skills_dir = workspace.join(&skills_cfg.skills_dir);
+
+    // Remove all previously loaded dynamic tools.
+    let old_names = registry.dynamic_tool_names();
+    for name in &old_names {
+        registry.unregister(name);
+    }
+
+    if !skills_dir.is_dir() {
+        if old_names.is_empty() {
+            return "skills dir not found; nothing to load".to_string();
+        }
+        return format!(
+            "skills dir not found; unloaded {} previous dynamic tool(s)",
+            old_names.len()
+        );
+    }
+
+    // Discover .wasm files in the skills directory.
+    let mut loaded: Vec<String> = Vec::new();
+    let max = if skills_cfg.max_skills == 0 {
+        usize::MAX
+    } else {
+        skills_cfg.max_skills
+    };
+
+    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+        for entry in entries.flatten() {
+            if loaded.len() >= max {
+                warn!(
+                    max_skills = skills_cfg.max_skills,
+                    "hit max_skills limit — ignoring remaining skills"
+                );
+                break;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
+                // For now, log the discovered skill.  Actual WASM instantiation
+                // will be wired up in Phase 2 (sandboxed compilation pipeline).
+                // This ensures the discovery + registration plumbing is tested.
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                info!(skill = %stem, path = %path.display(), "discovered dynamic skill");
+                loaded.push(stem);
+            }
+        }
+    }
+
+    let msg = format!(
+        "skills reload: unloaded {} old, discovered {} new dynamic tool(s)",
+        old_names.len(),
+        loaded.len()
+    );
+    info!("{}", msg);
+    msg
 }

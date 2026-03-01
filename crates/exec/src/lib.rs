@@ -528,7 +528,7 @@ pub fn default_registry(
         WriteFileTool,
     };
 
-    let mut registry = ToolRegistry::default();
+    let registry = ToolRegistry::default();
 
     // ── Step 1: WASM-first ─────────────────────────────────────────────────
     // Register compiled WASM guests before native tools.  `ToolRegistry::get`
@@ -544,7 +544,7 @@ pub fn default_registry(
             info!(count = names.len(), "wasm: {} guest tool(s) active", names.len());
         }
         for tool in tools {
-            registry.register(tool);
+            registry.register_with_source(tool, aigent_tools::ToolSource::Wasm);
         }
         names
     };

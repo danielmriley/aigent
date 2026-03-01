@@ -176,6 +176,17 @@ impl DaemonClient {
         bail!("daemon reload config response missing")
     }
 
+    /// Hot-reload dynamic skills from the skills directory.
+    pub async fn reload_tools(&self) -> Result<String> {
+        let events = self.request_events(ClientCommand::ReloadTools).await?;
+        for event in events {
+            if let ServerEvent::Ack(msg) = event {
+                return Ok(msg);
+            }
+        }
+        bail!("daemon reload tools response missing")
+    }
+
     pub async fn run_sleep_cycle(&self) -> Result<String> {
         self.run_sleep_cycle_with_progress(|_| {}).await
     }
