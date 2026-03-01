@@ -520,11 +520,12 @@ pub fn default_registry(
     search_providers: Vec<String>,
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
-        BrowsePageTool, CalendarAddEventTool, CpTool, DraftEmailTool, FetchPageTool,
-        FindTool, GitRollbackTool, GrepTool, HeadTool, ListDirTool, MkdirTool,
-        MvTool, ReadFileTool, RemindMeTool, RmTool, RunShellTool, TailTool,
-        TouchTool, TreeTool, WcTool, WebBrowseTool, WebSearchTool,
-        WorkspaceStatusTool, WriteFileTool,
+        BrowsePageTool, CalendarAddEventTool, CpTool, CutTool, DraftEmailTool,
+        EchoTool, FetchPageTool, FindTool, GitRollbackTool, GrepTool, HeadTool,
+        ListDirTool, MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool,
+        RunShellTool, SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool,
+        UniqTool, WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool,
+        WriteFileTool,
     };
 
     let mut registry = ToolRegistry::default();
@@ -658,6 +659,32 @@ pub fn default_registry(
         (
             "workspace_status",
             Box::new(WorkspaceStatusTool { workspace_root: workspace_root.clone() }),
+        ),
+        // ── Phase 1 extras ─────────────────────────────────────────────────
+        (
+            "sort",
+            Box::new(SortTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "uniq",
+            Box::new(UniqTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "cut",
+            Box::new(CutTool { workspace_root: workspace_root.clone() }),
+        ),
+        // ── Phase 2 ───────────────────────────────────────────────────────
+        (
+            "sed",
+            Box::new(SedTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "echo",
+            Box::new(EchoTool { workspace_root: workspace_root.clone() }),
+        ),
+        (
+            "seq",
+            Box::new(SeqTool),
         ),
     ];
 

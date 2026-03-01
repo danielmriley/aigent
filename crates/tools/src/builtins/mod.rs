@@ -11,8 +11,9 @@ mod web_browse;
 
 pub use browse::BrowsePageTool;
 pub use coreutils::{
-    CpTool, FindTool, GrepTool, HeadTool, ListDirTool, MkdirTool, MvTool,
-    RmTool, TailTool, TouchTool, TreeTool, WcTool, WorkspaceStatusTool,
+    CpTool, CutTool, EchoTool, FindTool, GrepTool, HeadTool, ListDirTool,
+    MkdirTool, MvTool, RmTool, SedTool, SeqTool, SortTool, TailTool,
+    TouchTool, TreeTool, UniqTool, WcTool, WorkspaceStatusTool,
 };
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use shell::RunShellTool;

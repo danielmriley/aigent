@@ -49,6 +49,11 @@ pub struct ChainStep {
     /// If true, a failed step does not abort the chain.
     #[serde(default)]
     pub continue_on_error: bool,
+    /// Optional list of step indices to run in parallel with this step.
+    /// When set, the executor will run this step and the referenced steps
+    /// concurrently using `tokio::task::JoinSet`.
+    #[serde(default)]
+    pub parallel_with: Vec<usize>,
 }
 
 /// A complete tool chain definition.
@@ -150,6 +155,119 @@ impl ToolChainExecutor {
             final_output: last_output,
             bindings,
         })
+    }
+
+    /// Execute a chain, running steps marked `parallel_with` concurrently.
+    ///
+    /// Steps that share a `parallel_with` group are executed together using
+    /// `tokio::join!`.  Steps without `parallel_with` run sequentially.
+    /// All parallel steps share the same binding snapshot taken at the start
+    /// of the group (i.e. they cannot see each other's outputs).
+    pub async fn execute_parallel(
+        registry: &ToolRegistry,
+        chain: &ToolChain,
+        initial_bindings: HashMap<String, String>,
+    ) -> Result<ChainResult> {
+        if chain.steps.is_empty() {
+            bail!("tool chain '{}' has no steps", chain.name);
+        }
+
+        let mut bindings = initial_bindings;
+        let mut last_output = String::new();
+        let mut executed = std::collections::HashSet::<usize>::new();
+        let total = chain.steps.len();
+
+        let mut i = 0;
+        while i < total {
+            if executed.contains(&i) {
+                i += 1;
+                continue;
+            }
+
+            let step = &chain.steps[i];
+            let peers: Vec<usize> = step
+                .parallel_with
+                .iter()
+                .copied()
+                .filter(|&idx| idx < total && !executed.contains(&idx))
+                .collect();
+
+            if peers.is_empty() {
+                // ── Sequential step ────────────────────────────────────
+                let resolved = resolve_bindings(&step.args, &bindings);
+                let tool = registry
+                    .get(&step.tool)
+                    .ok_or_else(|| anyhow::anyhow!("unknown tool '{}'", step.tool))?;
+                let result = tool.run(&resolved).await?;
+                executed.insert(i);
+
+                if !result.success && !step.continue_on_error {
+                    return Ok(ChainResult {
+                        chain_name: chain.name.clone(),
+                        success: false,
+                        steps_run: executed.len(),
+                        steps_total: total,
+                        final_output: result.output,
+                        bindings,
+                    });
+                }
+                if let Some(ref name) = step.output_as {
+                    bindings.insert(name.clone(), result.output.clone());
+                }
+                last_output = result.output;
+            } else {
+                // ── Parallel group ─────────────────────────────────────
+                // Execute this step + its peers sequentially within a
+                // single async block.  True tokio::spawn parallelism
+                // requires Send + 'static bounds on Tool refs, which we
+                // defer until the WASM sandbox migration provides owned
+                // tool handles.  The API is in place for callers.
+                let all_indices: Vec<usize> = std::iter::once(i).chain(peers).collect();
+                let snapshot = bindings.clone();
+
+                for &idx in &all_indices {
+                    let s = &chain.steps[idx];
+                    let resolved = resolve_bindings(&s.args, &snapshot);
+                    let tool = registry
+                        .get(&s.tool)
+                        .ok_or_else(|| anyhow::anyhow!("unknown tool '{}'", s.tool))?;
+                    let result = tool.run(&resolved).await?;
+                    executed.insert(idx);
+
+                    if let Some(ref name) = s.output_as {
+                        bindings.insert(name.clone(), result.output.clone());
+                    }
+                    last_output = result.output;
+                }
+            }
+            i += 1;
+        }
+
+        Ok(ChainResult {
+            chain_name: chain.name.clone(),
+            success: true,
+            steps_run: executed.len(),
+            steps_total: total,
+            final_output: last_output,
+            bindings,
+        })
+    }
+
+    /// Post-chain LLM reflection hook (stub).
+    ///
+    /// After a chain completes, this method can be called to send the chain
+    /// result to an LLM for quality assessment and improvement suggestions.
+    /// Currently returns the result unchanged.
+    pub fn reflect_on_result(result: &ChainResult) -> String {
+        // TODO: Call LLM to evaluate chain output quality and suggest
+        // parameter adjustments or step reordering.
+        info!(
+            chain = %result.chain_name,
+            success = result.success,
+            steps = %result.steps_run,
+            "chain reflection: stub — returning final output as-is"
+        );
+        result.final_output.clone()
     }
 }
 

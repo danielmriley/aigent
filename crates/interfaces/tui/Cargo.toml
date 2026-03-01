@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+advanced = []
 [dependencies]
 anyhow.workspace = true
 crossterm.workspace = true

@@ -290,6 +290,87 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
+// ── Qdrant backend (feature-gated) ──────────────────────────────────────────
+
+/// Configuration for connecting to a Qdrant vector database.
+#[cfg(feature = "qdrant")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QdrantConfig {
+    /// Qdrant gRPC endpoint (e.g. "http://localhost:6334").
+    pub endpoint: String,
+    /// Collection name to use.
+    pub collection: String,
+    /// Vector dimensions.
+    pub dimensions: usize,
+}
+
+#[cfg(feature = "qdrant")]
+impl Default for QdrantConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:6334".into(),
+            collection: "aigent_memories".into(),
+            dimensions: 384,
+        }
+    }
+}
+
+/// Qdrant-backed vector store.
+///
+/// Requires the `qdrant` feature flag on `aigent-memory`.
+/// Currently a stub implementation that stores vectors in memory and
+/// logs what would be sent to Qdrant.  Replace with `qdrant-client`
+/// calls when the dependency is added.
+#[cfg(feature = "qdrant")]
+pub struct QdrantVectorStore {
+    config: QdrantConfig,
+    // Fallback: use the flat store until qdrant-client is wired in.
+    inner: FlatVectorStore,
+}
+
+#[cfg(feature = "qdrant")]
+impl QdrantVectorStore {
+    pub fn new(config: QdrantConfig) -> Self {
+        let dims = config.dimensions;
+        Self {
+            config,
+            inner: FlatVectorStore::new(dims),
+        }
+    }
+
+    pub fn config(&self) -> &QdrantConfig {
+        &self.config
+    }
+}
+
+#[cfg(feature = "qdrant")]
+#[async_trait::async_trait]
+impl VectorBackend for QdrantVectorStore {
+    async fn upsert(&self, id: Uuid, vector: Vec<f32>) -> Result<()> {
+        tracing::debug!(
+            endpoint = %self.config.endpoint,
+            collection = %self.config.collection,
+            id = %id,
+            "qdrant stub: upsert (delegating to flat store)"
+        );
+        self.inner.upsert(id, vector).await
+    }
+
+    async fn remove(&self, id: Uuid) -> Result<()> {
+        tracing::debug!(id = %id, "qdrant stub: remove");
+        self.inner.remove(id).await
+    }
+
+    async fn search(&self, query: &[f32], k: usize) -> Result<Vec<VectorMatch>> {
+        tracing::debug!(k = k, "qdrant stub: search");
+        self.inner.search(query, k).await
+    }
+
+    async fn len(&self) -> usize {
+        self.inner.len().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

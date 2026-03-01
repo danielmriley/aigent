@@ -1033,6 +1033,414 @@ impl Tool for WorkspaceStatusTool {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+// ── sort ─────────────────────────────────────────────────────────────────────
+
+/// Sort lines of a file or input text.
+pub struct SortTool {
+    pub workspace_root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for SortTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sort".into(),
+            description: "Sort lines of a file alphabetically or numerically.".into(),
+            params: vec![
+                ToolParam::required("path", "File to sort (workspace-relative)"),
+                ToolParam::optional("numeric", "Sort numerically instead of lexicographically (default: false)"),
+                ToolParam::optional("reverse", "Reverse the sort order (default: false)"),
+                ToolParam::optional("unique", "Deduplicate after sorting (default: false)"),
+            ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: true,
+                group: "coreutils".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let path_str = args.get("path").cloned().unwrap_or_default();
+        let numeric = args.get("numeric").map(|v| v == "true").unwrap_or(false);
+        let reverse = args.get("reverse").map(|v| v == "true").unwrap_or(false);
+        let unique = args.get("unique").map(|v| v == "true").unwrap_or(false);
+
+        let full = self.workspace_root.join(&path_str);
+        if !full.starts_with(&self.workspace_root) {
+            return Ok(ToolOutput { output: "error: path escapes workspace".into(), success: false });
+        }
+
+        let text = match std::fs::read_to_string(&full) {
+            Ok(t) => t,
+            Err(e) => return Ok(ToolOutput { output: format!("error: {e}"), success: false }),
+        };
+
+        let mut lines: Vec<&str> = text.lines().collect();
+
+        if numeric {
+            lines.sort_by(|a, b| {
+                let na: f64 = a.trim().parse().unwrap_or(f64::MAX);
+                let nb: f64 = b.trim().parse().unwrap_or(f64::MAX);
+                na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            lines.sort();
+        }
+
+        if reverse {
+            lines.reverse();
+        }
+
+        if unique {
+            lines.dedup();
+        }
+
+        Ok(ToolOutput { output: lines.join("\n"), success: true })
+    }
+}
+
+// ── uniq ─────────────────────────────────────────────────────────────────────
+
+/// Remove consecutive duplicate lines from a file.
+pub struct UniqTool {
+    pub workspace_root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for UniqTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "uniq".into(),
+            description: "Remove consecutive duplicate lines. Use sort | uniq for global dedup.".into(),
+            params: vec![
+                ToolParam::required("path", "File to process (workspace-relative)"),
+                ToolParam::optional("count", "Prefix lines with occurrence count (default: false)"),
+            ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: true,
+                group: "coreutils".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let path_str = args.get("path").cloned().unwrap_or_default();
+        let count = args.get("count").map(|v| v == "true").unwrap_or(false);
+
+        let full = self.workspace_root.join(&path_str);
+        if !full.starts_with(&self.workspace_root) {
+            return Ok(ToolOutput { output: "error: path escapes workspace".into(), success: false });
+        }
+
+        let text = match std::fs::read_to_string(&full) {
+            Ok(t) => t,
+            Err(e) => return Ok(ToolOutput { output: format!("error: {e}"), success: false }),
+        };
+
+        let lines: Vec<&str> = text.lines().collect();
+        let mut result = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let mut n = 1usize;
+            while i + n < lines.len() && lines[i + n] == line {
+                n += 1;
+            }
+            if count {
+                result.push(format!("{:>7} {}", n, line));
+            } else {
+                result.push(line.to_string());
+            }
+            i += n;
+        }
+
+        Ok(ToolOutput { output: result.join("\n"), success: true })
+    }
+}
+
+// ── cut ──────────────────────────────────────────────────────────────────────
+
+/// Extract fields or character ranges from lines.
+pub struct CutTool {
+    pub workspace_root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for CutTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "cut".into(),
+            description: "Extract fields from each line using a delimiter.".into(),
+            params: vec![
+                ToolParam::required("path", "File to process (workspace-relative)"),
+                ToolParam::optional("delimiter", "Field delimiter (default: tab)"),
+                ToolParam::optional("fields", "Comma-separated field numbers (1-indexed), e.g. '1,3'"),
+                ToolParam::optional("characters", "Character range, e.g. '1-10'"),
+            ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: true,
+                group: "coreutils".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let path_str = args.get("path").cloned().unwrap_or_default();
+        let delim = args.get("delimiter").cloned().unwrap_or_else(|| "\t".to_string());
+        let fields = args.get("fields").cloned().unwrap_or_default();
+        let chars = args.get("characters").cloned().unwrap_or_default();
+
+        let full = self.workspace_root.join(&path_str);
+        if !full.starts_with(&self.workspace_root) {
+            return Ok(ToolOutput { output: "error: path escapes workspace".into(), success: false });
+        }
+
+        let text = match std::fs::read_to_string(&full) {
+            Ok(t) => t,
+            Err(e) => return Ok(ToolOutput { output: format!("error: {e}"), success: false }),
+        };
+
+        let mut result = Vec::new();
+
+        if !chars.is_empty() {
+            // Character mode: parse range like "1-10"
+            let parts: Vec<&str> = chars.split('-').collect();
+            let start = parts.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).saturating_sub(1);
+            let end = parts.get(1).and_then(|s| s.parse::<usize>().ok()).unwrap_or(usize::MAX);
+            for line in text.lines() {
+                let chars_vec: Vec<char> = line.chars().collect();
+                let slice: String = chars_vec.iter().skip(start).take(end - start).collect();
+                result.push(slice);
+            }
+        } else if !fields.is_empty() {
+            // Field mode
+            let field_indices: Vec<usize> = fields
+                .split(',')
+                .filter_map(|s| s.trim().parse::<usize>().ok())
+                .map(|i| i.saturating_sub(1))
+                .collect();
+
+            let delim_char = delim.chars().next().unwrap_or('\t');
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split(delim_char).collect();
+                let selected: Vec<&str> = field_indices
+                    .iter()
+                    .filter_map(|&i| parts.get(i).copied())
+                    .collect();
+                result.push(selected.join(&delim));
+            }
+        } else {
+            return Ok(ToolOutput {
+                output: "error: specify either 'fields' or 'characters'".into(),
+                success: false,
+            });
+        }
+
+        Ok(ToolOutput { output: result.join("\n"), success: true })
+    }
+}
+
+// ── sed (stream editor) ─────────────────────────────────────────────────────
+
+/// Simple sed-like find-and-replace on a file.
+pub struct SedTool {
+    pub workspace_root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for SedTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "sed".into(),
+            description: "Find and replace text in a file using regex. Operates on each line.".into(),
+            params: vec![
+                ToolParam::required("path", "File to process (workspace-relative)"),
+                ToolParam::required("pattern", "Regex pattern to match"),
+                ToolParam::required("replacement", "Replacement string ($1, $2 for captures)"),
+                ToolParam::optional("global", "Replace all occurrences per line (default: true)"),
+                ToolParam::optional("in_place", "Write result back to file (default: false)"),
+            ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Medium,
+                read_only: false,
+                group: "coreutils".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let path_str = args.get("path").cloned().unwrap_or_default();
+        let pattern = args.get("pattern").cloned().unwrap_or_default();
+        let replacement = args.get("replacement").cloned().unwrap_or_default();
+        let global = args.get("global").map(|v| v != "false").unwrap_or(true);
+        let in_place = args.get("in_place").map(|v| v == "true").unwrap_or(false);
+
+        let full = self.workspace_root.join(&path_str);
+        if !full.starts_with(&self.workspace_root) {
+            return Ok(ToolOutput { output: "error: path escapes workspace".into(), success: false });
+        }
+
+        let text = match std::fs::read_to_string(&full) {
+            Ok(t) => t,
+            Err(e) => return Ok(ToolOutput { output: format!("error: {e}"), success: false }),
+        };
+
+        let re = match regex::Regex::new(&pattern) {
+            Ok(r) => r,
+            Err(e) => return Ok(ToolOutput { output: format!("invalid regex: {e}"), success: false }),
+        };
+
+        let result: String = text
+            .lines()
+            .map(|line| {
+                if global {
+                    re.replace_all(line, replacement.as_str()).to_string()
+                } else {
+                    re.replace(line, replacement.as_str()).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if in_place {
+            if let Err(e) = std::fs::write(&full, &result) {
+                return Ok(ToolOutput { output: format!("write error: {e}"), success: false });
+            }
+        }
+
+        Ok(ToolOutput { output: result, success: true })
+    }
+}
+
+// ── echo ─────────────────────────────────────────────────────────────────────
+
+/// Echo text to output, optionally writing to a file.
+pub struct EchoTool {
+    pub workspace_root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for EchoTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "echo".into(),
+            description: "Output text. Optionally append or write to a file.".into(),
+            params: vec![
+                ToolParam::required("text", "Text to output"),
+                ToolParam::optional("file", "File to write to (workspace-relative)"),
+                ToolParam::optional("append", "Append instead of overwrite (default: false)"),
+            ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Medium,
+                read_only: false,
+                group: "coreutils".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let text = args.get("text").cloned().unwrap_or_default();
+        let file = args.get("file").cloned();
+        let append = args.get("append").map(|v| v == "true").unwrap_or(false);
+
+        if let Some(file_path) = file {
+            let full = self.workspace_root.join(&file_path);
+            if !full.starts_with(&self.workspace_root) {
+                return Ok(ToolOutput { output: "error: path escapes workspace".into(), success: false });
+            }
+            if let Some(parent) = full.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let res = if append {
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&full)
+                    .and_then(|mut f| writeln!(f, "{}", text))
+            } else {
+                std::fs::write(&full, &text).map(|_| ())
+            };
+            match res {
+                Ok(()) => Ok(ToolOutput { output: text, success: true }),
+                Err(e) => Ok(ToolOutput { output: format!("error: {e}"), success: false }),
+            }
+        } else {
+            Ok(ToolOutput { output: text, success: true })
+        }
+    }
+}
+
+// ── seq ──────────────────────────────────────────────────────────────────────
+
+/// Generate a sequence of numbers.
+pub struct SeqTool;
+
+#[async_trait]
+impl Tool for SeqTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "seq".into(),
+            description: "Generate a sequence of numbers from start to end with optional step.".into(),
+            params: vec![
+                ToolParam::required("end", "End value (inclusive)"),
+                ToolParam::optional("start", "Start value (default: 1)"),
+                ToolParam::optional("step", "Step increment (default: 1)"),
+                ToolParam::optional("separator", "Separator between numbers (default: newline)"),
+            ],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: true,
+                group: "coreutils".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let end: f64 = args.get("end").and_then(|v| v.parse().ok()).unwrap_or(10.0);
+        let start: f64 = args.get("start").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+        let step: f64 = args.get("step").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+        let sep = args.get("separator").cloned().unwrap_or_else(|| "\n".to_string());
+
+        if step == 0.0 {
+            return Ok(ToolOutput { output: "error: step cannot be 0".into(), success: false });
+        }
+
+        let mut nums = Vec::new();
+        let mut val = start;
+        if step > 0.0 {
+            while val <= end + f64::EPSILON {
+                nums.push(if val == val.floor() {
+                    format!("{}", val as i64)
+                } else {
+                    format!("{val}")
+                });
+                val += step;
+            }
+        } else {
+            while val >= end - f64::EPSILON {
+                nums.push(if val == val.floor() {
+                    format!("{}", val as i64)
+                } else {
+                    format!("{val}")
+                });
+                val += step;
+            }
+        }
+
+        Ok(ToolOutput { output: nums.join(&sep), success: true })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

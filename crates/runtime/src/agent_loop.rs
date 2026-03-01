@@ -267,6 +267,62 @@ impl AgentLoop {
     pub fn record_snapshot(&mut self, snapshot: ReactSnapshot) {
         self.history.push(snapshot);
     }
+
+    /// Score the overall outcome of the agent loop based on its history.
+    ///
+    /// Heuristic scoring (no LLM call):
+    /// - Penalises loops that hit max_rounds without finishing
+    /// - Rewards loops that produced a final answer
+    /// - Penalises high error rates in tool calls
+    /// - Returns an `EvalScore` with the computed score and rationale
+    pub fn score_outcome(&self) -> EvalScore {
+        let mut score: f32 = 0.5; // base
+        let mut reasons = Vec::new();
+
+        // Completed before max rounds?
+        let finished_cleanly = self.phase == ReactPhase::Done && self.round < self.max_rounds;
+        if finished_cleanly {
+            score += 0.2;
+            reasons.push("completed before max rounds".to_string());
+        } else if self.phase == ReactPhase::Done {
+            score += 0.1;
+            reasons.push("completed at max rounds".to_string());
+        } else {
+            score -= 0.2;
+            reasons.push("did not reach Done phase".to_string());
+        }
+
+        // Has a final answer?
+        let has_answer = self.history.last().is_some_and(|s| s.answer.is_some());
+        if has_answer {
+            score += 0.15;
+            reasons.push("produced final answer".to_string());
+        }
+
+        // Critique quality (if any critiques exist)
+        let critique_count = self.history.iter().filter(|s| s.critique.is_some()).count();
+        if critique_count > 0 {
+            score += 0.05;
+            reasons.push(format!("{critique_count} self-critiques performed"));
+        }
+
+        // Round efficiency: fewer rounds = better
+        if self.max_rounds > 0 {
+            let efficiency = 1.0 - (self.round as f32 / self.max_rounds as f32);
+            let bonus = efficiency * 0.1;
+            score += bonus;
+            reasons.push(format!("efficiency bonus: {bonus:.2}"));
+        }
+
+        score = score.clamp(0.0, 1.0);
+        let accepted = score >= 0.6;
+
+        EvalScore {
+            score,
+            rationale: reasons.join("; "),
+            accepted,
+        }
+    }
 }
 
 #[cfg(test)]

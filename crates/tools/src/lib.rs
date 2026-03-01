@@ -412,11 +412,11 @@ impl ToolRegistry {
 pub mod builtins;
 pub use builtins::{
     BrowsePageTool,
-    CalendarAddEventTool, CpTool, DraftEmailTool, FetchPageTool, FindTool,
-    GitRollbackTool, GrepTool, HeadTool, ListDirTool, MkdirTool, MvTool,
-    ReadFileTool, RemindMeTool, RmTool, RunShellTool, TailTool, TouchTool,
-    TreeTool, WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool,
-    WriteFileTool,
+    CalendarAddEventTool, CpTool, CutTool, DraftEmailTool, EchoTool,
+    FetchPageTool, FindTool, GitRollbackTool, GrepTool, HeadTool, ListDirTool,
+    MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool, RunShellTool,
+    SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool, UniqTool,
+    WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool, WriteFileTool,
 };
 
 // ── ToolRegistry tests ───────────────────────────────────────────────────────
