@@ -257,7 +257,8 @@ async fn handle_telegram_input(
             // ReAct / swarm events — not relevant for Telegram.
             BackendEvent::ReactPhaseChanged { .. }
             | BackendEvent::SubAgentSpawned { .. }
-            | BackendEvent::SubAgentCompleted { .. } => {}
+            | BackendEvent::SubAgentCompleted { .. }
+            | BackendEvent::ConfigUpdated { .. } => {}
         }
     }
     // Propagate IPC-level errors from stream_submit.

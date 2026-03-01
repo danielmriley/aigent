@@ -198,6 +198,12 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
                         let msg = update_model_provider(provider.trim(), &daemon).await?;
                         let _ = backend_tx.send(BackendEvent::Token(msg));
                         let _ = backend_tx.send(BackendEvent::Done);
+                        if let Ok(st) = daemon.get_status().await {
+                            let _ = backend_tx.send(BackendEvent::ConfigUpdated {
+                                model: st.model,
+                                provider: st.provider,
+                            });
+                        }
                         return Ok(());
                     }
 
@@ -205,6 +211,12 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
                         let msg = update_model_selection(model.trim(), &daemon).await?;
                         let _ = backend_tx.send(BackendEvent::Token(msg));
                         let _ = backend_tx.send(BackendEvent::Done);
+                        if let Ok(st) = daemon.get_status().await {
+                            let _ = backend_tx.send(BackendEvent::ConfigUpdated {
+                                model: st.model,
+                                provider: st.provider,
+                            });
+                        }
                         return Ok(());
                     }
 

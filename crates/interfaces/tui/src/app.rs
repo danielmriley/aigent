@@ -717,6 +717,10 @@ impl App {
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };
                 self.state.status = format!("{icon} sub-agent [{role}] finished");
             }
+            BackendEvent::ConfigUpdated { model, provider } => {
+                self.state.model_name = Some(model.clone());
+                self.state.status = format!("model={model} provider={provider}");
+            }
         }
     }
 

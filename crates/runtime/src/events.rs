@@ -69,5 +69,11 @@ pub enum BackendEvent {
         success: bool,
         summary: String,
     },
+    /// Emitted after a `/model set`, `/model provider`, or similar config
+    /// change so the TUI header can refresh the displayed model badge.
+    ConfigUpdated {
+        model: String,
+        provider: String,
+    },
 }
 
