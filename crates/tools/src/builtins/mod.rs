@@ -8,6 +8,7 @@ mod shell;
 mod web;
 mod calendar;
 mod web_browse;
+mod scheduler;
 
 pub use browse::BrowsePageTool;
 pub use coreutils::{
@@ -20,6 +21,7 @@ pub use shell::RunShellTool;
 pub use web::{WebSearchTool, FetchPageTool};
 pub use calendar::CalendarAddEventTool;
 pub use web_browse::WebBrowseTool;
+pub use scheduler::{CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool};
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};

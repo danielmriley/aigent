@@ -9,9 +9,10 @@ use schemars::JsonSchema;
 // ── Tool trait and registry ──────────────────────────────────────────────────
 
 /// JSON-friendly type hint for a tool parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ParamType {
+    #[default]
     String,
     Number,
     Integer,
@@ -20,25 +21,14 @@ pub enum ParamType {
     Object,
 }
 
-impl Default for ParamType {
-    fn default() -> Self {
-        Self::String
-    }
-}
-
 /// Security classification for a tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SecurityLevel {
+    #[default]
     Low,
     Medium,
     High,
-}
-
-impl Default for SecurityLevel {
-    fn default() -> Self {
-        Self::Low
-    }
 }
 
 /// Optional rich metadata about a tool (security, grouping, cost).

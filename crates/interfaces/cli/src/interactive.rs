@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 
 use aigent_config::AppConfig;
 use aigent_runtime::{BackendEvent, DaemonClient};
+use aigent_runtime::history as chat_history;
 use aigent_llm::{list_ollama_models, list_openrouter_models};
 
 use crate::CliModelProvider;
@@ -16,6 +17,29 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
 
     let (backend_tx, backend_rx) = aigent_ui::tui::create_backend_channel();
     let mut app = aigent_ui::App::new(backend_rx, config);
+
+    // Restore recent conversation history so the TUI shows prior context.
+    match chat_history::load_recent(50) {
+        Ok(turns) => {
+            for turn in &turns {
+                match turn.role.as_str() {
+                    "user" => app.push_user_message(turn.content.clone()),
+                    "assistant" => app.push_assistant_message(turn.content.clone()),
+                    _ => {}
+                }
+            }
+            if !turns.is_empty() {
+                app.push_assistant_message(format!(
+                    "— restored {} recent turns from history —",
+                    turns.len()
+                ));
+            }
+        }
+        Err(err) => {
+            tracing::debug!("failed to load history: {err}");
+        }
+    }
+
     app.push_assistant_message(format!(
         "{} is online. Type /help for commands.",
         config.agent.name

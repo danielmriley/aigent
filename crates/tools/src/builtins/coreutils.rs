@@ -830,14 +830,14 @@ fn grep_file(
                 OutputMode::Plain => {
                     // Context before.
                     let start = i.saturating_sub(ctx);
-                    for ci in start..i {
-                        results.push(format!("{}:{}- {}", rel.display(), ci + 1, lines[ci]));
+                    for (ci, ctx_line) in lines[start..i].iter().enumerate() {
+                        results.push(format!("{}:{}- {}", rel.display(), start + ci + 1, ctx_line));
                     }
                     results.push(format!("{}:{}  {}", rel.display(), i + 1, line));
                     // Context after.
                     let end = (i + 1 + ctx).min(lines.len());
-                    for ci in (i + 1)..end {
-                        results.push(format!("{}:{}- {}", rel.display(), ci + 1, lines[ci]));
+                    for (ci, ctx_line) in lines[(i + 1)..end].iter().enumerate() {
+                        results.push(format!("{}:{}- {}", rel.display(), i + 2 + ci, ctx_line));
                     }
                 }
             }
@@ -2008,16 +2008,9 @@ fn sort_lines_uutils(lines: &mut Vec<&str>, numeric: bool, reverse: bool, unique
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
         }
-        if let Ok(output) = child.wait_with_output() {
-            if output.status.success() {
-                let sorted = String::from_utf8_lossy(&output.stdout);
-                let _new_lines: Vec<&str> = sorted.lines().collect();
-                lines.clear();
-                // Can't hold references to `sorted` after this scope, so fall
-                // through to the default implementation.
-                // Instead, we'll just use the non-uutils path here as a
-                // pragmatic choice — the pure-Rust sort is already correct.
-            }
+        if let Ok(_output) = child.wait_with_output() {
+            // The system sort output cannot be used because `lines` borrows
+            // from the caller. Fall through to the pure-Rust sort below.
         }
     }
 

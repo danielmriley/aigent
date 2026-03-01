@@ -525,7 +525,7 @@ pub fn default_registry(
         ListDirTool, MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool,
         RunShellTool, SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool,
         UniqTool, WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool,
-        WriteFileTool,
+        WriteFileTool, CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool,
     };
 
     let registry = ToolRegistry::default();
@@ -685,6 +685,19 @@ pub fn default_registry(
         (
             "seq",
             Box::new(SeqTool),
+        ),
+        // ── Scheduler (self-scheduling) ──────────────────────────────────
+        (
+            "create_cron_job",
+            Box::new(CreateCronJobTool),
+        ),
+        (
+            "remove_cron_job",
+            Box::new(RemoveCronJobTool),
+        ),
+        (
+            "list_cron_jobs",
+            Box::new(ListCronJobsTool),
         ),
     ];
 

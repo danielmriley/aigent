@@ -21,6 +21,8 @@ use aigent_memory::{EmbedFn, MemoryManager};
 use aigent_tools::ToolRegistry;
 
 use crate::{AgentRuntime, BackendEvent, ConversationTurn, DaemonStatus};
+use crate::schedule_store;
+use crate::scheduler::{ScheduledTask, SchedulerState, spawn_scheduler, HeartbeatFn};
 
 /// Broadcast channel capacity. Old events are dropped when subscribers lag.
 const BROADCAST_CAP: usize = 256;
@@ -75,6 +77,15 @@ struct DaemonState {
     /// disabled.  Aborted gracefully during daemon shutdown so the task does not
     /// outlive the daemon process.
     proactive_handle: Option<tokio::task::AbortHandle>,
+    /// Shared scheduler state for cron/interval tasks.
+    scheduler_state: SchedulerState,
+    /// Action prompts keyed by task name — looked up by the heartbeat callback.
+    schedule_prompts: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>>,
+    /// Path to the schedule persistence file.
+    #[allow(dead_code)]
+    schedule_file: PathBuf,
+    /// Handle for the scheduler task so it can be aborted on shutdown.
+    scheduler_handle: Option<tokio::task::AbortHandle>,
 }
 
 impl DaemonState {
@@ -320,6 +331,10 @@ pub async fn run_unified_daemon(
         proactive_total_sent: 0,
         last_proactive_at: None,
         proactive_handle: None,
+        scheduler_state: SchedulerState::new(),
+        schedule_prompts: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        schedule_file: schedule_store::schedule_file_path(),
+        scheduler_handle: None,
     }));
 
     let listener = UnixListener::bind(&socket_path)?;
@@ -358,6 +373,70 @@ pub async fn run_unified_daemon(
         state.lock().await.proactive_handle = Some(handle);
     }
 
+    // ── Cron / Interval Scheduler ──────────────────────────────────────────
+    {
+        let schedule_file = schedule_store::schedule_file_path();
+        let entries: Vec<schedule_store::TaskEntry> = schedule_store::load_tasks(&schedule_file).unwrap_or_default();
+        info!(count = entries.len(), "loaded scheduled tasks from disk");
+
+        // Build runtime ScheduledTask list and populate the prompts map.
+        let mut tasks: Vec<ScheduledTask> = Vec::new();
+        let prompts: Arc<std::sync::RwLock<std::collections::HashMap<String, String>>> = {
+            let s = state.lock().await;
+            s.schedule_prompts.clone()
+        };
+        {
+            let mut map = prompts.write().unwrap();
+            for entry in &entries {
+                match entry.to_scheduled_task() {
+                    Ok(task) => {
+                        map.insert(task.name.clone(), entry.action_prompt.clone());
+                        tasks.push(task);
+                    }
+                    Err(err) => {
+                        warn!(name = %entry.name, ?err, "skipping invalid scheduled task");
+                    }
+                }
+            }
+        }
+
+        let sched_state = state.lock().await.scheduler_state.clone();
+        let socket_for_sched = socket_path.clone();
+        let prompts_for_sched = prompts.clone();
+
+        let heartbeat: HeartbeatFn = Arc::new(move |task_name: String| {
+            let socket = socket_for_sched.clone();
+            let prompts = prompts_for_sched.clone();
+            Box::pin(async move {
+                let prompt = {
+                    let map = prompts.read().unwrap();
+                    map.get(&task_name).cloned()
+                };
+                let Some(prompt) = prompt else {
+                    tracing::debug!(task = %task_name, "scheduler: no prompt for task");
+                    return Ok(());
+                };
+                // Submit through the daemon socket like any other client.
+                let client = crate::DaemonClient::new(&socket);
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                client
+                    .stream_submit(
+                        format!("[scheduled:{task_name}] {prompt}"),
+                        "scheduler",
+                        tx,
+                    )
+                    .await?;
+                // Drain events so the connection completes.
+                while rx.recv().await.is_some() {}
+                Ok(())
+            })
+        });
+
+        let handle = spawn_scheduler(tasks, sched_state, heartbeat);
+        state.lock().await.scheduler_handle = Some(handle.abort_handle());
+        info!("cron scheduler started");
+    }
+
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -385,6 +464,14 @@ pub async fn run_unified_daemon(
         if let Some(h) = handle {
             h.abort();
             info!("proactive task stopped");
+        }
+    }
+    {
+        // Cancel the cron scheduler.
+        let handle = state.lock().await.scheduler_handle.take();
+        if let Some(h) = handle {
+            h.abort();
+            info!("cron scheduler stopped");
         }
     }
     {

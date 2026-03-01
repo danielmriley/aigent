@@ -30,7 +30,7 @@ pub enum TaskSchedule {
     /// Cron expression (6-field: sec min hour dom month dow).
     ///
     /// Example: `"0 */15 * * * *"` = every 15 minutes.
-    Cron(CronSchedule),
+    Cron(Box<CronSchedule>),
 }
 
 impl TaskSchedule {
@@ -43,7 +43,7 @@ impl TaskSchedule {
     /// ```
     pub fn cron(expr: &str) -> Result<Self, cron::error::Error> {
         let schedule: CronSchedule = expr.parse()?;
-        Ok(Self::Cron(schedule))
+        Ok(Self::Cron(Box::new(schedule)))
     }
 
     /// Create a fixed-interval schedule.
@@ -175,6 +175,7 @@ impl ScheduledTask {
 
 /// Per-task execution state.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct TaskState {
     /// When the task last executed successfully.
     pub last_run: Option<DateTime<Utc>>,
@@ -184,17 +185,6 @@ pub struct TaskState {
     pub fail_count: u64,
     /// Whether the task is currently running.
     pub running: bool,
-}
-
-impl Default for TaskState {
-    fn default() -> Self {
-        Self {
-            last_run: None,
-            run_count: 0,
-            fail_count: 0,
-            running: false,
-        }
-    }
 }
 
 /// Thread-safe scheduler state shared between the scheduler loop and the
