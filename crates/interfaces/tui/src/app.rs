@@ -7,6 +7,7 @@
 use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 use ratatui::Frame;
 use tokio::sync::mpsc;
+#[cfg(not(feature = "advanced"))]
 use tui_textarea::{Input, Key};
 
 use aigent_config::AppConfig;
@@ -24,7 +25,13 @@ use crate::events::AppEvent;
 use crate::layout;
 use crate::state::SidebarTab;
 use crate::theme::Theme;
+#[cfg(not(feature = "advanced"))]
 use crate::widgets::markdown::render_markdown_lines;
+
+#[cfg(feature = "advanced")]
+use crate::components::vim_input::{InputAction, VimInput};
+#[cfg(feature = "advanced")]
+use crate::widgets::markdown::render_markdown_auto;
 
 // Re-export state types so `crate::app::X` paths keep working.
 pub use crate::state::{AppState, Focus, Message, UiCommand};
@@ -53,6 +60,9 @@ pub struct App {
     pub footer: Footer,
     pub command_palette: CommandPalette,
     pub file_picker: FilePicker,
+
+    #[cfg(feature = "advanced")]
+    pub vim_input: VimInput,
 }
 
 impl App {
@@ -81,6 +91,8 @@ impl App {
                 tool_history: Vec::new(),
                 sidebar_tab: SidebarTab::Sessions,
                 model_name: Some(config.active_model().to_string()),
+                memory_samples: Vec::new(),
+                input_history: Vec::new(),
             },
             backend_rx,
             focus: Focus::Input,
@@ -97,17 +109,25 @@ impl App {
             footer: Footer::new(),
             command_palette: CommandPalette::new(),
             file_picker: FilePicker::new(),
+            #[cfg(feature = "advanced")]
+            vim_input: VimInput::new(),
         }
     }
 
     // ── public helpers (API contract with CLI crate) ───────────
 
     pub fn input_text(&self) -> String {
-        self.input.text()
+        #[cfg(feature = "advanced")]
+        { return self.vim_input.text(); }
+        #[cfg(not(feature = "advanced"))]
+        { self.input.text() }
     }
 
     pub fn clear_input(&mut self) {
-        self.input.clear();
+        #[cfg(feature = "advanced")]
+        { self.vim_input.clear(); }
+        #[cfg(not(feature = "advanced"))]
+        { self.input.clear(); }
     }
 
     pub fn push_user_message(&mut self, text: String) {
@@ -403,6 +423,38 @@ impl App {
         }
 
         // ── normal input mode ──────────────────────────────────
+        // Advanced vim input mode.
+        #[cfg(feature = "advanced")]
+        {
+            match self.vim_input.handle_key(key) {
+                InputAction::Submit => {
+                    let text = normalize_for_submit(&self.vim_input.text());
+                    if text.is_empty() {
+                        return None;
+                    }
+                    if text == "/exit" {
+                        self.push_assistant_message("session closed".into());
+                        let _ = self.vim_input.submit_and_clear();
+                        return Some(UiCommand::Quit);
+                    }
+                    self.push_user_message(text.clone());
+                    self.chat.auto_follow = true;
+                    let _ = self.vim_input.submit_and_clear();
+                    self.state.status = "thinking...".to_string();
+                    return Some(UiCommand::Submit(text));
+                }
+                InputAction::Consumed => {
+                    self.file_picker.refresh(&self.vim_input.text());
+                    return None;
+                }
+                InputAction::Ignored => {
+                    return None;
+                }
+            }
+        }
+
+        // Standard tui-textarea input mode.
+        #[cfg(not(feature = "advanced"))]
         match key.code {
             KeyCode::Esc => {
                 self.state.history_mode = true;
@@ -517,8 +569,16 @@ impl App {
                         && last.content.starts_with("[stream]")
                     {
                         last.content = self.pending_stream.clone();
-                        last.rendered_md =
-                            Some(render_markdown_lines(&last.content));
+                        #[cfg(feature = "advanced")]
+                        {
+                            last.rendered_md =
+                                Some(render_markdown_auto(&last.content));
+                        }
+                        #[cfg(not(feature = "advanced"))]
+                        {
+                            last.rendered_md =
+                                Some(render_markdown_lines(&last.content));
+                        }
                     }
                 }
                 self.pending_stream.clear();
@@ -536,6 +596,11 @@ impl App {
             }
             BackendEvent::MemoryUpdated => {
                 self.state.status = "memory updated".to_string();
+                let count = self.state.memory_peek.len() as u64;
+                self.state.memory_samples.push(count);
+                if self.state.memory_samples.len() > 200 {
+                    self.state.memory_samples.remove(0);
+                }
             }
             BackendEvent::ToolCallStart(info) => {
                 self.active_tool = Some(info.name.clone());
@@ -612,6 +677,9 @@ impl App {
                     format!("belief ({:.2}): {}", confidence, display);
             }
             BackendEvent::ProactiveMessage { content } => {
+                #[cfg(feature = "advanced")]
+                let rendered = render_markdown_auto(&content);
+                #[cfg(not(feature = "advanced"))]
                 let rendered = render_markdown_lines(&content);
                 self.state.messages.push(Message {
                     role: "aigent".to_string(),
@@ -655,13 +723,19 @@ impl App {
     // ── draw (delegates to components) ─────────────────────────
 
     pub fn draw(&mut self, frame: &mut Frame<'_>) {
-        // Update input wrap width from terminal size.
-        self.input.wrap_width =
-            usize::from(frame.area().width.saturating_sub(4)).max(8);
-        self.input.apply_soft_wrap();
-
-        let input_line_count = self.input.textarea.lines().len().max(1);
-        let input_height = (input_line_count as u16 + 2).clamp(3, 8);
+        #[cfg(feature = "advanced")]
+        let input_height: u16 = {
+            let line_count = self.vim_input.text().lines().count().max(1);
+            (line_count as u16 + 2).clamp(3, 8)
+        };
+        #[cfg(not(feature = "advanced"))]
+        let input_height: u16 = {
+            self.input.wrap_width =
+                usize::from(frame.area().width.saturating_sub(4)).max(8);
+            self.input.apply_soft_wrap();
+            let input_line_count = self.input.textarea.lines().len().max(1);
+            (input_line_count as u16 + 2).clamp(3, 8)
+        };
 
         let [header_area, middle_area, input_area, footer_area] =
             layout::root_layout(frame.area(), input_height);
@@ -712,6 +786,9 @@ impl App {
         }
 
         // ── input ──────────────────────────────────────────────
+        #[cfg(feature = "advanced")]
+        self.vim_input.draw(frame, input_area, &self.theme);
+        #[cfg(not(feature = "advanced"))]
         self.input.draw(frame, input_area, &self.theme);
 
         // ── footer ─────────────────────────────────────────────

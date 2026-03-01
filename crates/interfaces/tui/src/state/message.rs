@@ -62,6 +62,12 @@ pub struct AppState {
     pub tool_history: Vec<ToolCallEntry>,
     pub sidebar_tab: SidebarTab,
     pub model_name: Option<String>,
+
+    // ── advanced TUI fields ─────────────────────────────────
+    /// Rolling window of memory-item counts for the sparkline chart.
+    pub memory_samples: Vec<u64>,
+    /// Input history for fuzzy search (advanced vim input).
+    pub input_history: Vec<String>,
 }
 
 /// State for the file-picker popup.

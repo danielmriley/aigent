@@ -11,6 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+#[cfg(feature = "advanced")]
+use ratatui::layout::{Constraint, Layout};
+
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -148,6 +151,25 @@ impl ContextPanel {
                     .border_style(Style::default().fg(theme.border)),
             )
             .wrap(Wrap { trim: true });
+
+        // ── advanced: split area to include charts ──────────────
+        #[cfg(feature = "advanced")]
+        {
+            use crate::widgets::charts;
+
+            let chunks = Layout::vertical([
+                Constraint::Min(10),        // text info
+                Constraint::Length(8),       // tool success chart
+                Constraint::Length(5),       // memory sparkline
+            ])
+            .split(area);
+
+            frame.render_widget(widget, chunks[0]);
+            charts::draw_tool_success_chart(frame, chunks[1], state, theme);
+            charts::draw_memory_sparkline(frame, chunks[2], state, theme);
+        }
+
+        #[cfg(not(feature = "advanced"))]
         frame.render_widget(widget, area);
     }
 }

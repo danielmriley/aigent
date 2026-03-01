@@ -309,3 +309,42 @@ fn highlight_code_block(code: &str, lang: &str) -> Vec<Line<'static>> {
 fn syntect_to_ratatui_color(c: highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
+
+// ── advanced: tui-markdown based renderer ──────────────────────
+
+/// Render markdown using the `tui-markdown` crate when the `advanced`
+/// feature is enabled.  Falls back to the hand-rolled renderer above
+/// when the feature is off.
+///
+/// The public entry point that callers should use is
+/// [`render_markdown_auto`] which dispatches at compile time.
+/// Unified entry point — uses `tui-markdown` when `advanced` is
+/// enabled, otherwise the hand-rolled renderer.
+#[cfg(feature = "advanced")]
+pub fn render_markdown_auto(input: &str) -> Vec<Line<'static>> {
+    // tui-markdown returns a ratatui_core::Text which may differ from
+    // ratatui::text::Text when versions diverge.  Convert via the
+    // display representation to bridge the gap safely.
+    let raw = tui_markdown::from_str(input);
+    // The ratatui_core::Text has .lines which are ratatui_core::Line.
+    // Each Line has .spans which are ratatui_core::Span.
+    // We rebuild using our local ratatui types.
+    raw.lines
+        .into_iter()
+        .map(|line| {
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .map(|span| {
+                    Span::styled(span.content.into_owned(), Style::default())
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "advanced"))]
+pub fn render_markdown_auto(input: &str) -> Vec<Line<'static>> {
+    render_markdown_lines(input)
+}

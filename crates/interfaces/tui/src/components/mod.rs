@@ -11,3 +11,5 @@ pub mod footer;
 pub mod input;
 pub mod sidebar;
 pub mod status_bar;
+#[cfg(feature = "advanced")]
+pub mod vim_input;
