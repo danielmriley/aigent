@@ -54,19 +54,40 @@ impl MemoryManager {
     /// `config.memory.forget_episodic_after_days > 0`.
     ///
     /// Returns the number of entries removed.
-    pub fn run_forgetting_pass(&mut self, forget_after_days: u64, min_confidence: f32) -> usize {
+    pub async fn run_forgetting_pass(&mut self, forget_after_days: u64, min_confidence: f32) -> Result<usize> {
         if forget_after_days == 0 {
-            return 0;
+            return Ok(0);
         }
         let cutoff = Utc::now() - Duration::days(forget_after_days as i64);
-        let before = self.store.len();
-        self.store.retain(|e| {
-            // Keep if wrong tier, too recent, or confidence is high enough.
-            e.tier != MemoryTier::Episodic
-                || e.created_at > cutoff
-                || e.confidence >= min_confidence
-        });
-        let removed = before.saturating_sub(self.store.len());
+
+        // Identify entries to forget first, then remove from store and event log.
+        let forget_ids: Vec<uuid::Uuid> = self.store.all().iter()
+            .filter(|e| {
+                e.tier == MemoryTier::Episodic
+                    && e.created_at <= cutoff
+                    && e.confidence < min_confidence
+            })
+            .map(|e| e.id)
+            .collect();
+
+        if forget_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let id_set: std::collections::HashSet<uuid::Uuid> = forget_ids.iter().copied().collect();
+        self.store.retain(|e| !id_set.contains(&e.id));
+
+        // Purge from event log so forgotten entries don't reappear on restart.
+        if let Some(event_log) = &self.event_log {
+            let events = event_log.load().await?;
+            let kept = events
+                .into_iter()
+                .filter(|ev| !id_set.contains(&ev.entry.id))
+                .collect::<Vec<_>>();
+            event_log.overwrite(&kept).await?;
+        }
+
+        let removed = forget_ids.len();
         if removed > 0 {
             info!(
                 removed,
@@ -75,7 +96,7 @@ impl MemoryManager {
                 "lightweight forgetting: pruned stale episodic entries"
             );
         }
-        removed
+        Ok(removed)
     }
 
     // ── Content deduplication ──────────────────────────────────────────────

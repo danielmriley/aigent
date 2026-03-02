@@ -236,7 +236,7 @@ impl MemoryManager {
         content: String,
         source: String,
     ) -> Result<MemoryEntry> {
-        self.record_inner_tagged(tier, content, source, vec![]).await
+        self.record_inner_tagged(tier, content, source, vec![], None).await
     }
 
     /// Like [`record_inner`] but attaches semantic `tags` to the entry.
@@ -244,12 +244,15 @@ impl MemoryManager {
     /// Tags are persisted in the event log and used by
     /// [`relational_state_block`] for classification instead of keyword
     /// matching.  The LLM assigns tags during the agentic sleep cycle.
+    ///
+    /// `confidence_override` optionally replaces the default 0.7 confidence.
     async fn record_inner_tagged(
         &mut self,
         tier: MemoryTier,
         content: String,
         source: String,
         tags: Vec<String>,
+        confidence_override: Option<f32>,
     ) -> Result<MemoryEntry> {
         let embedding = match &self.embed_fn {
             Some(f) => f(content.clone()).await,
@@ -260,7 +263,7 @@ impl MemoryManager {
             tier,
             content,
             source,
-            confidence: 0.7,
+            confidence: confidence_override.map(|c| c.clamp(0.0, 1.0)).unwrap_or(0.7),
             valence: 0.0,
             created_at: Utc::now(),
             provenance_hash: "local-dev-placeholder".to_string(),
@@ -311,16 +314,15 @@ impl MemoryManager {
         confidence: f32,
     ) -> Result<MemoryEntry> {
         let claim: String = claim.into();
-        let mut entry = self.record_inner_tagged(
+        let entry = self.record_inner_tagged(
             MemoryTier::Core,
             claim,
             "belief".to_string(),
             vec!["belief".to_string()],
+            Some(confidence),
         ).await?;
-        // Override confidence with the caller-supplied value.
-        entry.confidence = confidence.clamp(0.0, 1.0);
         self.invalidate_prompt_caches();
-        info!(claim = %entry.content, confidence, "belief recorded");
+        info!(claim = %entry.content, confidence = entry.confidence, "belief recorded");
         Ok(entry)
     }
 

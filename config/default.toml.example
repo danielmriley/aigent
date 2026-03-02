@@ -60,7 +60,7 @@ tool_allowlist = []
 tool_denylist = []
 # Tools that bypass interactive approval even when approval_required = true.
 # The four safe built-in tools are exempt by default.
-approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search", "browse_page", "fetch_page"]
+approval_exempt_tools = ["calendar_add_event", "remind_me", "draft_email", "web_search", "browse_page"]
 # Maximum number of times any single tool may be called per session.
 # 0 = unlimited.  Default: 25.
 # max_calls_per_tool = 25
@@ -91,7 +91,8 @@ approval_mode = "balanced"
 
 # Brave Search API key.  When non-empty the web_search tool uses the Brave
 # Search REST API instead of DuckDuckGo Instant Answers.
-# Can also be set via the BRAVE_API_KEY environment variable.
+# RECOMMENDED: set via the BRAVE_API_KEY environment variable (or .env file)
+# instead of here.  Env vars always take precedence over this file.
 # Get a free key at https://api.search.brave.com/app/
 brave_api_key = ""
 
@@ -117,19 +118,20 @@ max_tool_rounds = 5
 
 # ── Search provider configuration ────────────────────────────────────────────
 # Tavily Search API key. Provides AI-generated answers alongside results.
-# Get a free key at https://tavily.com
+# RECOMMENDED: set via TAVILY_API_KEY env var.  Get a free key at https://tavily.com
 tavily_api_key = ""
 
 # SearXNG base URL. Self-hosted meta-search engine.
+# RECOMMENDED: set via SEARXNG_BASE_URL env var.
 # Example: "http://localhost:8080"
 searxng_base_url = ""
 
 # Serper (Google Search) API key.  Uses the Google Search API via serper.dev.
-# Get a key at https://serper.dev
+# RECOMMENDED: set via SERPER_API_KEY env var.  Get a key at https://serper.dev
 serper_api_key = ""
 
 # Exa.ai API key for semantic/neural web search.
-# Get a key at https://exa.ai
+# RECOMMENDED: set via EXA_API_KEY env var.  Get a key at https://exa.ai
 exa_api_key = ""
 
 # Ordered list of search providers to try.  The agent tries each in order and

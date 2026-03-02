@@ -363,7 +363,7 @@ full tool access. Follow this protocol:\n\
      open questions. Also call list_cron_jobs to see your active agenda.\n\
   2. DECIDE: Pick the highest-value action — unresolved user problems \
      take priority, then scheduled research, then curiosity-driven exploration.\n\
-  3. ACT: Execute using web_search, browse_page, fetch_page, run_shell, \
+  3. ACT: Execute using web_search, browse_page, run_shell, \
      read_file, or any other tool you need. Chain multiple tool calls.\n\
   4. RECORD: Your tool outputs are automatically saved to procedural memory, \
      but ALSO output a concise summary of what you learned as your final \
@@ -488,7 +488,7 @@ Step 5: Reload \u{2014} make the daemon pick up the new skill immediately:\n\
   - stdout is buffered to 256KB \u{2014} keep output concise\n\
   - Only serde_json is available as a dependency (no network access from inside WASM)\n\
   - For tools needing HTTP/network, use run_shell to call curl or delegate to \n\
-    your existing web_search/fetch_page tools in a tool chain\n\
+    your existing web_search/browse_page tools in a tool chain\n\
   - Use descriptive tool names with underscores (my_skill_name, not my-skill-name)\n\
   - Write clear param descriptions \u{2014} these are what you see in your AVAILABLE TOOLS list\n\
   - All skill source code lives inside your workspace at extensions/skills-src/\n\
