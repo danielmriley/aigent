@@ -10,6 +10,7 @@ pub struct DaemonStatus {
     pub provider: String,
     pub model: String,
     pub thinking_level: String,
+    pub external_thinking: bool,
     pub memory_total: usize,
     pub memory_core: usize,
     pub memory_user_profile: usize,
