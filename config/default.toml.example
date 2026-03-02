@@ -151,6 +151,14 @@ exa_api_key = ""
 search_providers = ["brave", "tavily", "serper", "exa", "searxng", "duckduckgo"]
 
 
+# ── Skills (WASM tool plugins) ───────────────────────────────────────────────
+[tools.skills]
+enabled = true
+skills_dir = "extensions/skills"
+auto_reload = true
+max_skills = 64
+
+[telemetry]
 log_level = "info"
 
 [onboarding]
@@ -162,6 +170,11 @@ telegram_enabled = false
 [daemon]
 socket_path = "/tmp/aigent.sock"
 
+# ── UI ──────────────────────────────────────────────────────────────────────
+[ui]
+theme = "catppuccin-mocha"
+show_sidebar = true
+
 # ── Git integration (gait) ──────────────────────────────────────────────────────────
 [git]
 # Repository URLs considered trusted for push / commit identity.
@@ -172,3 +185,32 @@ trusted_write_paths = []
 # Allow read-only git ops (status, log, diff, blame, ls-remote) on any repo.
 # Set to false in "safer" mode to restrict reads to trusted_write_paths only.
 allow_system_read = true
+
+# ── Local inference (Candle) ──────────────────────────────────────────────────
+# Requires building with:  ./install.sh --candle
+# Or manually:             cargo build --release -p aigent-app --features candle
+[inference]
+# Enable the Candle local-inference backend. When true, the agent loads a GGUF
+# model from HuggingFace Hub (or a local path) and runs inference in-process.
+# Requires the binary to have been compiled with the `candle` feature.
+candle_enabled = false
+
+# HuggingFace Hub repository containing the GGUF model file.
+candle_model_repo = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+# GGUF filename within the repository.
+candle_model_file = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+
+# Absolute path to a local GGUF file. Overrides repo/file if non-empty.
+candle_model_path = ""
+# Directory to store downloaded model files.
+candle_local_models_dir = "~/.cache/aigent/models"
+
+# Maximum sequence length (context window). Higher values use more VRAM/RAM.
+candle_max_seq_len = 4096
+# Sampling: temperature (0.0 = greedy), top-p (nucleus), repeat penalty.
+candle_temperature = 0.7
+candle_top_p = 0.9
+candle_repeat_penalty = 1.1
+
+# Compute device:  "cpu", "cuda" (NVIDIA), or "metal" (Apple Silicon).
+candle_device = "cpu"

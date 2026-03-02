@@ -1984,3 +1984,48 @@ All changes are **backward compatible** with Ollama and OpenRouter:
 - The `candle` feature flag gates all Candle-specific code at compile time
 - `LlmClient` trait interface is unchanged
 - Config file path defaults to `config/default.toml` when `AIGENT_CONFIG` is unset
+
+### External Thinking Hardening (Phase 1.1)
+
+The external thinking loop (`/thinking external`) now works reliably with local
+models (Ollama with Qwen 3.5, Llama, Mistral, etc.) and Candle.
+
+**Problem:** Local models frequently failed the strict JSON-only output
+requirement — wrapping JSON in markdown fences, adding explanatory text, or
+omitting the `"type"` discriminator — causing "exhausted all retries after 12
+steps" errors.
+
+**Fixes:**
+
+1. **Ollama `format: "json"` enforcement** — when the provider is Ollama, the
+   request now sets `"format": "json"` at the API level, which constrains token
+   sampling to valid JSON.  Threaded via a new `json_mode: bool` parameter on
+   `LlmRouter::chat_messages_stream()` and `chat_messages()`.
+
+2. **Strengthened system prompt** — the external thinking block now uses a
+   `## STRICT JSON-ONLY MODE` header, explicit `OPTION A / OPTION B` schema
+   examples with realistic values, and `RULES (violation = system error)` framing
+   that local models respect more reliably.
+
+3. **Multi-layer fallback parsing** — `parse_agent_step()` now tries four layers:
+   - Direct `serde_json::from_str`
+   - Strip markdown code fences (`` ```json ... ``` ``)
+   - Extract first balanced `{...}` JSON object from surrounding text
+   - Heuristic repair: infer missing `"type"` from presence of `"tool_call"` vs
+     `"final_answer"` fields; fill missing `"thought"` with a default.
+
+4. **Improved retry logic** — consecutive parse/timeout failures now use
+   exponential backoff (1s, 2s, 3s) with a cap of 3 consecutive retries.  Error
+   correction messages include the exact JSON template so the model can
+   self-correct.
+
+**API changes:**
+- `LlmRouter::chat_messages(…, json_mode: bool)` — new trailing parameter
+- `LlmRouter::chat_messages_stream(…, json_mode: bool)` — new trailing parameter
+- `OllamaClient::chat_messages(…, json_mode: bool)` — injects `"format": "json"`
+- `OllamaClient::chat_messages_stream(…, json_mode: bool)` — injects `"format": "json"`
+- Existing callers (`react_loop`, `tool_loop`, `LlmClient` trait impl) pass `false`
+
+**Backward compatibility:** When `external_thinking = false` (default), none of
+these code paths are reached.  The `json_mode` parameter defaults to `false` at
+all non-external-thinking call sites.

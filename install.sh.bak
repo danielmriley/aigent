@@ -4,59 +4,15 @@ set -euo pipefail
 # ── Colours (disabled when piped) ─────────────────────────────────────────────
 if [[ -t 1 ]]; then
   BOLD='\033[1m' DIM='\033[2m' GREEN='\033[0;32m' YELLOW='\033[0;33m'
-  RED='\033[0;31m' CYAN='\033[0;36m' RESET='\033[0m'
+  RED='\033[0;31m' RESET='\033[0m'
 else
-  BOLD='' DIM='' GREEN='' YELLOW='' RED='' CYAN='' RESET=''
+  BOLD='' DIM='' GREEN='' YELLOW='' RED='' RESET=''
 fi
 
 info()  { printf "${GREEN}[+]${RESET} %s\n" "$*"; }
 warn()  { printf "${YELLOW}[!]${RESET} %s\n" "$*"; }
 err()   { printf "${RED}[x]${RESET} %s\n" "$*" >&2; }
 ask()   { printf "${BOLD}[?]${RESET} %s " "$*"; }
-note()  { printf "${CYAN}    %s${RESET}\n" "$*"; }
-
-usage() {
-  cat <<'USAGE'
-Aigent installer — build, install, and configure the AI agent.
-
-Usage:
-  ./install.sh [OPTIONS]
-
-Options:
-  --candle          Enable the Candle local-inference backend (GGUF models).
-  --cuda            Enable Candle with CUDA GPU acceleration.
-  --metal           Enable Candle with Metal GPU acceleration (macOS).
-  --all-features    Build with all optional features.
-  --no-candle       Explicitly disable the Candle backend (default).
-  --prefix DIR      Install binary to DIR instead of ~/.local/bin.
-  --config PATH     Set the config file path (default: config/default.toml).
-                    Also sets AIGENT_CONFIG in the shell hint.
-  --uninstall       Remove aigent binary, data, and daemon.
-  -h, --help        Show this help message.
-
-Environment variables:
-  AIGENT_INSTALL_DIR   Override install directory (same as --prefix).
-  AIGENT_CONFIG        Override config file path at runtime.
-  AIGENT_AUTO_DEPS=1   Auto-install missing system deps without prompting.
-  AIGENT_FEATURES      Space-separated extra cargo features (e.g. "qdrant").
-
-Examples:
-  # Standard install (Ollama + OpenRouter only):
-  ./install.sh
-
-  # With local Candle inference on CPU:
-  ./install.sh --candle
-
-  # With Candle + CUDA GPU:
-  ./install.sh --cuda
-
-  # With Candle + Metal GPU (macOS):
-  ./install.sh --metal
-
-  # Uninstall:
-  ./install.sh --uninstall
-USAGE
-}
 
 # ── OS / distro detection ────────────────────────────────────────────────────
 detect_os() {
@@ -96,6 +52,7 @@ detect_os() {
 }
 
 # ── Privilege helper ──────────────────────────────────────────────────────────
+# Returns the command prefix needed to install system packages.
 sudo_cmd() {
   if [[ "$(id -u)" -eq 0 ]]; then
     echo ""
@@ -111,12 +68,13 @@ sudo_cmd() {
 # ── Dependency check & install ────────────────────────────────────────────────
 
 # Required system libraries / headers for the build.
-#   openssl (libssl-dev)     — git2 crate + reqwest TLS
-#   pkg-config               — locates .pc files for openssl, libssh2, etc.
-#   cmake                    — libgit2-sys build (fallback when no system libgit2)
-#   zlib (zlib1g-dev)        — libgit2-sys, libssh2-sys compression
+#   openssl (libssl-dev)    — git2 crate + reqwest TLS
+#   pkg-config              — locates .pc files for openssl, libssh2, etc.
+#   cmake                   — libgit2-sys build (fallback when no system libgit2)
+#   zlib (zlib1g-dev)       — libgit2-sys, libssh2-sys compression
 #   libssh2 (libssh2-1-dev) — git2 SSH transport
 
+# Maps: package-manager → list of package names.
 deps_for_manager() {
   case "$1" in
     apt)     echo "pkg-config libssl-dev cmake zlib1g-dev libssh2-1-dev" ;;
@@ -130,6 +88,8 @@ deps_for_manager() {
 }
 
 # Quick presence check — returns 0 if the dependency is already satisfied.
+# We probe for the actual headers / .pc files rather than dpkg queries so this
+# works across distros.
 check_dep() {
   local dep="$1"
   case "$dep" in
@@ -157,6 +117,7 @@ check_dep() {
         [[ -d "$(brew --prefix libssh2 2>/dev/null)/include" ]] 2>/dev/null
       ;;
     *)
+      # Unknown dep — assume missing so it gets installed.
       return 1
       ;;
   esac
@@ -187,6 +148,7 @@ check_and_install_deps() {
 
   warn "Missing build dependencies: ${missing[*]}"
 
+  # In non-interactive mode (piped stdin), auto-install.
   local auto_install=false
   if [[ ! -t 0 ]] || [[ "${AIGENT_AUTO_DEPS:-}" == "1" ]]; then
     auto_install=true
@@ -283,73 +245,19 @@ check_rust() {
   esac
 }
 
-# ── CUDA / Metal check ───────────────────────────────────────────────────────
-
-check_cuda() {
-  if command -v nvcc >/dev/null 2>&1; then
-    local cuda_ver
-    cuda_ver="$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9.]+' || echo 'unknown')"
-    info "CUDA toolkit found: ${cuda_ver}"
-    return 0
-  fi
-
-  if [[ -d /usr/local/cuda ]]; then
-    info "CUDA found at /usr/local/cuda (nvcc not in PATH)"
-    note "You may need: export PATH=/usr/local/cuda/bin:\$PATH"
-    return 0
-  fi
-
-  warn "CUDA toolkit not found."
-  warn "For GPU acceleration, install CUDA from: https://developer.nvidia.com/cuda-downloads"
-  warn "Building anyway — Candle will fall back to CPU at runtime."
-  return 0
-}
-
-check_metal() {
-  if [[ "$OS" != "macos" ]]; then
-    warn "--metal only works on macOS. Ignoring."
-    METAL=false
-    return 0
-  fi
-  # Metal is always available on macOS with a supported GPU.
-  info "Metal GPU acceleration enabled (macOS built-in)."
-}
-
-# ── Config seeding ────────────────────────────────────────────────────────────
-
-seed_config() {
-  local config_path="$1"
-
-  if [[ -f "$config_path" ]]; then
-    info "Config file exists at ${config_path}"
-    return 0
-  fi
-
-  if [[ -f "config/default.toml.example" ]]; then
-    local config_dir
-    config_dir="$(dirname "$config_path")"
-    mkdir -p "$config_dir"
-    cp config/default.toml.example "$config_path"
-    info "Created ${config_path} from example template"
-  else
-    warn "No config template found. Run 'aigent onboard' to configure."
-  fi
-}
-
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 
 do_uninstall() {
   INSTALL_DIR="${AIGENT_INSTALL_DIR:-${HOME}/.local/bin}"
   INSTALL_PATH="${INSTALL_DIR}/aigent"
   DATA_DIR="${HOME}/.aigent"
-  MODELS_DIR="${HOME}/.cache/aigent"
   SOCKET_PATH="/tmp/aigent.sock"
 
+  # Try to read socket path from config if available.
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  local cfg_path="${AIGENT_CONFIG:-${SCRIPT_DIR}/config/default.toml}"
-  if [[ -f "$cfg_path" ]]; then
+  if [[ -f "${SCRIPT_DIR}/config/default.toml" ]]; then
     local cfg_socket
-    cfg_socket=$(grep -E '^\s*socket_path\s*=' "$cfg_path" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+    cfg_socket=$(grep -E '^\s*socket_path\s*=' "${SCRIPT_DIR}/config/default.toml" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
     SOCKET_PATH="${cfg_socket:-$SOCKET_PATH}"
   fi
 
@@ -363,6 +271,7 @@ do_uninstall() {
     if [[ -f "$INSTALL_PATH" ]]; then
       "$INSTALL_PATH" daemon stop 2>/dev/null || true
     fi
+    # If still running, send SIGTERM directly.
     if [[ -f "$PID_FILE" ]]; then
       local pid
       pid="$(cat "$PID_FILE" 2>/dev/null)"
@@ -380,7 +289,6 @@ do_uninstall() {
   echo "The following will be removed:"
   [[ -f "$INSTALL_PATH" ]] && echo "  Binary:     ${INSTALL_PATH}"
   [[ -d "$DATA_DIR" ]]     && echo "  Data dir:   ${DATA_DIR}  (memory, logs, secrets)"
-  [[ -d "$MODELS_DIR" ]]   && echo "  Models dir: ${MODELS_DIR}  (cached GGUF downloads)"
   [[ -S "$SOCKET_PATH" ]]  && echo "  Socket:     ${SOCKET_PATH}"
 
   if [[ ! -f "$INSTALL_PATH" ]] && [[ ! -d "$DATA_DIR" ]]; then
@@ -407,7 +315,7 @@ do_uninstall() {
     info "Removed ${INSTALL_PATH}"
   fi
 
-  # 4. Remove data directory.
+  # 4. Remove data directory (ask separately since it contains user data).
   if [[ -d "$DATA_DIR" ]]; then
     local remove_data=true
     if [[ -t 0 ]]; then
@@ -428,28 +336,7 @@ do_uninstall() {
     fi
   fi
 
-  # 5. Remove cached models.
-  if [[ -d "$MODELS_DIR" ]]; then
-    local remove_models=true
-    if [[ -t 0 ]]; then
-      echo ""
-      ask "Also remove ${MODELS_DIR}? This deletes cached GGUF model files. [y/N] "
-      read -r answer
-      case "${answer:-N}" in
-        [Yy]*) ;;
-        *) remove_models=false ;;
-      esac
-    fi
-
-    if [[ "$remove_models" == true ]]; then
-      rm -rf "$MODELS_DIR"
-      info "Removed ${MODELS_DIR}"
-    else
-      info "Kept ${MODELS_DIR}"
-    fi
-  fi
-
-  # 6. Clean up socket.
+  # 5. Clean up socket.
   rm -f "$SOCKET_PATH" 2>/dev/null || true
 
   echo ""
@@ -458,91 +345,16 @@ do_uninstall() {
   info "Build artifacts can be cleaned with: cargo clean"
 }
 
-# ── Build feature assembly ────────────────────────────────────────────────────
-
-assemble_features() {
-  local features=()
-
-  if [[ "$ALL_FEATURES" == true ]]; then
-    echo "--all-features"
-    return
-  fi
-
-  if [[ "$ENABLE_CANDLE" == true ]]; then
-    features+=("candle")
-  fi
-
-  # Allow extra features from env.
-  if [[ -n "${AIGENT_FEATURES:-}" ]]; then
-    for f in $AIGENT_FEATURES; do
-      features+=("$f")
-    done
-  fi
-
-  if [[ ${#features[@]} -gt 0 ]]; then
-    local joined
-    joined=$(IFS=,; echo "${features[*]}")
-    echo "--features ${joined}"
-  fi
-}
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-# Handle --uninstall before anything else (detect_os hasn't run yet).
-for arg in "$@"; do
-  case "$arg" in
-    --uninstall|uninstall)
-      do_uninstall
-      exit 0
-      ;;
-  esac
-done
-
-# Parse arguments.
-ENABLE_CANDLE=false
-CUDA=false
-METAL=false
-ALL_FEATURES=false
-CUSTOM_PREFIX=""
-CUSTOM_CONFIG=""
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --candle)       ENABLE_CANDLE=true; shift ;;
-    --cuda)         ENABLE_CANDLE=true; CUDA=true; shift ;;
-    --metal)        ENABLE_CANDLE=true; METAL=true; shift ;;
-    --all-features) ALL_FEATURES=true; ENABLE_CANDLE=true; shift ;;
-    --no-candle)    ENABLE_CANDLE=false; shift ;;
-    --prefix)       CUSTOM_PREFIX="$2"; shift 2 ;;
-    --config)       CUSTOM_CONFIG="$2"; shift 2 ;;
-    -h|--help)      usage; exit 0 ;;
-    *)
-      err "Unknown option: $1"
-      usage
-      exit 1
-      ;;
-  esac
-done
+# Handle --uninstall flag
+if [[ "${1:-}" == "--uninstall" || "${1:-}" == "uninstall" ]]; then
+  do_uninstall
+  exit 0
+fi
 
 detect_os
 info "Detected: OS=${OS}, distro=${DISTRO}, package manager=${PKG_MANAGER}"
-
-# Header
-echo ""
-printf "${BOLD}Aigent Installer${RESET}\n"
-if [[ "$ENABLE_CANDLE" == true ]]; then
-  if [[ "$CUDA" == true ]]; then
-    note "Mode: Candle + CUDA (GPU-accelerated local inference)"
-  elif [[ "$METAL" == true ]]; then
-    note "Mode: Candle + Metal (GPU-accelerated local inference)"
-  else
-    note "Mode: Candle (CPU local inference)"
-  fi
-else
-  note "Mode: Standard (Ollama + OpenRouter)"
-  note "Tip: use --candle to enable local GGUF model inference"
-fi
-echo ""
 
 check_rust
 
@@ -554,37 +366,11 @@ else
   warn "  cmake, zlib headers, libssh2 headers."
 fi
 
-# Check GPU toolkits if requested.
-if [[ "$CUDA" == true ]]; then
-  check_cuda
-fi
-if [[ "$METAL" == true ]]; then
-  check_metal
-fi
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Seed config if it doesn't exist.
-CONFIG_PATH="${CUSTOM_CONFIG:-config/default.toml}"
-seed_config "$CONFIG_PATH"
-
-# Assemble cargo build command.
-CARGO_FEATURES="$(assemble_features)"
-BUILD_CMD="cargo build --release -p aigent-app"
-if [[ -n "$CARGO_FEATURES" ]]; then
-  BUILD_CMD="${BUILD_CMD} ${CARGO_FEATURES}"
-fi
-
-# Add --locked only if Cargo.lock exists.
-if [[ -f Cargo.lock ]]; then
-  BUILD_CMD="${BUILD_CMD} --locked"
-fi
-
 info "Building aigent (release)..."
-note "${BUILD_CMD}"
-echo ""
-eval "$BUILD_CMD"
+cargo build --release --locked -p aigent-app
 
 TARGET_BIN="${SCRIPT_DIR}/target/release/aigent-app"
 if [[ ! -f "$TARGET_BIN" ]]; then
@@ -592,7 +378,7 @@ if [[ ! -f "$TARGET_BIN" ]]; then
   exit 1
 fi
 
-INSTALL_DIR="${CUSTOM_PREFIX:-${AIGENT_INSTALL_DIR:-${HOME}/.local/bin}}"
+INSTALL_DIR="${AIGENT_INSTALL_DIR:-${HOME}/.local/bin}"
 mkdir -p "$INSTALL_DIR"
 INSTALL_PATH="${INSTALL_DIR}/aigent"
 TEMP_PATH="$(mktemp "${INSTALL_DIR}/.aigent.tmp.XXXXXX")"
@@ -608,65 +394,26 @@ trap - EXIT
 
 info "Installed aigent to ${INSTALL_PATH}"
 if command -v sha256sum >/dev/null 2>&1; then
-  echo "  sha256: $(sha256sum "$INSTALL_PATH" | awk '{print $1}')"
+  echo "sha256: $(sha256sum "$INSTALL_PATH" | awk '{print $1}')"
 elif command -v shasum >/dev/null 2>&1; then
-  echo "  sha256: $(shasum -a 256 "$INSTALL_PATH" | awk '{print $1}')"
+  echo "sha256: $(shasum -a 256 "$INSTALL_PATH" | awk '{print $1}')"
 fi
 
 if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
   warn "${INSTALL_DIR} is not in PATH for this shell."
-  note "Add to your shell profile:  export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi
 
-# If a custom config path was given, suggest the env var.
-if [[ -n "$CUSTOM_CONFIG" ]]; then
-  echo ""
-  note "Custom config: ${CUSTOM_CONFIG}"
-  note "Set this in your shell profile:  export AIGENT_CONFIG=\"${CUSTOM_CONFIG}\""
-fi
-
-# ── Restart daemon if running ─────────────────────────────────────────────────
+# Restart the daemon if it is currently running, so it picks up the new binary.
 SOCKET_PATH=""
-if command -v grep >/dev/null 2>&1 && [[ -f "$CONFIG_PATH" ]]; then
-  SOCKET_PATH=$(grep -E '^\s*socket_path\s*=' "$CONFIG_PATH" 2>/dev/null | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+if command -v grep >/dev/null 2>&1 && [[ -f "config/default.toml" ]]; then
+  SOCKET_PATH=$(grep -E '^\s*socket_path\s*=' config/default.toml | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
 fi
 SOCKET_PATH="${SOCKET_PATH:-/tmp/aigent.sock}"
 PID_FILE=".aigent/runtime/daemon.pid"
-if [[ -S "$SOCKET_PATH" ]] || { [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; }; then
-  info "Restarting daemon to pick up new binary..."
-  "$INSTALL_PATH" daemon restart --force && info "Daemon restarted." || warn "Daemon restart failed — run 'aigent daemon restart' manually."
+if [[ -S "$SOCKET_PATH" ]] || ([[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null); then
+  echo "Restarting daemon to pick up new binary..."
+  "$INSTALL_PATH" daemon restart --force && echo "Daemon restarted." || echo "Warning: daemon restart failed — run 'aigent daemon restart' manually."
 else
-  echo ""
-  info "Installation complete!"
-  echo ""
-  echo "  Quick start:"
-  echo "    aigent                    # start interactive mode"
-  echo "    aigent onboard            # run the setup wizard"
-  echo "    aigent doctor             # check system status"
-  echo ""
-  if [[ "$ENABLE_CANDLE" == true ]]; then
-    echo "  Candle local inference (compiled in):"
-    echo "    aigent onboard            # select 'candle' as provider in wizard"
-    echo "    /model provider candle    # switch to Candle at runtime"
-    echo "    /model set <repo> <gguf>  # set HF model repo + GGUF filename"
-    echo "    /model list candle        # show configured Candle model"
-    echo ""
-    echo "  Config: [inference] section in ${CONFIG_PATH}"
-    echo "    candle_enabled = true"
-    echo "    candle_model_repo = \"Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF\""
-    echo "    candle_model_file = \"qwen2.5-coder-1.5b-instruct-q4_k_m.gguf\""
-    echo "    candle_device = \"cpu\"    # or \"cuda\" / \"metal\""
-    echo ""
-  else
-    echo "  Local inference:"
-    echo "    Rebuild with: ./install.sh --candle"
-    echo "    Or with GPU:  ./install.sh --cuda  (NVIDIA)"
-    echo "                  ./install.sh --metal (Apple Silicon)"
-    echo ""
-  fi
-  echo "  Thinking pipeline:"
-  echo "    /think low|balanced|deep  # set reasoning depth"
-  echo "    /thinking external        # enable external step-by-step reasoning"
-  echo "    /thinking model           # use model's internal reasoning (default)"
-  echo ""
+  echo "Run: aigent --version"
+  echo "Then: aigent onboard"
 fi
