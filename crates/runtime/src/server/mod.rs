@@ -446,7 +446,7 @@ pub async fn run_unified_daemon(
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
                 client
                     .stream_submit(
-                        format!("[scheduled:{task_name}] {prompt}"),
+                        format!("[scheduled:{task_name}] Before starting, call search_memory to check for any prior work on this topic. Then execute: {prompt}"),
                         "scheduler",
                         tx,
                     )

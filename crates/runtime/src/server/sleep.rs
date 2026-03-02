@@ -371,12 +371,27 @@ pub(super) fn spawn_proactive_task(
             // etc. while the user is away.  Only the *final* text (if any) is
             // broadcast as a ProactiveMessage.
             let proactive_user_msg = "\
-You have woken up proactively. Look at your environment, schedule, and recent \
-memories. Are there any background tasks you need to complete, web searches to \
-run, or problems to solve for the user? Take action silently using your tools. \
-If you discover something important that the user must know immediately, output \
-a concise final message to them. Otherwise, respond with an empty string to \
-return to sleep.";
+[PROACTIVE WAKE-UP] You have woken up autonomously. Follow the protocol:\n\
+\n\
+1. ORIENT — Run these two calls first:\n\
+   - search_memory(query=\"recent topics open questions user goals\", limit=10)\n\
+   - list_cron_jobs()\n\
+\n\
+2. DECIDE — Based on what you find, pick ONE high-value action:\n\
+   Priority order: unresolved user problems > active scheduled research > \n\
+   curiosity-driven exploration of user interests.\n\
+\n\
+3. ACT — Execute your chosen action using as many tool calls as needed. \n\
+   Chain web_search -> browse_page -> search_memory as appropriate.\n\
+\n\
+4. RECORD — Summarize what you learned or accomplished in your final message. \n\
+   Use specific keywords so search_memory can find this later. If your \n\
+   investigation raised follow-up questions, call create_cron_job to \n\
+   schedule the next step.\n\
+\n\
+5. OUTPUT — If you discovered something the user needs to know, output a \n\
+   concise message. If your work was routine maintenance with nothing \n\
+   urgent, respond with an empty string to return to sleep silently.";
 
             // ── Snapshot: clone runtime + memory + tools (lock released fast) ──
             let (rt_clone, mut memory, recent, tool_specs, registry, executor) = {
