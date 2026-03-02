@@ -120,6 +120,7 @@ pub async fn run_react_loop(
                         messages,
                         effective_tools,
                         token_tx.clone(),
+                        false,
                     )
                     .await?;
 

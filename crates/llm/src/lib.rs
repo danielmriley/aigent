@@ -629,6 +629,7 @@ impl LlmRouter {
         openrouter_model: &str,
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
+        json_mode: bool,
     ) -> Result<ChatResponse> {
         match primary {
             #[cfg(feature = "candle")]
@@ -637,7 +638,7 @@ impl LlmRouter {
             Provider::Candle => anyhow::bail!("candle feature not compiled; use `--features candle`"),
             Provider::Ollama => {
                 let (content, tool_calls, finish_reason) = self.ollama
-                    .chat_messages(ollama_model, messages, tools).await?;
+                    .chat_messages(ollama_model, messages, tools, json_mode).await?;
                 Ok(ChatResponse {
                     provider: Provider::Ollama,
                     content,
@@ -662,6 +663,7 @@ impl LlmRouter {
     ///
     /// Text tokens are streamed via `tx` as they arrive. If the model returns
     /// tool calls, they are accumulated and returned in the final `ChatResponse`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn chat_messages_stream(
         &self,
         primary: Provider,
@@ -670,6 +672,7 @@ impl LlmRouter {
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
         tx: mpsc::Sender<String>,
+        json_mode: bool,
     ) -> Result<ChatResponse> {
         match primary {
             #[cfg(feature = "candle")]
@@ -680,7 +683,7 @@ impl LlmRouter {
             Provider::Candle => anyhow::bail!("candle feature not compiled; use `--features candle`"),
             Provider::Ollama => {
                 let (content, tool_calls, finish_reason) = self.ollama
-                    .chat_messages_stream(ollama_model, messages, tools, tx).await?;
+                    .chat_messages_stream(ollama_model, messages, tools, tx, json_mode).await?;
                 Ok(ChatResponse {
                     provider: Provider::Ollama,
                     content,
@@ -741,7 +744,7 @@ impl LlmClient for LlmRouter {
         tools: Option<&serde_json::Value>,
     ) -> Result<ChatResponse> {
         let legacy = Provider::from(provider);
-        self.chat_messages(legacy, model, model, messages, tools)
+        self.chat_messages(legacy, model, model, messages, tools, false)
             .await
     }
 
@@ -754,7 +757,7 @@ impl LlmClient for LlmRouter {
         tx: mpsc::Sender<String>,
     ) -> Result<ChatResponse> {
         let legacy = Provider::from(provider);
-        self.chat_messages_stream(legacy, model, model, messages, tools, tx)
+        self.chat_messages_stream(legacy, model, model, messages, tools, tx, false)
             .await
     }
 }
@@ -847,6 +850,7 @@ impl OllamaClient {
         model: &str,
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
+        json_mode: bool,
     ) -> Result<(String, Vec<ToolCall>, String)> {
         let base_url = std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
@@ -858,6 +862,9 @@ impl OllamaClient {
             "messages": ollama_messages,
             "stream": false
         });
+        if json_mode {
+            payload["format"] = json!("json");
+        }
         if let Some(tools_val) = tools {
             payload["tools"] = tools_val.clone();
         }
@@ -887,6 +894,7 @@ impl OllamaClient {
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
         tx: mpsc::Sender<String>,
+        json_mode: bool,
     ) -> Result<(String, Vec<ToolCall>, String)> {
         let base_url = std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
@@ -898,6 +906,9 @@ impl OllamaClient {
             "messages": ollama_messages,
             "stream": true
         });
+        if json_mode {
+            payload["format"] = json!("json");
+        }
         if let Some(tools_val) = tools {
             payload["tools"] = tools_val.clone();
         }

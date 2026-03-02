@@ -96,6 +96,7 @@ pub async fn run_tool_loop(
                 messages,
                 effective_tools,
                 token_tx.clone(),
+                false,
             )
             .await?;
 
