@@ -92,33 +92,73 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
 
     // ── External thinking mode ───────────────────────────────────────────
     if config.agent.external_thinking {
-        buf.push_str(EXTERNAL_THINKING_BLOCK);
+        buf.push_str(&build_external_thinking_block(inputs.tool_specs));
     }
 
     buf
 }
-
-/// System prompt appendix for externalized JSON reasoning mode.
+/// Build the external thinking prompt appendix.
 ///
 /// When active, this forces the model to output only short structured JSON
 /// steps.  The Rust agent loop becomes the thinker — parsing, executing
 /// tools, and feeding observations back.
-const EXTERNAL_THINKING_BLOCK: &str = "\n\n\
-EXTERNAL REASONING MODE ACTIVE.\n\
-You MUST respond with EXACTLY this JSON structure and nothing else \
-(no markdown, no extra text, no <thinking>):\n\n\
-{\n\
-  \"type\": \"tool_call\" | \"final_answer\",\n\
-  \"thought\": \"brief 1-sentence reasoning (max 25 words)\",\n\
-  \"tool_call\": { \"name\": \"tool_name\", \"args\": { ... } } or null,\n\
-  \"final_answer\": \"your message to the user\" or null\n\
-}\n\n\
-Rules:\n\
-- Use \"tool_call\" type when you want to call a tool (set final_answer to null).\n\
-- Use \"final_answer\" type when you are ready to reply to the user (set tool_call to null).\n\
-- Keep \"thought\" extremely short.\n\
-- The \"tool_call\" object must have \"name\" (string) and \"args\" (object).\n\
-- Never output anything outside the JSON object.\n";
+///
+/// Includes the available tool names so the model knows exactly which tools
+/// it can invoke.
+fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> String {
+    let mut buf = String::with_capacity(2048);
+    buf.push_str("\n\nEXTERNAL REASONING MODE ACTIVE.\n\
+        You MUST respond with EXACTLY one JSON object and nothing else \
+        (no markdown, no extra text, no <thinking> tags).\n\n");
+
+    // ── JSON schema ──────────────────────────────────────────────────────
+    buf.push_str("Required JSON schema (pick exactly one type):\n\n\
+        For a tool call:\n");
+    buf.push_str(
+        r#"{"type":"tool_call","thought":"brief reasoning","tool_call":{"name":"TOOL_NAME","args":{...}}}"#,
+    );
+    buf.push_str("\n\nFor a final answer to the user:\n");
+    buf.push_str(
+        r#"{"type":"final_answer","thought":"brief reasoning","final_answer":"your message"}"#,
+    );
+    buf.push_str("\n\n");
+
+    // ── Available tools ──────────────────────────────────────────────────
+    if !tool_specs.is_empty() {
+        buf.push_str("AVAILABLE TOOLS (use only these names in tool_call.name):\n");
+        for spec in tool_specs {
+            buf.push_str(&format!("- {}: {}", spec.name, spec.description));
+            if !spec.params.is_empty() {
+                let params: Vec<String> = spec
+                    .params
+                    .iter()
+                    .map(|p| {
+                        let req = if p.required { ", required" } else { "" };
+                        format!("\"{}\" ({}{})", p.name, p.description, req)
+                    })
+                    .collect();
+                buf.push_str(&format!("  args: {{{}}}", params.join(", ")));
+            }
+            buf.push('\n');
+        }
+        buf.push('\n');
+    }
+
+    // ── Strict rules ─────────────────────────────────────────────────────
+    buf.push_str(
+        "STRICT RULES:\n\
+        1. Output ONLY the JSON object \u{2014} no prose before or after.\n\
+        2. The \"type\" field must be exactly \"tool_call\" or \"final_answer\".\n\
+        3. The \"thought\" field must be 25 words or fewer.\n\
+        4. For tool_call: \"tool_call\" is required, \"final_answer\" must be null or omitted.\n\
+        5. For final_answer: \"final_answer\" is required, \"tool_call\" must be null or omitted.\n\
+        6. If you do not need a tool, respond with final_answer immediately.\n\
+        7. NEVER output free-form text \u{2014} always use the JSON schema above.\n",
+    );
+
+    buf
+}
+
 
 // ─── block builders ──────────────────────────────────────────────────────────
 
@@ -628,5 +668,47 @@ mod tests {
         assert!(section.contains("AVAILABLE TOOLS"));
         assert!(section.contains("test_tool"));
         assert!(section.contains("GROUNDING RULES"));
+    }
+}
+
+#[cfg(test)]
+mod ext_think_tests {
+    use super::*;
+
+    #[test]
+    fn external_thinking_block_empty_tools() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("EXTERNAL REASONING MODE ACTIVE"));
+        assert!(block.contains("tool_call"));
+        assert!(block.contains("final_answer"));
+        assert!(block.contains("STRICT RULES"));
+        assert!(!block.contains("AVAILABLE TOOLS"));
+    }
+
+    #[test]
+    fn external_thinking_block_with_tools() {
+        let specs = vec![aigent_tools::ToolSpec {
+            name: "read_file".to_string(),
+            description: "Read a file from disk".to_string(),
+            params: vec![aigent_tools::ToolParam {
+                name: "path".to_string(),
+                description: "file path".to_string(),
+                required: true,
+                ..Default::default()
+            }],
+            metadata: aigent_tools::ToolMetadata::default(),
+        }];
+        let block = build_external_thinking_block(&specs);
+        assert!(block.contains("AVAILABLE TOOLS"));
+        assert!(block.contains("read_file"));
+        assert!(block.contains("Read a file from disk"));
+        assert!(block.contains("\"path\""));
+    }
+
+    #[test]
+    fn external_thinking_block_has_json_examples() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains(r#""type":"tool_call""#));
+        assert!(block.contains(r#""type":"final_answer""#));
     }
 }

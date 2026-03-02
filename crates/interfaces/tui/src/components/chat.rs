@@ -239,13 +239,27 @@ fn build_chat_lines(
         }
         // ── system message ──────────────────────────────────────
         else if msg.role == "system" {
-            let sys_style = Style::default()
-                .fg(theme.muted)
-                .add_modifier(Modifier::ITALIC);
-            lines.push(Line::from(Span::styled(
-                format!("  {}", msg.content),
-                sys_style,
-            )));
+            if let Some(thought) = msg.content.strip_prefix("[Thinking]: ") {
+                // External reasoning thought — use a distinctive color.
+                let prefix_style = Style::default()
+                    .fg(theme.info)
+                    .add_modifier(Modifier::BOLD);
+                let body_style = Style::default()
+                    .fg(theme.info)
+                    .add_modifier(Modifier::ITALIC);
+                lines.push(Line::from(vec![
+                    Span::styled("  \u{1f4ad} ", prefix_style),
+                    Span::styled(thought.to_string(), body_style),
+                ]));
+            } else {
+                let sys_style = Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::ITALIC);
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", msg.content),
+                    sys_style,
+                )));
+            }
         }
         // ── assistant / aigent ──────────────────────────────────
         else if msg.role == "assistant" || msg.role == "aigent" {
