@@ -73,7 +73,6 @@ impl Default for ExecutionPolicy {
                 "draft_email".to_string(),
                 "web_search".to_string(),
                 "browse_page".to_string(),
-                "fetch_page".to_string(),
                 "search_memory".to_string(),
             ],
             git_auto_commit: false,
@@ -522,10 +521,10 @@ pub fn default_registry(
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
         BrowsePageTool, CalendarAddEventTool, CpTool, CutTool, DraftEmailTool,
-        EchoTool, FetchPageTool, FindTool, GitRollbackTool, GrepTool, HeadTool,
+        EchoTool, FindTool, GitRollbackTool, GrepTool, HeadTool,
         ListDirTool, MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool,
         RunShellTool, SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool,
-        UniqTool, WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool,
+        UniqTool, WcTool, WebSearchTool, WorkspaceStatusTool,
         WriteFileTool, CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool,
         ListSkillsTool,
     };
@@ -584,14 +583,6 @@ pub fn default_registry(
                 exa_api_key: exa_api_key.clone(),
                 search_providers: search_providers.clone(),
             }),
-        ),
-        (
-            "fetch_page",
-            Box::new(FetchPageTool),
-        ),
-        (
-            "web_browse",
-            Box::new(WebBrowseTool),
         ),
         (
             "draft_email",

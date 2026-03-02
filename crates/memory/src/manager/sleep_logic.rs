@@ -112,6 +112,7 @@ impl MemoryManager {
                 fact.clone(),
                 "sleep:learned-about-user".to_string(),
                 vec!["user_fact".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -123,6 +124,7 @@ impl MemoryManager {
                 item.clone(),
                 "follow-up".to_string(),
                 vec!["follow_up".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -134,6 +136,7 @@ impl MemoryManager {
                 thought.clone(),
                 "sleep:reflection".to_string(),
                 vec!["reflection".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -145,6 +148,7 @@ impl MemoryManager {
                 milestone.clone(),
                 "sleep:relationship".to_string(),
                 vec!["relationship".to_string(), "dynamic".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -157,6 +161,7 @@ impl MemoryManager {
                 content,
                 "sleep:perspective".to_string(),
                 vec!["agent_belief".to_string(), "perspective".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -168,6 +173,7 @@ impl MemoryManager {
                 contradiction.clone(),
                 "sleep:contradiction".to_string(),
                 vec!["contradiction".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -179,6 +185,7 @@ impl MemoryManager {
                 insight_text.clone(),
                 "sleep:tool-insight".to_string(),
                 vec!["tool_pattern".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -190,6 +197,7 @@ impl MemoryManager {
                 synth.clone(),
                 "sleep:synthesis".to_string(),
                 vec!["synthesis".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -260,6 +268,7 @@ impl MemoryManager {
                 new_content.clone(),
                 "sleep:core-rewrite".to_string(),
                 vec!["core_rewrite".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -277,6 +286,7 @@ impl MemoryManager {
                 synthesis.clone(),
                 "sleep:core-consolidation".to_string(),
                 vec!["core_consolidation".to_string()],
+                None,
             ).await?;
             extra_ids.push(e.id.to_string());
         }
@@ -314,6 +324,7 @@ impl MemoryManager {
                     tags.dedup();
                     tags
                 },
+                None,
             ).await?;
             info!(
                 from_tier = ?entry.tier,
@@ -343,6 +354,7 @@ impl MemoryManager {
                 content.clone(),
                 "sleep:free-memory".to_string(),
                 tags,
+                None,
             ).await?;
             info!(
                 tier = ?tier,

@@ -337,7 +337,6 @@ impl Default for SafetyConfig {
                 "draft_email".to_string(),
                 "web_search".to_string(),
                 "browse_page".to_string(),
-                "fetch_page".to_string(),
             ],
             max_security_level: "high".to_string(),
             max_calls_per_tool: None,
@@ -471,10 +470,23 @@ impl AppConfig {
             }
         }
 
-        // Brave API key env override (takes precedence over config file).
-        if let Ok(key) = env::var("BRAVE_API_KEY") {
-            if !key.is_empty() {
-                config.tools.brave_api_key = key;
+        // ── Secret env-var overrides (take precedence over config file) ──
+        //
+        // API keys and credentials should be set via environment variables
+        // rather than stored in the config file.  Each field listed below
+        // can be overridden by the corresponding env var.
+        let secret_overrides: &[(&str, fn(&mut Self, String))] = &[
+            ("BRAVE_API_KEY",   |c, v| c.tools.brave_api_key   = v),
+            ("TAVILY_API_KEY",  |c, v| c.tools.tavily_api_key  = v),
+            ("SERPER_API_KEY",  |c, v| c.tools.serper_api_key  = v),
+            ("EXA_API_KEY",     |c, v| c.tools.exa_api_key     = v),
+            ("SEARXNG_BASE_URL",|c, v| c.tools.searxng_base_url = v),
+        ];
+        for (var, setter) in secret_overrides {
+            if let Ok(val) = env::var(var) {
+                if !val.is_empty() {
+                    setter(&mut config, val);
+                }
             }
         }
 
@@ -571,7 +583,7 @@ mod tests {
     #[test]
     fn default_safety_exempt_tools() {
         let safety = SafetyConfig::default();
-        assert_eq!(safety.approval_exempt_tools.len(), 6);
+        assert_eq!(safety.approval_exempt_tools.len(), 5);
         assert!(safety.approval_exempt_tools.contains(&"web_search".to_string()));
         assert!(safety.approval_exempt_tools.contains(&"remind_me".to_string()));
     }

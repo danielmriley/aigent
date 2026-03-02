@@ -113,9 +113,12 @@ pub(super) fn spawn_passive_distillation(
                 }
                 // Lightweight forgetting: prune old low-confidence episodic entries.
                 if forget_after_days > 0 {
-                    let pruned = s.memory.run_forgetting_pass(forget_after_days, forget_min_confidence);
-                    if pruned > 0 {
-                        info!(pruned, forget_after_days, "passive heuristic distillation: forgetting pass applied");
+                    match s.memory.run_forgetting_pass(forget_after_days, forget_min_confidence).await {
+                        Ok(pruned) if pruned > 0 => {
+                            info!(pruned, forget_after_days, "passive heuristic distillation: forgetting pass applied");
+                        }
+                        Err(ref err) => warn!(?err, "forgetting pass failed"),
+                        _ => {}
                     }
                 }
                 s.last_passive_sleep_at = Some(std::time::Instant::now());

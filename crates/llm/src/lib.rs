@@ -174,7 +174,8 @@ impl From<ModelProvider> for Provider {
     fn from(mp: ModelProvider) -> Self {
         match mp {
             ModelProvider::Ollama => Provider::Ollama,
-            ModelProvider::OpenRouter | ModelProvider::Candle => Provider::OpenRouter,
+            ModelProvider::OpenRouter => Provider::OpenRouter,
+            ModelProvider::Candle => Provider::Ollama,
         }
     }
 }
