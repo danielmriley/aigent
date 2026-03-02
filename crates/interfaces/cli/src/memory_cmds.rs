@@ -206,7 +206,7 @@ pub(crate) async fn run_phase_review_gate(
         config_changed = true;
     }
     if config_changed {
-        config.save_to("config/default.toml")?;
+        config.save_to(AppConfig::config_path())?;
     }
 
     if !Path::new(".aigent/vault/index.md").exists() {

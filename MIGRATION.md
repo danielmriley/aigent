@@ -1905,3 +1905,82 @@ The following fields were removed as unnecessary:
 
 When `candle_enabled = false` (default) or the `candle` feature is not compiled,
 **no new code paths are reached**. Ollama and OpenRouter work identically to before.
+
+---
+
+## Phase 2 Hardening — Candle Async Safety, Hot-Reload, Chat Templates & Streaming
+
+### Async Executor Safety (`spawn_blocking`)
+
+All CPU/GPU-intensive Candle operations (`prefill` + `autoregressive decode`) are
+now executed inside `tokio::task::spawn_blocking`. This prevents blocking the Tokio
+async executor and eliminates the system-wide freeze that occurred when generating
+long sequences.
+
+**Key change:** `CandleBackend::generate()` moves the `ModelWeights` into a
+`spawn_blocking` closure and returns it alongside the generated text. The model is
+temporarily taken out of `self.model` via `Option::take` and restored on completion.
+
+### Mutex Head-of-Line Blocking Fix (`take`/`return` Pattern)
+
+The Candle backend is now managed via a `take`/`return` pattern instead of holding a
+`MutexGuard` for the full duration of generation:
+
+- `take_candle()` — briefly locks the mutex, `Option::take`s the backend out
+- `return_candle()` — briefly locks the mutex, puts the backend back
+
+The mutex is held for microseconds (take/return), **not** the 10–30s generation
+window. Other async tasks are no longer starved.
+
+### Hot-Reload Support
+
+`ensure_candle_loaded()` now compares the loaded backend's `model_id()` and
+`gguf_file()` against the current config values. If they differ (e.g. the user ran
+`/model set` to switch models), the old backend is dropped and a fresh one is loaded.
+This eliminates "ghost model" bugs where config changes were silently ignored.
+
+### Chat Template Auto-Detection
+
+The hardcoded ChatML template has been replaced with automatic detection:
+
+- During `CandleBackend::load()`, the model's `tokenizer_config.json` is fetched
+  from HuggingFace and the `chat_template` Jinja2 string is classified.
+- Supported templates: **ChatML**, **Llama 3**, **Mistral**, **Gemma**, **Phi-3**.
+- `apply_chat_template()` formats messages according to the detected template kind.
+- Fallback: unknown templates default to ChatML.
+
+This fixes broken prompting for Llama 3 (`<|begin_of_text|>`), Mistral (`[INST]`),
+Gemma (`<start_of_turn>`), and Phi-3 (`<|user|>`) models.
+
+### Real Token-by-Token Streaming
+
+`CandleBackend::generate_stream()` provides genuine token-by-token streaming using a
+`std::sync::mpsc` → `tokio::sync::mpsc` bridge:
+
+1. The blocking generation thread sends each decoded token via `std::sync::mpsc`.
+2. An async reader task receives tokens on `std::sync::mpsc` and forwards them to the
+   `tokio::sync::mpsc::Sender<String>`.
+3. The caller receives tokens as they are generated, not after full generation.
+
+The old "generate fully then dump" fake streaming pattern has been removed from
+`chat_stream_with_fallback`, `complete_stream`, and `chat_stream`.
+
+### Configurable Config File Path
+
+All hardcoded `"config/default.toml"` references have been replaced with
+`AppConfig::config_path()`, which checks the `AIGENT_CONFIG` environment variable
+and falls back to `config/default.toml`.
+
+**New API:**
+- `AppConfig::config_path() -> String` — resolves config file path
+- `DEFAULT_CONFIG_PATH` constant — `"config/default.toml"`
+
+**Environment variable:** `AIGENT_CONFIG=/path/to/config.toml`
+
+### Backward Compatibility
+
+All changes are **backward compatible** with Ollama and OpenRouter:
+- No new code paths are reached when `candle_enabled = false` (default)
+- The `candle` feature flag gates all Candle-specific code at compile time
+- `LlmClient` trait interface is unchanged
+- Config file path defaults to `config/default.toml` when `AIGENT_CONFIG` is unset

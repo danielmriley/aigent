@@ -5,9 +5,9 @@
 //! Candle.  It supports GGUF-quantized models for low memory usage and loads
 //! them from a local path or downloads them from HuggingFace Hub.
 //!
-//! The complexity router in [`InferenceConfig`] decides when to use Candle
-//! vs. a remote provider based on estimated task complexity and a whitelist
-//! of "fast tools" that benefit from <50ms local latency.
+//! CPU-intensive work (model forward passes, token sampling) is always
+//! executed inside `tokio::task::spawn_blocking` so the async executor
+//! stays responsive.
 
 #[cfg(feature = "candle")]
 use anyhow::{Context, Result};
@@ -181,10 +181,250 @@ fn apply_repeat_penalty(logits: &mut [f32], recent_tokens: &[u32], penalty: f32)
     }
 }
 
+// -- Synchronous token generation (runs on blocking thread) ------------------
+
+/// Generate tokens synchronously.  This function contains the entire CPU/GPU
+/// intensive computation and must be called from `tokio::task::spawn_blocking`.
+#[cfg(feature = "candle")]
+#[allow(clippy::too_many_arguments)]
+fn generate_tokens_sync(
+    model: &mut ModelWeights,
+    device: &Device,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    temperature: f64,
+    top_p: f64,
+    repeat_penalty: f32,
+    repeat_penalty_last_n: usize,
+    eos_token_id: Option<u32>,
+    token_tx: Option<&std::sync::mpsc::Sender<u32>>,
+) -> Result<Vec<u32>> {
+    if prompt_tokens.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Process prompt (prefill).
+    let input = Tensor::new(prompt_tokens, device)
+        .context("failed to create prompt tensor")?
+        .unsqueeze(0)
+        .map_err(|e| anyhow::anyhow!("unsqueeze failed: {e}"))?;
+
+    let logits = model
+        .forward(&input, 0)
+        .map_err(|e| anyhow::anyhow!("forward pass (prefill) failed: {e}"))?;
+
+    let logits = logits
+        .squeeze(0)
+        .map_err(|e| anyhow::anyhow!("squeeze failed: {e}"))?;
+    let mut logits_vec: Vec<f32> = logits
+        .to_vec1()
+        .map_err(|e| anyhow::anyhow!("logits to vec failed: {e}"))?;
+
+    // Track recent tokens for repeat penalty.
+    let mut recent: Vec<u32> = prompt_tokens
+        .iter()
+        .rev()
+        .take(repeat_penalty_last_n)
+        .copied()
+        .collect();
+
+    apply_repeat_penalty(&mut logits_vec, &recent, repeat_penalty);
+    let mut next_token = sample_token(&logits_vec, temperature, top_p) as u32;
+
+    let mut generated_tokens: Vec<u32> = vec![next_token];
+    if let Some(tx) = token_tx {
+        let _ = tx.send(next_token);
+    }
+
+    // Autoregressive generation loop.
+    for step in 1..max_tokens {
+        if Some(next_token) == eos_token_id {
+            break;
+        }
+
+        let input = Tensor::new(&[next_token], device)
+            .map_err(|e| anyhow::anyhow!("token tensor failed at step {step}: {e}"))?
+            .unsqueeze(0)
+            .map_err(|e| anyhow::anyhow!("unsqueeze failed: {e}"))?;
+
+        let logits = model
+            .forward(&input, prompt_tokens.len() + step)
+            .map_err(|e| anyhow::anyhow!("forward pass (step {step}) failed: {e}"))?;
+
+        let logits = logits
+            .squeeze(0)
+            .map_err(|e| anyhow::anyhow!("squeeze: {e}"))?;
+        let mut logits_vec: Vec<f32> = logits
+            .to_vec1()
+            .map_err(|e| anyhow::anyhow!("logits to vec: {e}"))?;
+
+        // Update recent tokens ring buffer.
+        recent.push(next_token);
+        if recent.len() > repeat_penalty_last_n {
+            recent.remove(0);
+        }
+        apply_repeat_penalty(&mut logits_vec, &recent, repeat_penalty);
+
+        next_token = sample_token(&logits_vec, temperature, top_p) as u32;
+        generated_tokens.push(next_token);
+        if let Some(tx) = token_tx {
+            let _ = tx.send(next_token);
+        }
+    }
+
+    // Strip EOS if it ended up in the output.
+    if let Some(&last) = generated_tokens.last() {
+        if Some(last) == eos_token_id {
+            generated_tokens.pop();
+        }
+    }
+
+    Ok(generated_tokens)
+}
+
+// -- Chat template detection -------------------------------------------------
+
+/// Known chat template families.
+#[cfg(feature = "candle")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplateKind {
+    /// `<|im_start|>role\ncontent<|im_end|>` (Qwen, Yi, etc.)
+    ChatML,
+    /// `<|begin_of_text|><|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>` (Llama 3)
+    Llama3,
+    /// `[INST] content [/INST]` (Mistral, Llama 2)
+    Mistral,
+    /// `<start_of_turn>role\ncontent<end_of_turn>` (Gemma)
+    Gemma,
+    /// `<|role|>\ncontent<|end|>` (Phi-3)
+    Phi3,
+}
+
+/// Format chat messages according to the detected template.
+#[cfg(feature = "candle")]
+pub fn apply_chat_template(
+    kind: ChatTemplateKind,
+    messages: &[(String, String)],
+) -> String {
+    let mut prompt = String::new();
+    match kind {
+        ChatTemplateKind::ChatML => {
+            for (role, content) in messages {
+                prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
+            }
+            prompt.push_str("<|im_start|>assistant\n");
+        }
+        ChatTemplateKind::Llama3 => {
+            prompt.push_str("<|begin_of_text|>");
+            for (role, content) in messages {
+                prompt.push_str(&format!(
+                    "<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>"
+                ));
+            }
+            prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+        }
+        ChatTemplateKind::Mistral => {
+            let mut first = true;
+            for (role, content) in messages {
+                if role == "system" {
+                    // Mistral prepends system to first user message.
+                    prompt.push_str(content);
+                    prompt.push_str("\n\n");
+                } else if role == "user" {
+                    if first {
+                        prompt.push_str(&format!("<s>[INST] {content} [/INST]"));
+                        first = false;
+                    } else {
+                        prompt.push_str(&format!("[INST] {content} [/INST]"));
+                    }
+                } else if role == "assistant" {
+                    prompt.push_str(&format!(" {content}</s>"));
+                }
+            }
+        }
+        ChatTemplateKind::Gemma => {
+            for (role, content) in messages {
+                let gemma_role = if role == "assistant" { "model" } else { role.as_str() };
+                prompt.push_str(&format!(
+                    "<start_of_turn>{gemma_role}\n{content}<end_of_turn>\n"
+                ));
+            }
+            prompt.push_str("<start_of_turn>model\n");
+        }
+        ChatTemplateKind::Phi3 => {
+            for (role, content) in messages {
+                prompt.push_str(&format!("<|{role}|>\n{content}<|end|>\n"));
+            }
+            prompt.push_str("<|assistant|>\n");
+        }
+    }
+    prompt
+}
+
+/// Detect the chat template from the tokenizer_config.json in the HF repo.
+///
+/// Falls back to ChatML if detection fails (the default model uses ChatML).
+#[cfg(feature = "candle")]
+fn detect_chat_template(config: &CandleConfig) -> ChatTemplateKind {
+    let api = match hf_hub::api::sync::Api::new() {
+        Ok(api) => api,
+        Err(_) => return ChatTemplateKind::ChatML,
+    };
+
+    // Try the GGUF repo first, then the base repo.
+    let repos = [
+        config.model_id.clone(),
+        config
+            .model_id
+            .strip_suffix("-GGUF")
+            .unwrap_or(&config.model_id)
+            .to_string(),
+    ];
+
+    for repo_id in &repos {
+        let repo = api.repo(hf_hub::Repo::new(repo_id.clone(), hf_hub::RepoType::Model));
+        if let Ok(path) = repo.get("tokenizer_config.json") {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(tmpl) = json.get("chat_template").and_then(|v| v.as_str()) {
+                        return classify_template(tmpl);
+                    }
+                }
+            }
+        }
+    }
+
+    ChatTemplateKind::ChatML
+}
+
+/// Classify a Jinja2 chat template string into a known family by marker tokens.
+#[cfg(feature = "candle")]
+fn classify_template(tmpl: &str) -> ChatTemplateKind {
+    if tmpl.contains("<|im_start|>") {
+        ChatTemplateKind::ChatML
+    } else if tmpl.contains("<|begin_of_text|>") || tmpl.contains("<|eot_id|>") {
+        ChatTemplateKind::Llama3
+    } else if tmpl.contains("[INST]") {
+        ChatTemplateKind::Mistral
+    } else if tmpl.contains("<start_of_turn>") {
+        ChatTemplateKind::Gemma
+    } else if tmpl.contains("<|end|>") {
+        ChatTemplateKind::Phi3
+    } else {
+        // Unknown template — ChatML is the safest default.
+        ChatTemplateKind::ChatML
+    }
+}
+
+// -- Backend struct ----------------------------------------------------------
+
 /// Local inference engine powered by Candle (quantized GGUF models).
 ///
 /// Supports Qwen2, Llama, Phi and similar architectures via quantized GGUF
 /// format for efficient CPU/GPU inference with minimal memory footprint.
+///
+/// All CPU/GPU-intensive work is offloaded to `tokio::task::spawn_blocking`
+/// to avoid starving the async executor.
 #[cfg(feature = "candle")]
 pub struct CandleBackend {
     pub config: CandleConfig,
@@ -192,6 +432,7 @@ pub struct CandleBackend {
     tokenizer: Option<Tokenizer>,
     device: Device,
     eos_token_id: Option<u32>,
+    chat_template: ChatTemplateKind,
 }
 
 #[cfg(feature = "candle")]
@@ -205,6 +446,7 @@ impl CandleBackend {
             tokenizer: None,
             device,
             eos_token_id: None,
+            chat_template: ChatTemplateKind::ChatML,
         })
     }
 
@@ -217,8 +459,10 @@ impl CandleBackend {
         let device = self.device.clone();
 
         // Run the blocking model load on a dedicated thread.
-        let (model, tokenizer, eos_id) = tokio::task::spawn_blocking(move || {
-            Self::load_model_sync(&config, &device)
+        let (model, tokenizer, eos_id, template) = tokio::task::spawn_blocking(move || {
+            let (model, tokenizer, eos_id) = Self::load_model_sync(&config, &device)?;
+            let template = detect_chat_template(&config);
+            Ok::<_, anyhow::Error>((model, tokenizer, eos_id, template))
         })
         .await
         .context("model loading task panicked")??;
@@ -226,11 +470,13 @@ impl CandleBackend {
         self.model = Some(model);
         self.tokenizer = Some(tokenizer);
         self.eos_token_id = eos_id;
+        self.chat_template = template;
 
         tracing::info!(
             model = %self.config.model_id,
             gguf = %self.config.gguf_file,
             device = %self.config.device,
+            template = ?self.chat_template,
             "candle backend loaded"
         );
         Ok(())
@@ -265,7 +511,8 @@ impl CandleBackend {
             .token_to_id("<|endoftext|>")
             .or_else(|| tokenizer.token_to_id("<|im_end|>"))
             .or_else(|| tokenizer.token_to_id("</s>"))
-            .or_else(|| tokenizer.token_to_id("<eos>"));
+            .or_else(|| tokenizer.token_to_id("<eos>"))
+            .or_else(|| tokenizer.token_to_id("<|eot_id|>"));
 
         Ok((model, tokenizer, eos_id))
     }
@@ -318,12 +565,9 @@ impl CandleBackend {
 
     /// Generate a completion for the given prompt.
     ///
-    /// Returns the generated text (excluding the prompt).
+    /// CPU/GPU work is offloaded to a blocking thread via
+    /// `tokio::task::spawn_blocking` so the async executor stays responsive.
     pub async fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String> {
-        let model = self
-            .model
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("candle backend: model not loaded -- call load() first"))?;
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -343,84 +587,142 @@ impl CandleBackend {
             return Ok(String::new());
         }
 
+        // Take model out to move into the blocking thread.
+        let mut model = self
+            .model
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("candle backend: model not loaded -- call load() first"))?;
+
+        let device = self.device.clone();
         let temperature = self.config.temperature;
         let top_p = self.config.top_p;
         let repeat_penalty = self.config.repeat_penalty;
         let repeat_last_n = self.config.repeat_penalty_last_n;
         let eos_id = self.eos_token_id;
-        let device = &self.device;
 
-        // Process prompt (prefill)
-        let input = Tensor::new(prompt_tokens.as_slice(), device)
-            .context("failed to create prompt tensor")?
-            .unsqueeze(0)
-            .map_err(|e| anyhow::anyhow!("unsqueeze failed: {e}"))?;
+        let (tokens_result, model_back) = tokio::task::spawn_blocking(move || {
+            let r = generate_tokens_sync(
+                &mut model,
+                &device,
+                &prompt_tokens,
+                max_tokens,
+                temperature,
+                top_p,
+                repeat_penalty,
+                repeat_last_n,
+                eos_id,
+                None,
+            );
+            (r, model)
+        })
+        .await
+        .context("generation task panicked")?;
 
-        let logits = model
-            .forward(&input, 0)
-            .map_err(|e| anyhow::anyhow!("forward pass (prefill) failed: {e}"))?;
-
-        let logits = logits.squeeze(0).map_err(|e| anyhow::anyhow!("squeeze failed: {e}"))?;
-        let mut logits_vec: Vec<f32> = logits
-            .to_vec1()
-            .map_err(|e| anyhow::anyhow!("logits to vec failed: {e}"))?;
-
-        // Track recent tokens for repeat penalty.
-        let mut recent: Vec<u32> = prompt_tokens
-            .iter()
-            .rev()
-            .take(repeat_last_n)
-            .copied()
-            .collect();
-
-        apply_repeat_penalty(&mut logits_vec, &recent, repeat_penalty);
-        let mut next_token = sample_token(&logits_vec, temperature, top_p) as u32;
-
-        let mut generated_tokens: Vec<u32> = vec![next_token];
-
-        // Autoregressive generation loop.
-        for step in 1..max_tokens {
-            if Some(next_token) == eos_id {
-                break;
-            }
-
-            let input = Tensor::new(&[next_token], device)
-                .map_err(|e| anyhow::anyhow!("token tensor failed at step {step}: {e}"))?
-                .unsqueeze(0)
-                .map_err(|e| anyhow::anyhow!("unsqueeze failed: {e}"))?;
-
-            let logits = model
-                .forward(&input, prompt_tokens.len() + step)
-                .map_err(|e| anyhow::anyhow!("forward pass (step {step}) failed: {e}"))?;
-
-            let logits = logits.squeeze(0).map_err(|e| anyhow::anyhow!("squeeze: {e}"))?;
-            let mut logits_vec: Vec<f32> = logits
-                .to_vec1()
-                .map_err(|e| anyhow::anyhow!("logits to vec: {e}"))?;
-
-            // Update recent tokens ring buffer.
-            recent.push(next_token);
-            if recent.len() > repeat_last_n {
-                recent.remove(0);
-            }
-            apply_repeat_penalty(&mut logits_vec, &recent, repeat_penalty);
-
-            next_token = sample_token(&logits_vec, temperature, top_p) as u32;
-            generated_tokens.push(next_token);
-        }
-
-        // Strip EOS if it ended up in the output.
-        if let Some(&last) = generated_tokens.last() {
-            if Some(last) == eos_id {
-                generated_tokens.pop();
-            }
-        }
+        // Always return the model, even on generation error.
+        self.model = Some(model_back);
+        let generated_tokens = tokens_result?;
 
         let decoded = tokenizer
             .decode(&generated_tokens, true)
             .map_err(|e| anyhow::anyhow!("decoding failed: {e}"))?;
 
         Ok(decoded)
+    }
+
+    /// Generate with true token-by-token streaming.
+    ///
+    /// Each generated token is decoded and sent through `tx` as soon as it
+    /// is sampled.  The full response text is returned at the end.
+    pub async fn generate_stream(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("candle backend: tokenizer not loaded"))?;
+
+        let encoding = tokenizer
+            .encode(prompt, true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let prompt_tokens: Vec<u32> = encoding.get_ids().to_vec();
+
+        if prompt_tokens.is_empty() {
+            return Ok(String::new());
+        }
+
+        let max_tokens = max_tokens.min(self.config.max_seq_len.saturating_sub(prompt_tokens.len()));
+        if max_tokens == 0 {
+            return Ok(String::new());
+        }
+
+        // Take model out to move into the blocking thread.
+        let mut model = self
+            .model
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("candle backend: model not loaded"))?;
+
+        let device = self.device.clone();
+        let temperature = self.config.temperature;
+        let top_p = self.config.top_p;
+        let repeat_penalty = self.config.repeat_penalty;
+        let repeat_last_n = self.config.repeat_penalty_last_n;
+        let eos_id = self.eos_token_id;
+        let tok_clone = tokenizer.clone();
+
+        // Use std::sync::mpsc for the blocking thread → async bridge.
+        let (token_tx, token_rx) = std::sync::mpsc::channel::<u32>();
+
+        let gen_handle = tokio::task::spawn_blocking(move || {
+            let r = generate_tokens_sync(
+                &mut model,
+                &device,
+                &prompt_tokens,
+                max_tokens,
+                temperature,
+                top_p,
+                repeat_penalty,
+                repeat_last_n,
+                eos_id,
+                Some(&token_tx),
+            );
+            drop(token_tx); // Signal end of stream.
+            (r, model)
+        });
+
+        // Forward decoded tokens to the async channel.
+        let mut full_text = String::new();
+        // Process tokens from the sync channel, decoding and forwarding each.
+        while let Ok(token_id) = token_rx.recv() {
+            if let Some(eos) = eos_id {
+                if token_id == eos {
+                    break;
+                }
+            }
+            if let Ok(piece) = tok_clone.decode(&[token_id], true) {
+                if !piece.is_empty() {
+                    full_text.push_str(&piece);
+                    let _ = tx.send(piece).await;
+                }
+            }
+        }
+
+        let (tokens_result, model_back) = gen_handle
+            .await
+            .context("generation task panicked")?;
+
+        self.model = Some(model_back);
+        // We already have full_text from streaming; ignore the token vec on success.
+        tokens_result?;
+
+        Ok(full_text)
+    }
+
+    /// The detected chat template for this model.
+    pub fn chat_template(&self) -> ChatTemplateKind {
+        self.chat_template
     }
 
     /// Whether the model has been loaded into memory.
@@ -431,6 +733,11 @@ impl CandleBackend {
     /// The model identifier.
     pub fn model_id(&self) -> &str {
         &self.config.model_id
+    }
+
+    /// The GGUF filename.
+    pub fn gguf_file(&self) -> &str {
+        &self.config.gguf_file
     }
 }
 
@@ -549,5 +856,67 @@ mod tests {
     fn resolve_cpu_device() {
         let d = resolve_device("cpu").unwrap();
         assert!(matches!(d, Device::Cpu));
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn classify_chatml_template() {
+        let tmpl = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}";
+        assert_eq!(classify_template(tmpl), ChatTemplateKind::ChatML);
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn classify_llama3_template() {
+        let tmpl = "{% for message in messages %}<|begin_of_text|><|start_header_id|>{{ message.role }}<|end_header_id|>{{ message.content }}<|eot_id|>{% endfor %}";
+        assert_eq!(classify_template(tmpl), ChatTemplateKind::Llama3);
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn classify_mistral_template() {
+        let tmpl = "{% for message in messages %}[INST] {{ message.content }} [/INST]{% endfor %}";
+        assert_eq!(classify_template(tmpl), ChatTemplateKind::Mistral);
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn classify_gemma_template() {
+        let tmpl = "{% for message in messages %}<start_of_turn>{{ message.role }}\n{{ message.content }}<end_of_turn>\n{% endfor %}";
+        assert_eq!(classify_template(tmpl), ChatTemplateKind::Gemma);
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn classify_phi3_template() {
+        let tmpl = "{% for message in messages %}<|{{ message.role }}|>\n{{ message.content }}<|end|>\n{% endfor %}";
+        assert_eq!(classify_template(tmpl), ChatTemplateKind::Phi3);
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn chatml_format_roundtrip() {
+        let msgs = vec![
+            ("system".to_string(), "You are helpful.".to_string()),
+            ("user".to_string(), "Hello".to_string()),
+        ];
+        let prompt = apply_chat_template(ChatTemplateKind::ChatML, &msgs);
+        assert!(prompt.contains("<|im_start|>system\nYou are helpful.<|im_end|>"));
+        assert!(prompt.contains("<|im_start|>user\nHello<|im_end|>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[cfg(feature = "candle")]
+    #[test]
+    fn llama3_format_roundtrip() {
+        let msgs = vec![
+            ("system".to_string(), "You are helpful.".to_string()),
+            ("user".to_string(), "Hello".to_string()),
+        ];
+        let prompt = apply_chat_template(ChatTemplateKind::Llama3, &msgs);
+        assert!(prompt.contains("<|begin_of_text|>"));
+        assert!(prompt.contains("<|start_header_id|>system<|end_header_id|>"));
+        assert!(prompt.contains("<|eot_id|>"));
+        assert!(prompt.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 }

@@ -537,7 +537,17 @@ pub struct AppConfig {
     pub inference: InferenceConfig,
 }
 
+/// Default config file path, overridable via `AIGENT_CONFIG` env var.
+pub const DEFAULT_CONFIG_PATH: &str = "config/default.toml";
+
 impl AppConfig {
+    /// Resolve the config file path: honours `AIGENT_CONFIG` env var, falls
+    /// back to [`DEFAULT_CONFIG_PATH`].
+    pub fn config_path() -> String {
+        std::env::var("AIGENT_CONFIG")
+            .unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string())
+    }
+
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self> {
         let mut config = Self::default();
         if let Ok(raw) = fs::read_to_string(path) {
