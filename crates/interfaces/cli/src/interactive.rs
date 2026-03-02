@@ -75,11 +75,12 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
                         match daemon.get_status().await {
                             Ok(status) => {
                                 let text = format!(
-                                    "bot: {}\nprovider: {}\nmodel: {}\nthinking: {}\nmemory: {} total (core={} profile={} reflective={} semantic={} episodic={})\nuptime: {}s",
+                                    "bot: {}\nprovider: {}\nmodel: {}\nthinking: {} ({})\nmemory: {} total (core={} profile={} reflective={} semantic={} episodic={})\nuptime: {}s",
                                     status.bot_name,
                                     status.provider,
                                     status.model,
                                     status.thinking_level,
+                                    if status.external_thinking { "external" } else { "model" },
                                     status.memory_total,
                                     status.memory_core,
                                     status.memory_user_profile,
@@ -305,7 +306,7 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
 pub(crate) async fn run_interactive_line_session(daemon: DaemonClient) -> Result<()> {
     println!("interactive mode");
     println!("commands: /model show|list [ollama|openrouter]|provider <ollama|openrouter>|set <model>");
-    println!("          /think <low|balanced|deep>, /status, /memory, /help, /exit");
+    println!("          /think <low|balanced|deep>, /thinking <external|model>, /status, /memory, /help, /exit");
     println!("or type any message to chat with Aigent");
 
     let stdin = io::stdin();
@@ -338,6 +339,7 @@ pub(crate) async fn run_interactive_line_session(daemon: DaemonClient) -> Result
             println!("/model provider <ollama|openrouter>");
             println!("/model set <model>");
             println!("/think <low|balanced|deep>");
+            println!("/thinking <external|model>");
             println!("/exit");
             continue;
         }
@@ -347,7 +349,7 @@ pub(crate) async fn run_interactive_line_session(daemon: DaemonClient) -> Result
             println!("bot: {}", status.bot_name);
             println!("provider: {}", status.provider);
             println!("model: {}", status.model);
-            println!("thinking: {}", status.thinking_level);
+            println!("thinking: {} ({})", status.thinking_level, if status.external_thinking { "external" } else { "model" });
             println!(
                 "memory: {} total (core={} profile={} reflective={} semantic={} episodic={})",
                 status.memory_total,
@@ -396,7 +398,7 @@ pub(crate) async fn run_interactive_line_session(daemon: DaemonClient) -> Result
             let status = daemon.get_status().await?;
             println!("provider: {}", status.provider);
             println!("model: {}", status.model);
-            println!("thinking: {}", status.thinking_level);
+            println!("thinking: {} ({})", status.thinking_level, if status.external_thinking { "external" } else { "model" });
             continue;
         }
 

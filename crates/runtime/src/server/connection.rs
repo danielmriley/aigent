@@ -130,12 +130,19 @@ pub(super) async fn handle_connection(
                 let context = memory.context_for_prompt_ranked_with_embed(&user, 10, query_embedding);
                 let stats = memory.stats();
 
+                // Decide now whether we're using external thinking, since it
+                // affects both prompt construction and tool dispatch.
+                let use_ext_thinking = rt_clone.config.agent.external_thinking;
+
                 let mut prompt_inputs = crate::prompt_builder::PromptInputs {
                     config: &rt_clone.config,
                     memory: &mut memory,
                     user_message: &user,
                     recent_turns: &recent,
-                    tool_specs: &[],  // Don't inject tools into the text prompt — they go via API
+                    // External thinking mode needs tool specs in the text prompt
+                    // because tools are NOT passed via the structured API.
+                    // Standard mode omits them — they go via the tools JSON API.
+                    tool_specs: if use_ext_thinking { &tool_specs } else { &[] },
                     pending_follow_ups: &[],
                     context_items: &context,
                     stats,
@@ -153,8 +160,9 @@ pub(super) async fn handle_connection(
                 }
                 messages.push(aigent_llm::ChatMessage::user(&user));
 
-                // Build tools JSON from specs
-                let tools_json = if tool_specs.is_empty() {
+                // Build tools JSON from specs (only needed for native tool loop,
+                // not for external thinking which uses text-prompt tool listing).
+                let tools_json = if use_ext_thinking || tool_specs.is_empty() {
                     None
                 } else {
                     Some(crate::tool_loop::build_tools_json(&tool_specs))
@@ -171,8 +179,6 @@ pub(super) async fn handle_connection(
                 //
                 // When external_thinking is enabled, we use the JSON reasoning
                 // loop instead of the standard tool loop.
-                let use_ext_thinking = rt_clone.config.agent.external_thinking;
-
                 let reply_result: Result<String, anyhow::Error> = if use_ext_thinking {
                     // ── External JSON reasoning loop ────────────────────
                     let ext_cfg = crate::ext_think::ExtThinkConfig {
@@ -196,6 +202,20 @@ pub(super) async fn handle_connection(
 
                     match ext_result {
                         Ok(ref result) => {
+                            // Record tool executions to procedural memory
+                            for exec in &result.tool_executions {
+                                let outcome = format!(
+                                    "Tool '{}' executed. Output (first 400 chars): {}",
+                                    exec.tool_name,
+                                    safe_truncate(&exec.output, 400),
+                                );
+                                let _: Result<_, _> = memory.record(
+                                    MemoryTier::Procedural,
+                                    outcome,
+                                    format!("tool-use:{}", exec.tool_name),
+                                ).await;
+                            }
+                            // Record assistant reply
                             if !result.content.is_empty() {
                                 let _: Result<_, _> = memory.record(
                                     aigent_memory::MemoryTier::Episodic,

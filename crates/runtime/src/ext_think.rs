@@ -35,6 +35,7 @@ use aigent_llm::{ChatMessage, LlmRouter, Provider};
 use aigent_tools::ToolRegistry;
 
 use crate::agent_loop::LlmToolCall;
+use crate::tool_loop::ToolExecution;
 use crate::events::{BackendEvent, ToolCallInfo, ToolResult as ToolResultEvent};
 
 // ── AgentStep: the structured JSON schema the model must produce ─────────────
@@ -87,6 +88,8 @@ pub struct ExtThinkResult {
     pub content: String,
     /// Total reasoning steps consumed.
     pub steps: usize,
+    /// Tool executions performed during reasoning (for procedural memory).
+    pub tool_executions: Vec<ToolExecution>,
 }
 
 // ── Configuration (read from AppConfig at call site) ─────────────────────────
@@ -130,6 +133,7 @@ pub async fn run_external_thinking_loop(
     event_tx: Option<&broadcast::Sender<BackendEvent>>,
 ) -> Result<ExtThinkResult> {
     let mut steps = 0usize;
+    let mut tool_executions: Vec<ToolExecution> = Vec::new();
 
     loop {
         if steps >= config.max_steps {
@@ -225,6 +229,15 @@ pub async fn run_external_thinking_loop(
                     Err(err) => (false, format!("tool error: {err}")),
                 };
 
+                // Track for procedural memory.
+                tool_executions.push(ToolExecution {
+                    tool_name: tool_call.name.clone(),
+                    args: tool_call.args.clone(),
+                    success,
+                    output: output.clone(),
+                    duration_ms,
+                });
+
                 // Emit tool end.
                 if let Some(tx) = event_tx {
                     let _ = tx.send(BackendEvent::ToolCallEnd(ToolResultEvent {
@@ -264,6 +277,7 @@ pub async fn run_external_thinking_loop(
                 return Ok(ExtThinkResult {
                     content: final_answer,
                     steps,
+                    tool_executions,
                 });
             }
         }
@@ -315,11 +329,14 @@ async fn call_llm_with_timeout(
         .context("step timed out")?
         .context("LLM call failed")?;
 
-    // Prefer the response content; fall back to collected tokens.
+    // Always await the collector task to avoid a dangling spawn.
+    let collected = collect_handle.await.unwrap_or_default();
+
+    // Prefer the response content; fall back to collected stream tokens.
     let text = if !response.content.is_empty() {
         response.content
     } else {
-        collect_handle.await.unwrap_or_default()
+        collected
     };
 
     if text.trim().is_empty() {

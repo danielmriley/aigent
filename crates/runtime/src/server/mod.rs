@@ -97,6 +97,7 @@ impl DaemonState {
             provider: self.runtime.config.llm.provider.clone(),
             model: self.runtime.config.active_model().to_string(),
             thinking_level: self.runtime.config.agent.thinking_level.clone(),
+            external_thinking: self.runtime.config.agent.external_thinking,
             memory_total: stats.total,
             memory_core: stats.core,
             memory_user_profile: stats.user_profile,
