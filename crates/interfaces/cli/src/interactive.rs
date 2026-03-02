@@ -279,7 +279,13 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
                     }
 
                     tokio::spawn(async move {
-                        let _ = daemon.stream_submit(line, "tui", backend_tx.clone()).await;
+                        if let Err(err) = daemon.stream_submit(line, "tui", backend_tx.clone()).await {
+                            // Ensure the TUI always receives a terminal event so
+                            // the thinking spinner / status resets even when the
+                            // daemon connection drops or fails.
+                            let _ = backend_tx.send(BackendEvent::Error(err.to_string()));
+                            let _ = backend_tx.send(BackendEvent::Done);
+                        }
                     });
                 }
             }
