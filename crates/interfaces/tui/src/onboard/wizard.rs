@@ -157,8 +157,10 @@ pub(super) fn normalize_provider(raw: &str) -> Result<String> {
         Ok("openrouter".to_string())
     } else if raw.eq_ignore_ascii_case("ollama") {
         Ok("ollama".to_string())
+    } else if raw.eq_ignore_ascii_case("candle") {
+        Ok("candle".to_string())
     } else {
-        bail!("provider must be one of: ollama, openrouter");
+        bail!("provider must be one of: ollama, openrouter, candle");
     }
 }
 
@@ -356,6 +358,11 @@ fn prompt_llm_settings(config: &mut AppConfig) -> Result<()> {
         if let Some(key) = key {
             upsert_env_value(Path::new(".env"), "OPENROUTER_API_KEY", &key)?;
         }
+    } else if provider == "candle" {
+        config.llm.provider = "candle".to_string();
+        config.inference.candle_enabled = true;
+        let model = prompt("Candle HF model repo", &config.inference.candle_model_repo)?;
+        config.inference.candle_model_repo = model;
     } else {
         config.llm.provider = "ollama".to_string();
         let model = prompt("Ollama model", &config.llm.ollama_model)?;

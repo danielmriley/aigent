@@ -15,5 +15,6 @@ tracing.workspace = true
 
 aigent-runtime = { path = "../../runtime" }
 aigent-llm = { path = "../../llm" }
+aigent-config = { path = "../../config" }
 aigent-memory = { path = "../../memory" }
 

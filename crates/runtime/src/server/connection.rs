@@ -168,10 +168,10 @@ pub(super) async fn handle_connection(
                     Some(crate::tool_loop::build_tools_json(&tool_specs))
                 };
 
-                let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
-                    aigent_llm::Provider::OpenRouter
-                } else {
-                    aigent_llm::Provider::Ollama
+                let primary = match rt_clone.config.llm.provider.to_lowercase().as_str() {
+                    "openrouter" => aigent_llm::Provider::OpenRouter,
+                    "candle" => aigent_llm::Provider::Candle,
+                    _ => aigent_llm::Provider::Ollama,
                 };
 
                 // Run the structured tool loop — registry/executor are Arc-cloned
@@ -989,11 +989,11 @@ pub(super) async fn handle_connection(
                 Some(crate::tool_loop::build_tools_json(&tool_specs))
             };
 
-            let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
-                aigent_llm::Provider::OpenRouter
-            } else {
-                aigent_llm::Provider::Ollama
-            };
+            let primary = match rt_clone.config.llm.provider.to_lowercase().as_str() {
+                    "openrouter" => aigent_llm::Provider::OpenRouter,
+                    "candle" => aigent_llm::Provider::Candle,
+                    _ => aigent_llm::Provider::Ollama,
+                };
 
             let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);
             tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });

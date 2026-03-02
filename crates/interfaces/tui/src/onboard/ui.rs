@@ -568,27 +568,37 @@ fn step_content<'a>(
         ),
         WizardStep::Provider => (
             "LLM Provider",
-            "Choose the LLM provider (Up/Down/Tab to cycle):\n\nOllama = local-first\nOpenRouter = hosted API".to_string(),
-            format_choice_list(&["ollama", "openrouter"], &draft.provider),
+            "Choose the LLM provider (Up/Down/Tab to cycle):\n\nOllama = local-first\nOpenRouter = hosted API\nCandle = native local inference (GGUF)".to_string(),
+            format_choice_list(&["ollama", "openrouter", "candle"], &draft.provider),
         ),
         WizardStep::Model => {
-            let is_openrouter = draft.provider.eq_ignore_ascii_case("openrouter");
-            let models = if is_openrouter {
-                &draft.available_models.openrouter
+            let is_candle = draft.provider.eq_ignore_ascii_case("candle");
+            if is_candle {
+                // Candle uses a HuggingFace repo string — free-form text input
+                (
+                    "Model Selection",
+                    format!("Enter the HuggingFace model repo for Candle (e.g. Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF):"),
+                    ratatui::text::Text::from(format!("\n{}\n", input)),
+                )
             } else {
-                &draft.available_models.ollama
-            };
-            let current = if is_openrouter {
-                &draft.openrouter_model
-            } else {
-                &draft.ollama_model
-            };
-            let model_refs: Vec<&str> = models.iter().map(|s| s.as_str()).collect();
-            (
-                "Model Selection",
-                format!("Set the model to use for provider {}:", draft.provider),
-                format_choice_list(&model_refs, current),
-            )
+                let is_openrouter = draft.provider.eq_ignore_ascii_case("openrouter");
+                let models = if is_openrouter {
+                    &draft.available_models.openrouter
+                } else {
+                    &draft.available_models.ollama
+                };
+                let current = if is_openrouter {
+                    &draft.openrouter_model
+                } else {
+                    &draft.ollama_model
+                };
+                let model_refs: Vec<&str> = models.iter().map(|s| s.as_str()).collect();
+                (
+                    "Model Selection",
+                    format!("Set the model to use for provider {}:", draft.provider),
+                    format_choice_list(&model_refs, current),
+                )
+            }
         }
         WizardStep::OpenRouterKey => (
             "OpenRouter API Key",

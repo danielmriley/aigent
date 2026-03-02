@@ -145,6 +145,8 @@ impl Default for OpenRouterClient {
 pub enum Provider {
     Ollama,
     OpenRouter,
+    /// Local Candle inference (GGUF models).
+    Candle,
 }
 
 // ── LlmClient trait & ModelProvider ──────────────────────────────────────────
@@ -166,6 +168,7 @@ impl From<Provider> for ModelProvider {
         match p {
             Provider::Ollama => ModelProvider::Ollama,
             Provider::OpenRouter => ModelProvider::OpenRouter,
+            Provider::Candle => ModelProvider::Candle,
         }
     }
 }
@@ -175,7 +178,7 @@ impl From<ModelProvider> for Provider {
         match mp {
             ModelProvider::Ollama => Provider::Ollama,
             ModelProvider::OpenRouter => Provider::OpenRouter,
-            ModelProvider::Candle => Provider::Ollama,
+            ModelProvider::Candle => Provider::Candle,
         }
     }
 }
@@ -224,10 +227,50 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<ChatResponse>;
 }
 
-#[derive(Debug, Clone, Default)]
 pub struct LlmRouter {
     ollama: OllamaClient,
     openrouter: OpenRouterClient,
+    /// Candle local inference backend (feature-gated, lazily loaded).
+    #[cfg(feature = "candle")]
+    candle: std::sync::Arc<tokio::sync::Mutex<Option<candle_backend::CandleBackend>>>,
+    /// Candle config for lazy init.
+    #[cfg(feature = "candle")]
+    candle_config: Option<candle_backend::CandleConfig>,
+}
+
+impl Default for LlmRouter {
+    fn default() -> Self {
+        Self {
+            ollama: OllamaClient::new(),
+            openrouter: OpenRouterClient::new(),
+            #[cfg(feature = "candle")]
+            candle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            #[cfg(feature = "candle")]
+            candle_config: None,
+        }
+    }
+}
+
+impl Clone for LlmRouter {
+    fn clone(&self) -> Self {
+        Self {
+            ollama: self.ollama.clone(),
+            openrouter: self.openrouter.clone(),
+            #[cfg(feature = "candle")]
+            candle: std::sync::Arc::clone(&self.candle),
+            #[cfg(feature = "candle")]
+            candle_config: self.candle_config.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for LlmRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmRouter")
+            .field("ollama", &self.ollama)
+            .field("openrouter", &self.openrouter)
+            .finish()
+    }
 }
 
 const OPENROUTER_FALLBACK_MODELS: &[&str] = &[
@@ -325,6 +368,72 @@ pub async fn list_openrouter_models() -> Result<Vec<String>> {
 }
 
 impl LlmRouter {
+    /// Create a new LlmRouter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Configure the Candle backend for local inference.
+    #[cfg(feature = "candle")]
+    pub fn with_candle_config(mut self, config: candle_backend::CandleConfig) -> Self {
+        self.candle_config = Some(config);
+        self
+    }
+
+    /// Get or lazily initialize the Candle backend.
+    #[cfg(feature = "candle")]
+    async fn get_candle(&self) -> Result<tokio::sync::MutexGuard<'_, Option<candle_backend::CandleBackend>>> {
+        let mut guard = self.candle.lock().await;
+        if guard.is_none() {
+            let config = self.candle_config.clone().unwrap_or_default();
+            let mut backend = candle_backend::CandleBackend::new(config)?;
+            backend.load().await?;
+            *guard = Some(backend);
+        }
+        Ok(guard)
+    }
+
+    /// Format chat messages into a ChatML prompt and run through Candle.
+    ///
+    /// Candle generates raw text — it does not parse tool calls. If tools
+    /// were requested the finish_reason will be set to "stop"; the runtime
+    /// layer is responsible for extracting any structured JSON the model
+    /// chose to emit inside its text response.
+    #[cfg(feature = "candle")]
+    async fn candle_chat(
+        &self,
+        messages: &[ChatMessage],
+        _tools: Option<&serde_json::Value>,
+    ) -> Result<ChatResponse> {
+        // Build a ChatML-style prompt from messages.
+        let mut prompt = String::new();
+        for msg in messages {
+            let role_str = match msg.role {
+                ChatRole::System => "system",
+                ChatRole::User => "user",
+                ChatRole::Assistant => "assistant",
+                ChatRole::Tool => "tool",
+            };
+            let content = msg.content.as_deref().unwrap_or("");
+            prompt.push_str(&format!("<|im_start|>{role_str}\n{content}<|im_end|>\n"));
+        }
+        prompt.push_str("<|im_start|>assistant\n");
+
+        let mut guard = self.get_candle().await?;
+        let backend = guard
+            .as_mut()
+            .expect("candle backend loaded by get_candle");
+        let max_tokens = backend.config.max_seq_len;
+        let text = backend.generate(&prompt, max_tokens).await?;
+
+        Ok(ChatResponse {
+            provider: Provider::Candle,
+            content: text,
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+        })
+    }
+
     pub async fn chat_with_fallback(
         &self,
         primary: Provider,
@@ -335,6 +444,17 @@ impl LlmRouter {
         let should_force_fallback = prompt.to_lowercase().contains("/fallback");
 
         match primary {
+            #[cfg(feature = "candle")]
+            Provider::Candle => {
+                let mut guard = self.get_candle().await?;
+                let backend = guard.as_mut().expect("candle loaded");
+                let text = backend.generate(prompt, backend.config.max_seq_len).await?;
+                Ok((Provider::Candle, text))
+            }
+            #[cfg(not(feature = "candle"))]
+            Provider::Candle => {
+                anyhow::bail!("candle feature not compiled; use `--features candle`")
+            }
             Provider::Ollama if !should_force_fallback => Ok((
                 Provider::Ollama,
                 self.ollama.chat_model(ollama_model, prompt).await?,
@@ -361,6 +481,18 @@ impl LlmRouter {
         let should_force_fallback = prompt.to_lowercase().contains("/fallback");
 
         match primary {
+            #[cfg(feature = "candle")]
+            Provider::Candle => {
+                let mut guard = self.get_candle().await?;
+                let backend = guard.as_mut().expect("candle loaded");
+                let text = backend.generate(prompt, backend.config.max_seq_len).await?;
+                let _ = tx.send(text.clone()).await;
+                Ok((Provider::Candle, text))
+            }
+            #[cfg(not(feature = "candle"))]
+            Provider::Candle => {
+                anyhow::bail!("candle feature not compiled; use `--features candle`")
+            }
             Provider::Ollama if !should_force_fallback => Ok((
                 Provider::Ollama,
                 self.ollama.chat_model_stream(ollama_model, prompt, tx).await?,
@@ -390,6 +522,10 @@ impl LlmRouter {
         tools: Option<&serde_json::Value>,
     ) -> Result<ChatResponse> {
         match primary {
+            #[cfg(feature = "candle")]
+            Provider::Candle => self.candle_chat(messages, tools).await,
+            #[cfg(not(feature = "candle"))]
+            Provider::Candle => anyhow::bail!("candle feature not compiled; use `--features candle`"),
             Provider::Ollama => {
                 let (content, tool_calls, finish_reason) = self.ollama
                     .chat_messages(ollama_model, messages, tools).await?;
@@ -427,6 +563,15 @@ impl LlmRouter {
         tx: mpsc::Sender<String>,
     ) -> Result<ChatResponse> {
         match primary {
+            #[cfg(feature = "candle")]
+            Provider::Candle => {
+                // Candle doesn't support true streaming — generate fully then send.
+                let resp = self.candle_chat(messages, tools).await?;
+                let _ = tx.send(resp.content.clone()).await;
+                Ok(resp)
+            }
+            #[cfg(not(feature = "candle"))]
+            Provider::Candle => anyhow::bail!("candle feature not compiled; use `--features candle`"),
             Provider::Ollama => {
                 let (content, tool_calls, finish_reason) = self.ollama
                     .chat_messages_stream(ollama_model, messages, tools, tx).await?;
@@ -1358,4 +1503,38 @@ mod tests {
         // which is invalid JSON, so we should get None.
         assert!(extract_json_output::<StructuredOutput>(raw).is_none());
     }
+
+    // ── Provider::Candle serde ─────────────────────────────────────────────
+
+    #[test]
+    fn provider_candle_serde_roundtrip() {
+        let provider = Provider::Candle;
+        let json = serde_json::to_string(&provider).unwrap();
+        let back: Provider = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, Provider::Candle);
+    }
+
+    #[test]
+    fn provider_candle_from_model_provider() {
+        let mp = ModelProvider::Candle;
+        let p: Provider = Provider::from(mp);
+        assert_eq!(p, Provider::Candle);
+    }
+
+    #[test]
+    fn model_provider_from_provider_candle() {
+        let p = Provider::Candle;
+        let mp: ModelProvider = p.into();
+        assert_eq!(mp, ModelProvider::Candle);
+    }
+
+    // ── LlmRouter default ─────────────────────────────────────────────────
+
+    #[test]
+    fn llm_router_new_and_default_equivalent() {
+        // Both should produce a valid router; mainly ensure no panics.
+        let _a = LlmRouter::new();
+        let _b = LlmRouter::default();
+    }
+
 }

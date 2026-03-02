@@ -26,5 +26,9 @@ aigent-llm = { path = "../llm" }
 aigent-memory = { path = "../memory" }
 aigent-tools = { path = "../tools" }
 
+[features]
+default = []
+candle = ["aigent-llm/candle"]
+
 [dev-dependencies]
 tempfile = "3"

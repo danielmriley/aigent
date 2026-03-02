@@ -27,10 +27,37 @@ pub struct AgentRuntime {
 
 impl AgentRuntime {
     pub fn new(config: AppConfig) -> Self {
-        Self {
-            config,
-            llm: LlmRouter::default(),
+        #[allow(unused_mut)]
+        let mut llm = LlmRouter::new();
+
+        // Wire Candle local inference backend when the feature is compiled in
+        // and the user has enabled it in [inference].
+        #[cfg(feature = "candle")]
+        if config.inference.candle_enabled {
+            let candle_cfg = aigent_llm::candle_backend::CandleConfig {
+                model_id: config.inference.candle_model_repo.clone(),
+                gguf_file: config.inference.candle_model_file.clone(),
+                model_path: if config.inference.candle_model_path.is_empty() {
+                    None
+                } else {
+                    Some(config.inference.candle_model_path.clone())
+                },
+                max_seq_len: config.inference.candle_max_seq_len,
+                temperature: config.inference.candle_temperature,
+                top_p: config.inference.candle_top_p,
+                repeat_penalty: config.inference.candle_repeat_penalty,
+                repeat_penalty_last_n: 64,
+                device: config.inference.candle_device.clone(),
+            };
+            tracing::info!(
+                model = %candle_cfg.model_id,
+                device = %candle_cfg.device,
+                "candle local inference configured"
+            );
+            llm = llm.with_candle_config(candle_cfg);
         }
+
+        Self { config, llm }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -38,11 +65,11 @@ impl AgentRuntime {
     }
 
     pub async fn test_model_connection(&self) -> Result<String> {
-        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
-            Provider::OpenRouter
-        } else {
-            Provider::Ollama
-        };
+        let primary = match self.config.llm.provider.to_lowercase().as_str() {
+                    "openrouter" => Provider::OpenRouter,
+                    "candle" => Provider::Candle,
+                    _ => Provider::Ollama,
+                };
 
         let prompt = format!(
             "[healthcheck][bot-name:{}][thinking:{}] Reply with a short single-line confirmation.",

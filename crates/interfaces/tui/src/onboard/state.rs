@@ -98,6 +98,7 @@ pub(super) struct OnboardingDraft {
     pub(super) provider: String,
     pub(super) ollama_model: String,
     pub(super) openrouter_model: String,
+    pub(super) candle_model_repo: String,
     pub(super) openrouter_key: String,
     pub(super) thinking_level: String,
     pub(super) night_sleep_start_hour: u8,
@@ -122,6 +123,7 @@ impl OnboardingDraft {
             provider: config.llm.provider.clone(),
             ollama_model: config.llm.ollama_model.clone(),
             openrouter_model: config.llm.openrouter_model.clone(),
+            candle_model_repo: config.inference.candle_model_repo.clone(),
             openrouter_key: String::new(),
             thinking_level: config.agent.thinking_level.clone(),
             night_sleep_start_hour: config.memory.night_sleep_start_hour,
@@ -154,6 +156,8 @@ impl OnboardingDraft {
             WizardStep::Model => {
                 if self.provider.eq_ignore_ascii_case("openrouter") {
                     self.openrouter_model.clone()
+                } else if self.provider.eq_ignore_ascii_case("candle") {
+                    self.candle_model_repo.clone()
                 } else {
                     self.ollama_model.clone()
                 }
@@ -214,6 +218,8 @@ impl OnboardingDraft {
                 }
                 if self.provider.eq_ignore_ascii_case("openrouter") {
                     self.openrouter_model = value.to_string();
+                } else if self.provider.eq_ignore_ascii_case("candle") {
+                    self.candle_model_repo = value.to_string();
                 } else {
                     self.ollama_model = value.to_string();
                 }
@@ -257,13 +263,17 @@ impl OnboardingDraft {
                 self.config_section = all[(idx + 1) % all.len()];
             }
             WizardStep::Provider => {
-                self.provider = if self.provider.eq_ignore_ascii_case("openrouter") {
-                    "ollama".to_string()
-                } else {
-                    "openrouter".to_string()
+                self.provider = match self.provider.to_lowercase().as_str() {
+                    "ollama" => "openrouter".to_string(),
+                    "openrouter" => "candle".to_string(),
+                    _ => "ollama".to_string(),
                 }
             }
             WizardStep::Model => {
+                // Candle uses free-form text input, no cycling
+                if self.provider.eq_ignore_ascii_case("candle") {
+                    return;
+                }
                 let is_openrouter = self.provider.eq_ignore_ascii_case("openrouter");
                 let models = if is_openrouter {
                     &self.available_models.openrouter
@@ -331,6 +341,10 @@ impl OnboardingDraft {
                 self.config_section = all[prev];
             }
             WizardStep::Model => {
+                // Candle uses free-form text input, no cycling
+                if self.provider.eq_ignore_ascii_case("candle") {
+                    return;
+                }
                 let is_openrouter = self.provider.eq_ignore_ascii_case("openrouter");
                 let models = if is_openrouter {
                     &self.available_models.openrouter
@@ -383,6 +397,10 @@ impl OnboardingDraft {
         config.llm.provider = super::wizard::normalize_provider(&self.provider)?;
         config.llm.ollama_model = self.ollama_model.clone();
         config.llm.openrouter_model = self.openrouter_model.clone();
+        if self.provider.eq_ignore_ascii_case("candle") {
+            config.inference.candle_enabled = true;
+            config.inference.candle_model_repo = self.candle_model_repo.clone();
+        }
         config.agent.thinking_level = super::wizard::normalize_thinking_level(&self.thinking_level)?;
         config.memory.night_sleep_start_hour = self.night_sleep_start_hour;
         config.memory.night_sleep_end_hour = self.night_sleep_end_hour;
@@ -417,6 +435,10 @@ impl OnboardingDraft {
         config.llm.provider = super::wizard::normalize_provider(&self.provider)?;
         config.llm.ollama_model = self.ollama_model.clone();
         config.llm.openrouter_model = self.openrouter_model.clone();
+        if self.provider.eq_ignore_ascii_case("candle") {
+            config.inference.candle_enabled = true;
+            config.inference.candle_model_repo = self.candle_model_repo.clone();
+        }
         if let Ok(level) = super::wizard::normalize_thinking_level(&self.thinking_level) {
             config.agent.thinking_level = level;
         }

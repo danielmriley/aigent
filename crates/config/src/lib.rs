@@ -467,6 +467,67 @@ impl Default for GitConfig {
     }
 }
 
+// ── Inference config (hybrid routing + Candle local models) ───────────────────
+
+/// Configuration for inference routing and local model execution.
+///
+/// Controls the hybrid router that decides which backend handles a request:
+/// Candle (local, fast, private) vs Ollama/OpenRouter (powerful, cloud).
+///
+/// Maps to the `[inference]` section of `default.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InferenceConfig {
+    /// Enable the Candle local inference backend.
+    /// Requires the `candle` feature flag to be compiled in.
+    pub candle_enabled: bool,
+    /// HuggingFace model repo for GGUF download
+    /// (e.g. `"Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"`).
+    pub candle_model_repo: String,
+    /// Specific GGUF filename inside the repo
+    /// (e.g. `"qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"`).
+    pub candle_model_file: String,
+    /// Path to a local GGUF file (overrides HuggingFace download when set).
+    pub candle_model_path: String,
+    /// Directory for cached model downloads.
+    pub candle_local_models_dir: String,
+    /// Maximum sequence length for Candle inference.
+    pub candle_max_seq_len: usize,
+    /// Temperature for sampling (0.0 = greedy).
+    pub candle_temperature: f64,
+    /// Top-p nucleus sampling threshold.
+    pub candle_top_p: f64,
+    /// Repeat penalty.
+    pub candle_repeat_penalty: f32,
+    /// Device selection: `"cpu"`, `"cuda"`, `"metal"`.
+    pub candle_device: String,
+    /// Task complexity threshold (0.0 – 1.0). Tasks below this complexity
+    /// route to Candle; tasks above route to the cloud provider.
+    /// `0.0` = route everything to cloud, `1.0` = route everything to Candle.
+    pub candle_complexity_threshold: f32,
+    /// Patterns matching tool names that always route to Candle for low latency.
+    pub candle_fast_tools: Vec<String>,
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self {
+            candle_enabled: false,
+            candle_model_repo: "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF".to_string(),
+            candle_model_file: "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf".to_string(),
+            candle_model_path: String::new(),
+            candle_local_models_dir: "~/.cache/aigent/models".to_string(),
+            candle_max_seq_len: 4096,
+            candle_temperature: 0.7,
+            candle_top_p: 0.9,
+            candle_repeat_penalty: 1.1,
+            candle_device: "cpu".to_string(),
+            candle_complexity_threshold: 0.3,
+            candle_fast_tools: vec!["list_dir".to_string(), "read_file".to_string()],
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -481,6 +542,7 @@ pub struct AppConfig {
     pub daemon: DaemonConfig,
     pub ui: UiConfig,
     pub git: GitConfig,
+    pub inference: InferenceConfig,
 }
 
 impl AppConfig {
@@ -530,7 +592,9 @@ impl AppConfig {
     }
 
     pub fn active_model(&self) -> &str {
-        if self.llm.provider.eq_ignore_ascii_case("openrouter") {
+        if self.llm.provider.eq_ignore_ascii_case("candle") {
+            &self.inference.candle_model_repo
+        } else if self.llm.provider.eq_ignore_ascii_case("openrouter") {
             &self.llm.openrouter_model
         } else {
             &self.llm.ollama_model
@@ -859,4 +923,35 @@ allow_system_read = false
         assert_eq!(mem.max_beliefs_in_prompt, 5);
         assert_eq!(mem.proactive_cooldown_minutes, 5);
     }
+
+    // ── InferenceConfig defaults ───────────────────────────────────────────
+
+    #[test]
+    fn inference_config_defaults() {
+        let inf = InferenceConfig::default();
+        assert!(!inf.candle_enabled);
+        assert_eq!(inf.candle_model_repo, "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF");
+        assert_eq!(inf.candle_model_file, "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
+        assert!(inf.candle_model_path.is_empty());
+        assert_eq!(inf.candle_max_seq_len, 4096);
+        assert!((inf.candle_temperature - 0.7).abs() < f64::EPSILON);
+        assert!((inf.candle_top_p - 0.9).abs() < f64::EPSILON);
+        assert!((inf.candle_repeat_penalty - 1.1_f32).abs() < f32::EPSILON);
+        assert_eq!(inf.candle_device, "cpu");
+    }
+
+    #[test]
+    fn active_model_returns_candle_repo_when_candle_provider() {
+        let mut cfg = AppConfig::default();
+        cfg.llm.provider = "candle".to_string();
+        cfg.inference.candle_model_repo = "test/model-gguf".to_string();
+        assert_eq!(cfg.active_model(), "test/model-gguf");
+    }
+
+    #[test]
+    fn active_model_returns_ollama_for_default_provider() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.active_model(), &cfg.llm.ollama_model);
+    }
+
 }

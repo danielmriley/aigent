@@ -106,6 +106,7 @@ enum CliModelProvider {
     All,
     Ollama,
     Openrouter,
+    Candle,
 }
 
 #[derive(Debug, Subcommand)]

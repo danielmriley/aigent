@@ -1818,3 +1818,63 @@ Exported types: `AgentStep`, `ExtThinkConfig`, `ExtThinkResult`, `run_external_t
 
 When `external_thinking = false` (default), **no new code paths are reached**.
 The existing native tool loop and ReAct loop are completely untouched.
+
+## Native Candle Inference (Phase 2)
+
+### New Config Section
+
+New `[inference]` section in `config/default.toml`:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `candle_enabled` | `bool` | `false` | Enable local Candle inference backend |
+| `candle_model_repo` | `String` | `"Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"` | HuggingFace model repository |
+| `candle_model_file` | `String` | `"qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"` | GGUF filename within the repo |
+| `candle_model_path` | `String` | `""` | Optional local path (skips HF download) |
+| `candle_local_models_dir` | `String` | `"~/.cache/aigent/models"` | Models cache directory |
+| `candle_max_seq_len` | `usize` | `4096` | Maximum sequence length |
+| `candle_temperature` | `f64` | `0.7` | Sampling temperature |
+| `candle_top_p` | `f64` | `0.9` | Nucleus sampling top-p |
+| `candle_repeat_penalty` | `f32` | `1.1` | Repetition penalty |
+| `candle_device` | `String` | `"cpu"` | Device: `"cpu"`, `"cuda"`, or `"metal"` |
+| `candle_complexity_threshold` | `f32` | `0.6` | Complexity threshold for routing |
+| `candle_fast_tools` | `Vec<String>` | `[]` | Tool names always routed to candle |
+
+All fields have serde defaults — existing configs work unchanged.
+
+### New Feature Flag
+
+Build with `--features candle` to enable local inference:
+
+```sh
+cargo build --features candle
+```
+
+Without the feature enabled, all Candle code is compiled out. Zero runtime overhead.
+
+### New Slash Commands
+
+| Command | Effect |
+|---|---|
+| `/model provider candle` | Switch to local Candle inference |
+| `/model list candle` | Show configured Candle model |
+| `/model set <repo>` | When provider is candle, updates `candle_model_repo` |
+
+### Provider Resolution
+
+All provider detection points now use a three-way match:
+- `"openrouter"` → `Provider::OpenRouter`
+- `"candle"` → `Provider::Candle`
+- `_` (default) → `Provider::Ollama`
+
+### New Types
+
+- `Provider::Candle` — variant added to `aigent_llm::Provider` enum
+- `InferenceConfig` — configuration struct in `aigent_config`
+- `LlmRouter::with_candle_config()` — builder method (cfg-gated)
+- `LlmRouter::candle_chat()` — ChatML prompt dispatch (cfg-gated)
+
+### Backward Compatibility
+
+When `candle_enabled = false` (default) or the `candle` feature is not compiled,
+**no new code paths are reached**. Ollama and OpenRouter work identically to before.

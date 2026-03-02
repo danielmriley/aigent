@@ -66,7 +66,7 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
                 aigent_ui::UiCommand::Submit(line) => {
                     if line == "/help" {
                         let _ = backend_tx.send(BackendEvent::Token(
-                            "Commands: /help, /status, /memory, /sleep, /dedup, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /thinking <external|model>, /exit".to_string(),
+                            "Commands: /help, /status, /memory, /sleep, /dedup, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter|candle], /model provider <ollama|openrouter|candle>, /model set <model>, /think <low|balanced|deep>, /thinking <external|model>, /exit".to_string(),
                         ));
                         let _ = backend_tx.send(BackendEvent::Done);
                         return Ok(());
@@ -335,8 +335,8 @@ pub(crate) async fn run_interactive_line_session(daemon: DaemonClient) -> Result
             println!("/sleep  -- trigger an agentic sleep cycle now");
             println!("/dedup  -- remove content-duplicate memory entries");
             println!("/model show");
-            println!("/model list [ollama|openrouter]");
-            println!("/model provider <ollama|openrouter>");
+            println!("/model list [ollama|openrouter|candle]");
+            println!("/model provider <ollama|openrouter|candle>");
             println!("/model set <model>");
             println!("/think <low|balanced|deep>");
             println!("/thinking <external|model>");
@@ -459,14 +459,17 @@ pub(crate) fn parse_model_provider_from_command(line: &str) -> CliModelProvider 
         if provider == "openrouter" {
             return CliModelProvider::Openrouter;
         }
+        if provider == "candle" {
+            return CliModelProvider::Candle;
+        }
     }
     CliModelProvider::All
 }
 
 pub(crate) async fn update_model_provider(raw: &str, daemon: &DaemonClient) -> Result<String> {
     let provider = raw.trim().to_lowercase();
-    if provider != "ollama" && provider != "openrouter" {
-        bail!("invalid provider, expected ollama or openrouter");
+    if provider != "ollama" && provider != "openrouter" && provider != "candle" {
+        bail!("invalid provider, expected ollama, openrouter, or candle");
     }
 
     let mut config = AppConfig::load_from("config/default.toml")?;
@@ -490,6 +493,8 @@ pub(crate) async fn update_model_selection(raw: &str, daemon: &DaemonClient) -> 
     let mut config = AppConfig::load_from("config/default.toml")?;
     if config.llm.provider.eq_ignore_ascii_case("openrouter") {
         config.llm.openrouter_model = model.to_string();
+    } else if config.llm.provider.eq_ignore_ascii_case("candle") {
+        config.inference.candle_model_repo = model.to_string();
     } else {
         config.llm.ollama_model = model.to_string();
     }
@@ -559,6 +564,12 @@ pub(crate) async fn collect_model_lines(provider: CliModelProvider) -> Result<Ve
         let openrouter = list_openrouter_models().await?;
         lines.push(format!("openrouter models ({})", openrouter.len()));
         lines.extend(openrouter.into_iter().map(|model| format!("- {model}")));
+    }
+
+    if matches!(provider, CliModelProvider::All | CliModelProvider::Candle) {
+        let config = aigent_config::AppConfig::load_from("config/default.toml")?;
+        lines.push("candle models (configured)".to_string());
+        lines.push(format!("- {} ({})", config.inference.candle_model_repo, config.inference.candle_model_file));
     }
 
     Ok(lines)
