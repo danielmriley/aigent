@@ -473,7 +473,7 @@ Step 4: Build and deploy (the build script compiles AND copies to the skills dir
   the .wasm binary and .tool.json manifest to extensions/skills/.\n\
 \n\
 Step 5: Reload \u{2014} make the daemon pick up the new skill immediately:\n\
-  Use your reload_tools capability or tell the user to run: aigent tools reload\n\
+  run_shell(command=\"aigent tools reload\") to make new skills available immediately\n\
   On next daemon restart, skills load automatically from extensions/skills/.\n\
 \n\
 === WHEN TO CREATE A SKILL ===\n\

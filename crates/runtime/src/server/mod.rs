@@ -258,6 +258,11 @@ pub async fn run_unified_daemon(
     );
     let tool_executor = ToolExecutor::new(policy);
 
+    // ── Bootstrap skills scaffolding scripts into the workspace ─────────
+    if config.tools.skills.enabled {
+        bootstrap_skills_infra(std::path::Path::new(&config.agent.workspace_path));
+    }
+
     // ── Load dynamic skills from the skills directory at startup ─────────
     if config.tools.skills.enabled {
         let skills_dir = std::path::Path::new(&config.agent.workspace_path)
@@ -591,6 +596,56 @@ pub async fn run_unified_daemon(
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
+
+// ── Skills infrastructure bootstrap ──────────────────────────────────────────
+
+/// Ensures the workspace has the skills scaffolding scripts and directories.
+///
+/// On a fresh install the `workspace/` dir is empty (it's gitignored).
+/// The scripts are embedded at compile time from `extensions/skills-src/` so
+/// they are always available regardless of how the binary was distributed.
+fn bootstrap_skills_infra(workspace: &std::path::Path) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let src_dir = workspace.join("extensions/skills-src");
+    let skills_dir = workspace.join("extensions/skills");
+
+    // Create both directories if needed.
+    let _ = fs::create_dir_all(&src_dir);
+    let _ = fs::create_dir_all(&skills_dir);
+
+    // Embedded scripts (compiled into the binary).
+    static NEW_SKILL_SH: &str = include_str!("../../../../extensions/skills-src/new-skill.sh");
+    static BUILD_SH: &str = include_str!("../../../../extensions/skills-src/build.sh");
+    static CARGO_TOML: &str = include_str!("../../../../extensions/skills-src/Cargo.toml");
+
+    let files: &[(&str, &str, bool)] = &[
+        ("new-skill.sh", NEW_SKILL_SH, true),
+        ("build.sh", BUILD_SH, true),
+        ("Cargo.toml", CARGO_TOML, false),
+    ];
+
+    for &(name, contents, executable) in files {
+        let path = src_dir.join(name);
+        // Write if missing or if the embedded version is newer (content differs).
+        let needs_write = match fs::read_to_string(&path) {
+            Ok(existing) => existing != contents,
+            Err(_) => true,
+        };
+        if needs_write {
+            if let Err(e) = fs::write(&path, contents) {
+                tracing::warn!(file = %path.display(), err = %e, "failed to write skill script");
+                continue;
+            }
+            if executable {
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
+            }
+            tracing::info!(file = %path.display(), "bootstrapped skill script");
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
