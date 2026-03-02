@@ -271,6 +271,7 @@ pub async fn run_unified_daemon(
                 config.tools.skills.max_skills
             };
             let mut count = 0usize;
+            let mut seen_names = std::collections::HashSet::new();
             if let Ok(entries) = std::fs::read_dir(&skills_dir) {
                 for entry in entries.flatten() {
                     if count >= max { break; }
@@ -281,6 +282,11 @@ pub async fn run_unified_daemon(
                             Some(workspace),
                         ) {
                             let name = tool.spec().name.clone();
+                            if !seen_names.insert(name.clone()) {
+                                warn!(skill = %name, path = %path.display(),
+                                    "duplicate skill name \u{2014} skipping");
+                                continue;
+                            }
                             tool_registry.register_with_source(
                                 Box::new(tool),
                                 aigent_tools::ToolSource::Dynamic,

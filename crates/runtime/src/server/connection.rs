@@ -1128,6 +1128,11 @@ fn reload_dynamic_skills(
                 ) {
                     Some(tool) => {
                         let name = tool.spec().name.clone();
+                        if loaded.contains(&name) {
+                            warn!(skill = %name, path = %path.display(),
+                                "duplicate skill name \u{2014} skipping");
+                            continue;
+                        }
                         registry.register_with_source(
                             Box::new(tool),
                             aigent_tools::ToolSource::Dynamic,

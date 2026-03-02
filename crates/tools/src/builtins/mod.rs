@@ -261,6 +261,91 @@ impl Tool for GitRollbackTool {
     }
 }
 
+
+/// Lists all deployed WASM skills by reading `.tool.json` manifests from the
+/// skills directory.  Shows name, description, and security level for each.
+pub struct ListSkillsTool {
+    pub skills_dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for ListSkillsTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "list_skills".to_string(),
+            description: "List all deployed WASM skills with their name, description, and security level.".to_string(),
+            params: vec![],
+            metadata: ToolMetadata {
+                security_level: SecurityLevel::Low,
+                read_only: true,
+                group: "skills".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, _args: &HashMap<String, String>) -> Result<ToolOutput> {
+        if !self.skills_dir.is_dir() {
+            return Ok(ToolOutput {
+                output: "No skills directory found.".to_string(),
+                success: true,
+            });
+        }
+
+        let entries = std::fs::read_dir(&self.skills_dir)?;
+        let mut skills: Vec<String> = Vec::new();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.ends_with(".tool.json"))
+            {
+                match std::fs::read_to_string(&path) {
+                    Ok(data) => {
+                        if let Ok(manifest) =
+                            serde_json::from_str::<serde_json::Value>(&data)
+                        {
+                            let name = manifest["name"]
+                                .as_str()
+                                .unwrap_or("unknown");
+                            let desc = manifest["description"]
+                                .as_str()
+                                .unwrap_or("no description");
+                            let sec = manifest["metadata"]["security_level"]
+                                .as_str()
+                                .unwrap_or("low");
+                            skills.push(format!(
+                                "\u{2022} {name} [{sec}] \u{2014} {desc}"
+                            ));
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        if skills.is_empty() {
+            return Ok(ToolOutput {
+                output: "No skills deployed yet.".to_string(),
+                success: true,
+            });
+        }
+
+        skills.sort();
+        Ok(ToolOutput {
+            output: format!(
+                "Deployed skills ({}):\n{}",
+                skills.len(),
+                skills.join("\n")
+            ),
+            success: true,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     

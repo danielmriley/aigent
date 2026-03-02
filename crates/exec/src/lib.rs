@@ -527,6 +527,7 @@ pub fn default_registry(
         RunShellTool, SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool,
         UniqTool, WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool,
         WriteFileTool, CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool,
+        ListSkillsTool,
     };
 
     let registry = ToolRegistry::default();
@@ -699,6 +700,12 @@ pub fn default_registry(
         (
             "list_cron_jobs",
             Box::new(ListCronJobsTool),
+        ),
+        (
+            "list_skills",
+            Box::new(ListSkillsTool {
+                skills_dir: workspace_root.join("extensions/skills"),
+            }),
         ),
     ];
 

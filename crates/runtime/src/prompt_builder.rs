@@ -492,7 +492,9 @@ Step 5: Reload \u{2014} make the daemon pick up the new skill immediately:\n\
   - Use descriptive tool names with underscores (my_skill_name, not my-skill-name)\n\
   - Write clear param descriptions \u{2014} these are what you see in your AVAILABLE TOOLS list\n\
   - All skill source code lives inside your workspace at extensions/skills-src/\n\
-  - Deployed skills go to extensions/skills/ (handled automatically by build.sh)";
+  - Deployed skills go to extensions/skills/ (handled automatically by build.sh)\n\
+  - After building a skill, always run perform_gait commit to version your source\n\
+  - Use the list_skills tool to see all currently deployed skills";
 
     format!(
         "\n\nAVAILABLE TOOLS (you have FULL ACCESS to all of these):\n\
