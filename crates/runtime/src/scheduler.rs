@@ -306,26 +306,29 @@ pub fn spawn_scheduler(
                     match crate::schedule_store::load_tasks(path) {
                         Ok(entries) => {
                             let mut new_tasks = Vec::new();
+                            for entry in &entries {
+                                match entry.to_scheduled_task() {
+                                    Ok(task) => {
+                                        new_tasks.push(task);
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            name = %entry.name,
+                                            ?err,
+                                            "scheduler: skipping invalid task on reload"
+                                        );
+                                    }
+                                }
+                            }
+                            // Update the prompts map if available.
                             if let Some(ref prompts) = schedule_prompts {
                                 let mut map = prompts.write().unwrap();
                                 map.clear();
-                                for entry in &entries {
-                                    match entry.to_scheduled_task() {
-                                        Ok(task) => {
-                                            map.insert(
-                                                task.name.clone(),
-                                                entry.action_prompt.clone(),
-                                            );
-                                            new_tasks.push(task);
-                                        }
-                                        Err(err) => {
-                                            warn!(
-                                                name = %entry.name,
-                                                ?err,
-                                                "scheduler: skipping invalid task on reload"
-                                            );
-                                        }
-                                    }
+                                for (task, entry) in new_tasks.iter().zip(entries.iter()) {
+                                    map.insert(
+                                        task.name.clone(),
+                                        entry.action_prompt.clone(),
+                                    );
                                 }
                             }
                             info!(
