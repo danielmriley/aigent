@@ -89,8 +89,36 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
         mem = context_block,
         msg = inputs.user_message,
     );
+
+    // ── External thinking mode ───────────────────────────────────────────
+    if config.agent.external_thinking {
+        buf.push_str(EXTERNAL_THINKING_BLOCK);
+    }
+
     buf
 }
+
+/// System prompt appendix for externalized JSON reasoning mode.
+///
+/// When active, this forces the model to output only short structured JSON
+/// steps.  The Rust agent loop becomes the thinker — parsing, executing
+/// tools, and feeding observations back.
+const EXTERNAL_THINKING_BLOCK: &str = "\n\n\
+EXTERNAL REASONING MODE ACTIVE.\n\
+You MUST respond with EXACTLY this JSON structure and nothing else \
+(no markdown, no extra text, no <thinking>):\n\n\
+{\n\
+  \"type\": \"tool_call\" | \"final_answer\",\n\
+  \"thought\": \"brief 1-sentence reasoning (max 25 words)\",\n\
+  \"tool_call\": { \"name\": \"tool_name\", \"args\": { ... } } or null,\n\
+  \"final_answer\": \"your message to the user\" or null\n\
+}\n\n\
+Rules:\n\
+- Use \"tool_call\" type when you want to call a tool (set final_answer to null).\n\
+- Use \"final_answer\" type when you are ready to reply to the user (set tool_call to null).\n\
+- Keep \"thought\" extremely short.\n\
+- The \"tool_call\" object must have \"name\" (string) and \"args\" (object).\n\
+- Never output anything outside the JSON object.\n";
 
 // ─── block builders ──────────────────────────────────────────────────────────
 

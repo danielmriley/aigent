@@ -717,6 +717,14 @@ impl App {
                 let icon = if success { "\u{2713}" } else { "\u{2717}" };
                 self.state.status = format!("{icon} sub-agent [{role}] finished");
             }
+            BackendEvent::AgentThought(thought) => {
+                self.state.messages.push(Message {
+                    role: "system".to_string(),
+                    content: format!("[Thinking]: {thought}"),
+                    rendered_md: None,
+                });
+                self.state.status = "thinking…".to_string();
+            }
             BackendEvent::ConfigUpdated { model, provider } => {
                 self.state.model_name = Some(model.clone());
                 self.state.status = format!("model={model} provider={provider}");

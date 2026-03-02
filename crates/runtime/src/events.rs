@@ -50,6 +50,10 @@ pub enum BackendEvent {
     /// streamed reply was raw tool JSON — the ugly tokens are cleared before
     /// the corrected response is streamed.
     ClearStream,
+    /// A brief thought from the external thinking loop. The TUI renders
+    /// these as dim grey "[Thinking]: …" lines so the user sees the model's
+    /// chain-of-thought without filling the chat with long monologues.
+    AgentThought(String),
 
     // ── ReAct state machine events ─────────────────────────────────
     /// Emitted when the ReAct loop transitions to a new phase.

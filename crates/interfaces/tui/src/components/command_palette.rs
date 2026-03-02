@@ -38,6 +38,8 @@ impl CommandPalette {
                     "/tools",
                     "/model show",
                     "/model list",
+                    "/thinking external",
+                    "/thinking model",
                     "/exit",
                 ],
             },
