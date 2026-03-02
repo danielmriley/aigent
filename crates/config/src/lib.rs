@@ -501,12 +501,6 @@ pub struct InferenceConfig {
     pub candle_repeat_penalty: f32,
     /// Device selection: `"cpu"`, `"cuda"`, `"metal"`.
     pub candle_device: String,
-    /// Task complexity threshold (0.0 – 1.0). Tasks below this complexity
-    /// route to Candle; tasks above route to the cloud provider.
-    /// `0.0` = route everything to cloud, `1.0` = route everything to Candle.
-    pub candle_complexity_threshold: f32,
-    /// Patterns matching tool names that always route to Candle for low latency.
-    pub candle_fast_tools: Vec<String>,
 }
 
 impl Default for InferenceConfig {
@@ -522,8 +516,6 @@ impl Default for InferenceConfig {
             candle_top_p: 0.9,
             candle_repeat_penalty: 1.1,
             candle_device: "cpu".to_string(),
-            candle_complexity_threshold: 0.3,
-            candle_fast_tools: vec!["list_dir".to_string(), "read_file".to_string()],
         }
     }
 }
@@ -563,7 +555,8 @@ impl AppConfig {
         // API keys and credentials should be set via environment variables
         // rather than stored in the config file.  Each field listed below
         // can be overridden by the corresponding env var.
-        let secret_overrides: &[(&str, fn(&mut Self, String))] = &[
+        type SecretOverride = (&'static str, fn(&mut AppConfig, String));
+        let secret_overrides: &[SecretOverride] = &[
             ("BRAVE_API_KEY",   |c, v| c.tools.brave_api_key   = v),
             ("TAVILY_API_KEY",  |c, v| c.tools.tavily_api_key  = v),
             ("SERPER_API_KEY",  |c, v| c.tools.serper_api_key  = v),

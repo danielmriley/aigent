@@ -512,7 +512,7 @@ mod tests {
         let sched = TaskSchedule::cron("0 */5 * * * *").unwrap();
         let gap = sched.min_interval_secs();
         // Should be ~300 seconds.
-        assert!(gap >= 290 && gap <= 310, "gap was {}", gap);
+        assert!((290..=310).contains(&gap), "gap was {}", gap);
     }
 
     #[tokio::test]

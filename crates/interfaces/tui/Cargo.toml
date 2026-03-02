@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+candle = []
 advanced = ["dep:tui-markdown"]
 [dependencies]
 anyhow.workspace = true

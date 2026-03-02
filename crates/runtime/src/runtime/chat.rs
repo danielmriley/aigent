@@ -35,11 +35,7 @@ impl AgentRuntime {
         tx: mpsc::Sender<String>,
         tool_specs: &[aigent_tools::ToolSpec],
     ) -> Result<String> {
-        let primary = match self.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => Provider::OpenRouter,
-                    "candle" => Provider::Candle,
-                    _ => Provider::Ollama,
-                };
+        let primary = Provider::from(self.config.llm.provider.as_str());
 
         // Persist the user turn immediately so it survives a restart.
         memory.record(MemoryTier::Episodic, user_message.to_string(), "user-input").await?;

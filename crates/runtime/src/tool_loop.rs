@@ -60,6 +60,7 @@ pub struct ToolExecution {
 ///
 /// Text tokens are streamed via `token_tx` as they arrive.
 /// Tool lifecycle events are sent via `event_tx` for UI display.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tool_loop(
     llm: &LlmRouter,
     primary: Provider,

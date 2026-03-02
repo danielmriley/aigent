@@ -261,7 +261,7 @@ pub(super) fn spawn_nightly_consolidation(
                             insights.reflective_thoughts.len(),
                             insights.user_profile_updates.len(),
                         ));
-                        match s.memory.apply_agentic_sleep_insights(insights, summary_text).await {
+                        match s.memory.apply_agentic_sleep_insights(*insights, summary_text).await {
                             Ok(ref summary) if !summary.distilled.is_empty() => {
                                 // Write the sentinel so the 22h rate-limit survives restarts.
                                 let _ = s.memory.record(
@@ -439,11 +439,7 @@ pub(super) fn spawn_proactive_task(
                 Some(crate::tool_loop::build_tools_json(&tool_specs))
             };
 
-            let primary = match rt_clone.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => aigent_llm::Provider::OpenRouter,
-                    "candle" => aigent_llm::Provider::Candle,
-                    _ => aigent_llm::Provider::Ollama,
-                };
+            let primary = aigent_llm::Provider::from(rt_clone.config.llm.provider.as_str());
 
             // Create a sink channel — proactive tokens are NOT shown to the user.
             let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);
@@ -580,8 +576,8 @@ fn profile_tz(memory: &aigent_memory::MemoryManager, default_tz: Tz) -> Tz {
         if low.starts_with("timezone:") || src_low.contains("timezone") {
             let val = e
                 .content
-                .splitn(2, ':')
-                .nth(1)
+                .split_once(':')
+                .map(|x| x.1)
                 .unwrap_or(&e.content)
                 .trim();
             if let Ok(tz) = val.parse::<Tz>() {
@@ -646,9 +642,9 @@ fn profile_quiet_window(
 /// Extract a trailing integer from a "key: value" or "key :: value" string.
 fn extract_trailing_u32(s: &str) -> Option<u32> {
     let val_str = s
-        .splitn(2, "::")
-        .nth(1)
-        .or_else(|| s.splitn(2, ':').nth(1))?
+        .split_once("::")
+        .map(|x| x.1)
+        .or_else(|| s.split_once(':').map(|x| x.1))?
         .trim();
     val_str.parse().ok()
 }

@@ -125,7 +125,7 @@ pub(super) fn run_onboarding_tui(
                 }
                 KeyCode::Char('t') if !step.is_text_step() => {
                     let tested = match step {
-                        WizardStep::Model | WizardStep::OpenRouterKey => {
+                        WizardStep::Model | WizardStep::CandleModelFile | WizardStep::OpenRouterKey => {
                             Some(wizard::test_llm_connection_for_draft(&draft).map(|ok| {
                                 format!("Connected ✓ {ok}")
                             }))
@@ -296,6 +296,8 @@ fn draw_onboarding(
                     WizardStep::DataDirectory => "Data Directory",
                     WizardStep::Provider => "Provider",
                     WizardStep::Model => "Model",
+                    WizardStep::CandleModelFile => "GGUF File",
+                    WizardStep::CandleDevice => "Device",
                     WizardStep::OpenRouterKey => "OpenRouter Key",
                     WizardStep::Thinking => "Thinking",
                     WizardStep::NightSleepStart => "Sleep Start",
@@ -568,8 +570,16 @@ fn step_content<'a>(
         ),
         WizardStep::Provider => (
             "LLM Provider",
-            "Choose the LLM provider (Up/Down/Tab to cycle):\n\nOllama = local-first\nOpenRouter = hosted API\nCandle = native local inference (GGUF)".to_string(),
-            format_choice_list(&["ollama", "openrouter", "candle"], &draft.provider),
+            if cfg!(feature = "candle") {
+                "Choose the LLM provider (Up/Down/Tab to cycle):\n\nOllama = local-first\nOpenRouter = hosted API\nCandle = native local inference (GGUF)".to_string()
+            } else {
+                "Choose the LLM provider (Up/Down/Tab to cycle):\n\nOllama = local-first\nOpenRouter = hosted API".to_string()
+            },
+            if cfg!(feature = "candle") {
+                format_choice_list(&["ollama", "openrouter", "candle"], &draft.provider)
+            } else {
+                format_choice_list(&["ollama", "openrouter"], &draft.provider)
+            },
         ),
         WizardStep::Model => {
             let is_candle = draft.provider.eq_ignore_ascii_case("candle");
@@ -577,7 +587,7 @@ fn step_content<'a>(
                 // Candle uses a HuggingFace repo string — free-form text input
                 (
                     "Model Selection",
-                    format!("Enter the HuggingFace model repo for Candle (e.g. Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF):"),
+                    "Enter the HuggingFace model repo for Candle (e.g. Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF):".to_string(),
                     ratatui::text::Text::from(format!("\n{}\n", input)),
                 )
             } else {
@@ -600,6 +610,16 @@ fn step_content<'a>(
                 )
             }
         }
+        WizardStep::CandleModelFile => (
+            "GGUF Model File",
+            "Enter the GGUF file name (e.g. qwen2.5-coder-1.5b-instruct-q4_k_m.gguf):".to_string(),
+            ratatui::text::Text::from(format!("\n{}\n", input)),
+        ),
+        WizardStep::CandleDevice => (
+            "Compute Device",
+            "Choose compute device (Up/Down/Tab to cycle):".to_string(),
+            format_choice_list(&["cpu", "cuda", "metal"], &draft.candle_device),
+        ),
         WizardStep::OpenRouterKey => (
             "OpenRouter API Key",
             "Optional OpenRouter API key (saved to .env if set). Leave blank to keep existing.".to_string(),

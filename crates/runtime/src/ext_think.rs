@@ -120,6 +120,7 @@ const MAX_RETRIES_PER_STEP: usize = 2;
 ///
 /// The `thought` field from each step is emitted via `BackendEvent::AgentThought`
 /// so the TUI can display it in real-time.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_external_thinking_loop(
     config: &ExtThinkConfig,
     llm: &LlmRouter,
@@ -314,12 +315,12 @@ async fn call_llm_with_timeout(
         buf
     });
 
-    let mut msgs = messages.to_vec();
+    let msgs = messages.to_vec();
     let fut = llm.chat_messages_stream(
         primary,
         ollama_model,
         openrouter_model,
-        &mut msgs,
+        &msgs,
         None, // No tools schema — we use our JSON schema instead.
         tx,
     );

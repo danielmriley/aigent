@@ -95,7 +95,7 @@ impl ChatPanel {
         let cache_hit = self
             .vis_cache
             .as_ref()
-            .map_or(false, |c| {
+            .is_some_and(|c| {
                 c.matches(
                     state.messages.len(),
                     last_content_len,

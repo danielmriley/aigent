@@ -580,7 +580,7 @@ pub async fn run_unified_daemon(
             match gen_result {
                 Ok(crate::SleepGenerationResult::Insights(insights)) => {
                     let summary_text = Some("Shutdown agentic sleep cycle".to_string());
-                    let _ = s.memory.apply_agentic_sleep_insights(insights, summary_text).await;
+                    let _ = s.memory.apply_agentic_sleep_insights(*insights, summary_text).await;
                 }
                 Ok(crate::SleepGenerationResult::PassiveFallback(_)) => {
                     let _ = s.memory.run_sleep_cycle().await;

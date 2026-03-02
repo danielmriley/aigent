@@ -363,6 +363,10 @@ fn prompt_llm_settings(config: &mut AppConfig) -> Result<()> {
         config.inference.candle_enabled = true;
         let model = prompt("Candle HF model repo", &config.inference.candle_model_repo)?;
         config.inference.candle_model_repo = model;
+        let gguf_file = prompt("GGUF model file name", &config.inference.candle_model_file)?;
+        config.inference.candle_model_file = gguf_file;
+        let device = prompt("Compute device (cpu/cuda/metal)", &config.inference.candle_device)?;
+        config.inference.candle_device = device;
     } else {
         config.llm.provider = "ollama".to_string();
         let model = prompt("Ollama model", &config.llm.ollama_model)?;

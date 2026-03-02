@@ -68,6 +68,7 @@ pub struct ReactLoopResult {
 /// This is the primary entry point for agent turns when `use_native_calling`
 /// is enabled.  It wraps the structured tool loop with explicit ReAct phase
 /// tracking and optional self-critique.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_react_loop(
     config: &ReactConfig,
     llm: &LlmRouter,
@@ -316,6 +317,7 @@ pub struct SubAgentResult {
 /// - Supervisor spawns Researcher + Executor sub-agents
 /// - Each sub-agent runs its own ReAct loop
 /// - Results are collected and merged by the supervisor
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_sub_agent(
     role: SwarmRole,
     task_description: String,
@@ -338,7 +340,7 @@ pub fn spawn_sub_agent(
     }
 
     // Add the task as a user message for the sub-agent.
-    messages.push(ChatMessage::user(&format!(
+    messages.push(ChatMessage::user(format!(
         "[Sub-agent role: {}] Task: {}",
         role, task_description
     )));

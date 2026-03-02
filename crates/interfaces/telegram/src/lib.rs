@@ -412,7 +412,7 @@ async fn collect_model_lines(provider: ModelProviderFilter) -> Result<Vec<String
         lines.extend(openrouter.into_iter().map(|model| format!("- {model}")));
     }
 
-    if matches!(provider, ModelProviderFilter::All | ModelProviderFilter::Candle) {
+    if cfg!(feature = "candle") && matches!(provider, ModelProviderFilter::All | ModelProviderFilter::Candle) {
         let config = aigent_config::AppConfig::load_from("config/default.toml")?;
         lines.push("candle models (configured)".to_string());
         lines.push(format!("- {} ({})", config.inference.candle_model_repo, config.inference.candle_model_file));
