@@ -74,7 +74,7 @@ pub(crate) fn print_daemon_help() {
 }
 
 pub(crate) fn daemon_start(force: bool) -> Result<()> {
-    let config = AppConfig::load_from("config/default.toml")?;
+    let config = AppConfig::load_from(AppConfig::config_path())?;
     if config.needs_onboarding() {
         bail!("onboarding not complete; run `aigent onboard` first");
     }
@@ -158,7 +158,7 @@ pub(crate) fn daemon_start(force: bool) -> Result<()> {
 }
 
 pub(crate) async fn daemon_stop() -> Result<()> {
-    let config = AppConfig::load_from("config/default.toml")?;
+    let config = AppConfig::load_from(AppConfig::config_path())?;
     let paths = daemon_paths();
     let client = DaemonClient::new(&config.daemon.socket_path);
 
@@ -198,7 +198,7 @@ pub(crate) fn wait_for_pid_exit(pid: u32, timeout: Duration) {
 }
 
 pub(crate) fn daemon_status() -> Result<()> {
-    let config = AppConfig::load_from("config/default.toml")?;
+    let config = AppConfig::load_from(AppConfig::config_path())?;
     let paths = daemon_paths();
     let socket_path = PathBuf::from(&config.daemon.socket_path);
     let mode = fs::read_to_string(&paths.mode_file)

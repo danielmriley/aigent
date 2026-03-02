@@ -480,10 +480,10 @@ pub(crate) async fn update_model_provider(raw: &str, daemon: &DaemonClient) -> R
         bail!("invalid provider, expected ollama, openrouter, or candle");
     }
 
-    let mut config = AppConfig::load_from("config/default.toml")?;
+    let mut config = AppConfig::load_from(AppConfig::config_path())?;
     config.llm.provider = provider.clone();
     config.inference.candle_enabled = provider == "candle";
-    config.save_to("config/default.toml")?;
+    config.save_to(AppConfig::config_path())?;
     daemon.reload_config().await?;
     let status = daemon.get_status().await?;
 
@@ -499,7 +499,7 @@ pub(crate) async fn update_model_selection(raw: &str, daemon: &DaemonClient) -> 
         bail!("model cannot be empty");
     }
 
-    let mut config = AppConfig::load_from("config/default.toml")?;
+    let mut config = AppConfig::load_from(AppConfig::config_path())?;
     if config.llm.provider.eq_ignore_ascii_case("openrouter") {
         config.llm.openrouter_model = model.to_string();
     } else if config.llm.provider.eq_ignore_ascii_case("candle") {
@@ -514,7 +514,7 @@ pub(crate) async fn update_model_selection(raw: &str, daemon: &DaemonClient) -> 
     } else {
         config.llm.ollama_model = model.to_string();
     }
-    config.save_to("config/default.toml")?;
+    config.save_to(AppConfig::config_path())?;
     daemon.reload_config().await?;
     let status = daemon.get_status().await?;
 
@@ -532,9 +532,9 @@ pub(crate) async fn update_thinking_level(raw: &str, daemon: &DaemonClient) -> R
         _ => bail!("invalid thinking level, expected low, balanced, or deep"),
     };
 
-    let mut config = AppConfig::load_from("config/default.toml")?;
+    let mut config = AppConfig::load_from(AppConfig::config_path())?;
     config.agent.thinking_level = level.to_string();
-    config.save_to("config/default.toml")?;
+    config.save_to(AppConfig::config_path())?;
     daemon.reload_config().await?;
     let status = daemon.get_status().await?;
 
@@ -551,9 +551,9 @@ pub(crate) async fn update_thinking_mode(raw: &str, daemon: &DaemonClient) -> Re
         _ => bail!("invalid thinking mode, expected 'external' or 'model'"),
     };
 
-    let mut config = AppConfig::load_from("config/default.toml")?;
+    let mut config = AppConfig::load_from(AppConfig::config_path())?;
     config.agent.external_thinking = enable;
-    config.save_to("config/default.toml")?;
+    config.save_to(AppConfig::config_path())?;
     daemon.reload_config().await?;
     let status = daemon.get_status().await?;
 
@@ -583,7 +583,7 @@ pub(crate) async fn collect_model_lines(provider: CliModelProvider) -> Result<Ve
     }
 
     if matches!(provider, CliModelProvider::All | CliModelProvider::Candle) {
-        let config = aigent_config::AppConfig::load_from("config/default.toml")?;
+        let config = aigent_config::AppConfig::load_from(AppConfig::config_path())?;
         lines.push("candle models (configured)".to_string());
         lines.push(format!("- {} ({})", config.inference.candle_model_repo, config.inference.candle_model_file));
     }

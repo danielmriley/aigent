@@ -747,7 +747,7 @@ pub(super) async fn handle_connection(
             // secrets saved via onboarding) takes effect immediately without
             // requiring a daemon restart.
             let _ = dotenvy::from_path_override(std::path::Path::new(".env"));
-            let updated = AppConfig::load_from("config/default.toml")?;
+            let updated = AppConfig::load_from(AppConfig::config_path())?;
 
             // Hot-reload dynamic skills when the skills subsystem is enabled
             // and auto_reload is on.

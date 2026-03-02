@@ -183,8 +183,8 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let mut config = AppConfig::load_from("config/default.toml")?;
-    let config_exists = Path::new("config/default.toml").exists();
+    let mut config = AppConfig::load_from(AppConfig::config_path())?;
+    let config_exists = Path::new(&AppConfig::config_path()).exists();
     let memory_log_path = Path::new(".aigent").join("memory").join("events.jsonl");
 
     if std::env::var("AIGENT_DAEMON_PROCESS").ok().as_deref() == Some("1") {
@@ -204,14 +204,14 @@ async fn main() -> Result<()> {
         Commands::Onboard => {
             let models = fetch_available_models().await;
             run_onboarding(&mut config, models)?;
-            config.save_to("config/default.toml")?;
+            config.save_to(AppConfig::config_path())?;
             seed_identity_from_config(&config, &memory_log_path).await?;
             println!("{}", aigent_ui::tui::banner());
         }
         Commands::Configuration => {
             let models = fetch_available_models().await;
             run_configuration(&mut config, models)?;
-            config.save_to("config/default.toml")?;
+            config.save_to(AppConfig::config_path())?;
             seed_identity_from_config(&config, &memory_log_path).await?;
             println!("configuration updated");
         }
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
             if !config_exists || config.needs_onboarding() {
                 let models = fetch_available_models().await;
                 run_onboarding(&mut config, models)?;
-                config.save_to("config/default.toml")?;
+                config.save_to(AppConfig::config_path())?;
                 seed_identity_from_config(&config, &memory_log_path).await?;
             }
 
@@ -229,7 +229,7 @@ async fn main() -> Result<()> {
             if !config_exists || config.needs_onboarding() {
                 let models = fetch_available_models().await;
                 run_onboarding(&mut config, models)?;
-                config.save_to("config/default.toml")?;
+                config.save_to(AppConfig::config_path())?;
                 seed_identity_from_config(&config, &memory_log_path).await?;
             }
 
@@ -499,7 +499,7 @@ async fn run_reset_command(hard: bool, yes: bool) -> Result<()> {
         }
     }
 
-    let config = AppConfig::load_from("config/default.toml").ok();
+    let config = AppConfig::load_from(AppConfig::config_path()).ok();
     if let Some(config) = &config {
         let client = DaemonClient::new(&config.daemon.socket_path);
         let _ = client.graceful_shutdown().await;
@@ -519,7 +519,7 @@ async fn run_reset_command(hard: bool, yes: bool) -> Result<()> {
 
     if let Some(mut config) = config {
         config.onboarding.completed = false;
-        config.save_to("config/default.toml")?;
+        config.save_to(AppConfig::config_path())?;
     }
 
     println!("hard reset complete");

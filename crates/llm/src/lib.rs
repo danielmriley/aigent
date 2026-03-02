@@ -381,50 +381,134 @@ impl LlmRouter {
     }
 
     /// Get or lazily initialize the Candle backend.
+    ///
+    /// Supports hot-reload: if the configured model repo or GGUF file has
+    /// changed since the last load, the old model is dropped (freeing
+    /// RAM/VRAM) and the new model is loaded from scratch.
     #[cfg(feature = "candle")]
-    async fn get_candle(&self) -> Result<tokio::sync::MutexGuard<'_, Option<candle_backend::CandleBackend>>> {
+    async fn ensure_candle_loaded(&self) -> Result<()> {
         let mut guard = self.candle.lock().await;
+        let config = self.candle_config.clone().unwrap_or_default();
+
+        // Hot-reload: detect model config change and drop stale backend.
+        if let Some(ref backend) = *guard {
+            if backend.model_id() != config.model_id
+                || backend.gguf_file() != config.gguf_file
+            {
+                tracing::info!(
+                    old_model = %backend.model_id(),
+                    new_model = %config.model_id,
+                    "candle model config changed, reloading"
+                );
+                *guard = None; // Drop old backend, free RAM/VRAM.
+            }
+        }
+
         if guard.is_none() {
-            let config = self.candle_config.clone().unwrap_or_default();
             let mut backend = candle_backend::CandleBackend::new(config)?;
             backend.load().await?;
             *guard = Some(backend);
         }
-        Ok(guard)
+        Ok(())
     }
 
-    /// Format chat messages into a ChatML prompt and run through Candle.
+    /// Take the Candle backend out for exclusive use.
     ///
-    /// Candle generates raw text — it does not parse tool calls. If tools
-    /// were requested the finish_reason will be set to "stop"; the runtime
-    /// layer is responsible for extracting any structured JSON the model
-    /// chose to emit inside its text response.
+    /// The caller MUST return it via `return_candle()` when done.
+    /// This pattern avoids holding the async mutex during the long
+    /// (10-30s) generation, unblocking other async tasks.
+    #[cfg(feature = "candle")]
+    async fn take_candle(&self) -> Result<candle_backend::CandleBackend> {
+        self.ensure_candle_loaded().await?;
+        let mut guard = self.candle.lock().await;
+        guard.take().ok_or_else(|| anyhow::anyhow!("candle backend currently in use by another task"))
+    }
+
+    /// Return the Candle backend after use.
+    #[cfg(feature = "candle")]
+    async fn return_candle(&self, backend: candle_backend::CandleBackend) {
+        let mut guard = self.candle.lock().await;
+        *guard = Some(backend);
+    }
+
+    /// Format chat messages using the model's native chat template and run
+    /// through Candle.
+    ///
+    /// The template is auto-detected from the model's tokenizer_config.json
+    /// during loading (ChatML, Llama 3, Mistral, Gemma, Phi-3).
     #[cfg(feature = "candle")]
     async fn candle_chat(
         &self,
         messages: &[ChatMessage],
         _tools: Option<&serde_json::Value>,
     ) -> Result<ChatResponse> {
-        // Build a ChatML-style prompt from messages.
-        let mut prompt = String::new();
-        for msg in messages {
-            let role_str = match msg.role {
-                ChatRole::System => "system",
-                ChatRole::User => "user",
-                ChatRole::Assistant => "assistant",
-                ChatRole::Tool => "tool",
-            };
-            let content = msg.content.as_deref().unwrap_or("");
-            prompt.push_str(&format!("<|im_start|>{role_str}\n{content}<|im_end|>\n"));
-        }
-        prompt.push_str("<|im_start|>assistant\n");
+        let mut backend = self.take_candle().await?;
 
-        let mut guard = self.get_candle().await?;
-        let backend = guard
-            .as_mut()
-            .expect("candle backend loaded by get_candle");
+        let template_messages: Vec<(String, String)> = messages
+            .iter()
+            .map(|msg| {
+                let role = match msg.role {
+                    ChatRole::System => "system",
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                    ChatRole::Tool => "tool",
+                };
+                let content = msg.content.as_deref().unwrap_or("");
+                (role.to_string(), content.to_string())
+            })
+            .collect();
+
+        let prompt = candle_backend::apply_chat_template(
+            backend.chat_template(),
+            &template_messages,
+        );
+
         let max_tokens = backend.config.max_seq_len;
-        let text = backend.generate(&prompt, max_tokens).await?;
+        let result = backend.generate(&prompt, max_tokens).await;
+        self.return_candle(backend).await;
+        let text = result?;
+
+        Ok(ChatResponse {
+            provider: Provider::Candle,
+            content: text,
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+        })
+    }
+
+    /// Streaming variant of candle_chat — sends tokens as they are generated.
+    #[cfg(feature = "candle")]
+    async fn candle_chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        _tools: Option<&serde_json::Value>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<ChatResponse> {
+        let mut backend = self.take_candle().await?;
+
+        let template_messages: Vec<(String, String)> = messages
+            .iter()
+            .map(|msg| {
+                let role = match msg.role {
+                    ChatRole::System => "system",
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                    ChatRole::Tool => "tool",
+                };
+                let content = msg.content.as_deref().unwrap_or("");
+                (role.to_string(), content.to_string())
+            })
+            .collect();
+
+        let prompt = candle_backend::apply_chat_template(
+            backend.chat_template(),
+            &template_messages,
+        );
+
+        let max_tokens = backend.config.max_seq_len;
+        let result = backend.generate_stream(&prompt, max_tokens, tx).await;
+        self.return_candle(backend).await;
+        let text = result?;
 
         Ok(ChatResponse {
             provider: Provider::Candle,
@@ -447,9 +531,11 @@ impl LlmRouter {
             #[cfg(feature = "candle")]
             Provider::Candle => {
                 let candle_result: Result<String> = async {
-                    let mut guard = self.get_candle().await?;
-                    let backend = guard.as_mut().expect("candle loaded");
-                    backend.generate(prompt, backend.config.max_seq_len).await
+                    let mut backend = self.take_candle().await?;
+                    let max_tokens = backend.config.max_seq_len;
+                    let result = backend.generate(prompt, max_tokens).await;
+                    self.return_candle(backend).await;
+                    result
                 }.await;
                 match candle_result {
                     Ok(text) => Ok((Provider::Candle, text)),
@@ -495,15 +581,14 @@ impl LlmRouter {
             #[cfg(feature = "candle")]
             Provider::Candle => {
                 let candle_result: Result<String> = async {
-                    let mut guard = self.get_candle().await?;
-                    let backend = guard.as_mut().expect("candle loaded");
-                    backend.generate(prompt, backend.config.max_seq_len).await
+                    let mut backend = self.take_candle().await?;
+                    let max_tokens = backend.config.max_seq_len;
+                    let result = backend.generate_stream(prompt, max_tokens, tx.clone()).await;
+                    self.return_candle(backend).await;
+                    result
                 }.await;
                 match candle_result {
-                    Ok(text) => {
-                        let _ = tx.send(text.clone()).await;
-                        Ok((Provider::Candle, text))
-                    }
+                    Ok(text) => Ok((Provider::Candle, text)),
                     Err(err) => {
                         tracing::warn!(?err, "candle inference failed, falling back to ollama (stream)");
                         Ok((
@@ -589,10 +674,7 @@ impl LlmRouter {
         match primary {
             #[cfg(feature = "candle")]
             Provider::Candle => {
-                // Candle doesn't support true streaming — generate fully then send.
-                let resp = self.candle_chat(messages, tools).await?;
-                let _ = tx.send(resp.content.clone()).await;
-                Ok(resp)
+                self.candle_chat_stream(messages, tools, tx).await
             }
             #[cfg(not(feature = "candle"))]
             Provider::Candle => anyhow::bail!("candle feature not compiled; use `--features candle`"),
