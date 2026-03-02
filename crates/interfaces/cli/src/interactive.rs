@@ -66,7 +66,7 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
                 aigent_ui::UiCommand::Submit(line) => {
                     if line == "/help" {
                         let _ = backend_tx.send(BackendEvent::Token(
-                            "Commands: /help, /status, /memory, /sleep, /dedup, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /exit".to_string(),
+                            "Commands: /help, /status, /memory, /sleep, /dedup, /tools, /tools run <name> {args}, /model show, /model list [ollama|openrouter], /model provider <ollama|openrouter>, /model set <model>, /think <low|balanced|deep>, /thinking <external|model>, /exit".to_string(),
                         ));
                         let _ = backend_tx.send(BackendEvent::Done);
                         return Ok(());
@@ -222,6 +222,13 @@ pub(crate) async fn run_interactive_session(config: &AppConfig, daemon: DaemonCl
 
                     if let Some(level) = line.strip_prefix("/think ") {
                         let msg = update_thinking_level(level.trim(), &daemon).await?;
+                        let _ = backend_tx.send(BackendEvent::Token(msg));
+                        let _ = backend_tx.send(BackendEvent::Done);
+                        return Ok(());
+                    }
+
+                    if let Some(mode) = line.strip_prefix("/thinking ") {
+                        let msg = update_thinking_mode(mode.trim(), &daemon).await?;
                         let _ = backend_tx.send(BackendEvent::Token(msg));
                         let _ = backend_tx.send(BackendEvent::Done);
                         return Ok(());
@@ -415,6 +422,11 @@ pub(crate) async fn run_interactive_line_session(daemon: DaemonClient) -> Result
             continue;
         }
 
+        if let Some(mode) = line.strip_prefix("/thinking ") {
+            println!("{}", update_thinking_mode(mode.trim(), &daemon).await?);
+            continue;
+        }
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         daemon.stream_submit(line.to_string(), "tui", tx).await?;
         while let Ok(event) = rx.try_recv() {
@@ -506,6 +518,26 @@ pub(crate) async fn update_thinking_level(raw: &str, daemon: &DaemonClient) -> R
     Ok(format!(
         "thinking level updated to {} • active provider: {} • active model: {}",
         status.thinking_level, status.provider, status.model
+    ))
+}
+
+pub(crate) async fn update_thinking_mode(raw: &str, daemon: &DaemonClient) -> Result<String> {
+    let enable = match raw.trim().to_lowercase().as_str() {
+        "external" | "ext" | "on" => true,
+        "model" | "internal" | "off" => false,
+        _ => bail!("invalid thinking mode, expected 'external' or 'model'"),
+    };
+
+    let mut config = AppConfig::load_from("config/default.toml")?;
+    config.agent.external_thinking = enable;
+    config.save_to("config/default.toml")?;
+    daemon.reload_config().await?;
+    let status = daemon.get_status().await?;
+
+    let mode = if enable { "external" } else { "model" };
+    Ok(format!(
+        "thinking mode updated to {mode} • provider: {} • model: {}",
+        status.provider, status.model
     ))
 }
 

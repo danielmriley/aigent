@@ -11,6 +11,7 @@ pub mod scheduler;
 mod runtime;
 mod server;
 pub mod tool_loop;
+pub mod ext_think;
 
 pub use agent_loop::{
     AgentLoop, EvalScore, LlmToolCall, ProactiveOutput, ReactPhase, ReactSnapshot,
@@ -24,3 +25,4 @@ pub use scheduler::{HeartbeatFn, ScheduledTask, SchedulerState, TaskSchedule, sp
 pub use runtime::{AgentRuntime, ConversationTurn, SleepGenerationResult};
 pub use server::run_unified_daemon;
 pub use tool_loop::{ToolLoopResult, ToolExecution, run_tool_loop, build_tools_json};
+pub use ext_think::{AgentStep, ExtThinkConfig, ExtThinkResult, run_external_thinking_loop};

@@ -7,6 +7,17 @@ user_name = ""
 workspace_path = "./workspace"
 thinking_level = "balanced"
 
+# Externalized reasoning mode.  When true, the agent outputs short JSON
+# steps instead of long internal monologues.  Best for large local models
+# (e.g. Qwen 3.5 35B MoE via Ollama) that tend to timeout during long
+# unstructured reasoning.
+# Toggle at runtime: /thinking external  or  /thinking model
+external_thinking = false
+# Per-step timeout in seconds (only in external thinking mode).
+step_timeout_seconds = 12
+# Maximum reasoning steps per turn.
+max_steps_per_turn = 10
+
 [llm]
 provider = "ollama"
 ollama_model = "llama3.1:8b"

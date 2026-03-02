@@ -30,6 +30,21 @@ pub struct AgentConfig {
     pub user_name: String,
     pub workspace_path: String,
     pub thinking_level: String,
+    /// When `true`, the agent uses externalized JSON reasoning instead of
+    /// letting the model think internally.  This forces short structured
+    /// outputs, preventing long internal monologues and timeouts with large
+    /// local models.  Default: `false`.
+    #[serde(default)]
+    pub external_thinking: bool,
+    /// Per-step timeout in seconds for the external thinking loop.
+    /// If the LLM takes longer than this, the step is retried.
+    /// Only applies when `external_thinking = true`.
+    #[serde(default = "default_step_timeout_seconds")]
+    pub step_timeout_seconds: u64,
+    /// Maximum number of JSON reasoning steps per turn.
+    /// Prevents infinite loops in external thinking mode.
+    #[serde(default = "default_max_steps_per_turn")]
+    pub max_steps_per_turn: usize,
 }
 
 impl Default for AgentConfig {
@@ -39,8 +54,19 @@ impl Default for AgentConfig {
             user_name: String::new(),
             workspace_path: ".".to_string(),
             thinking_level: "balanced".to_string(),
+            external_thinking: false,
+            step_timeout_seconds: default_step_timeout_seconds(),
+            max_steps_per_turn: default_max_steps_per_turn(),
         }
     }
+}
+
+fn default_step_timeout_seconds() -> u64 {
+    12
+}
+
+fn default_max_steps_per_turn() -> usize {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -258,7 +258,8 @@ async fn handle_telegram_input(
             BackendEvent::ReactPhaseChanged { .. }
             | BackendEvent::SubAgentSpawned { .. }
             | BackendEvent::SubAgentCompleted { .. }
-            | BackendEvent::ConfigUpdated { .. } => {}
+            | BackendEvent::ConfigUpdated { .. }
+            | BackendEvent::AgentThought(_) => {}
         }
     }
     // Propagate IPC-level errors from stream_submit.

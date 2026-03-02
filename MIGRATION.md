@@ -1781,3 +1781,40 @@ Three complementary improvements:
 - [x] `cargo check --features marketplace` — 0 errors, 0 warnings
 - [x] `cargo test --workspace` — 338 tests pass, 0 failures
 - [x] `cargo test --features marketplace` — 99 tests pass (tools crate)
+
+
+## External Thinking (Phase 1)
+
+### New Config Fields
+
+Three new optional fields under `[agent]` in `config/default.toml`:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `external_thinking` | `bool` | `false` | Enable JSON-based external reasoning loop |
+| `step_timeout_seconds` | `u64` | `12` | Per-step LLM timeout (external mode) |
+| `max_steps_per_turn` | `usize` | `10` | Maximum reasoning steps per turn |
+
+All fields have serde defaults — existing configs work unchanged.
+
+### New Slash Commands
+
+| Command | Effect |
+|---|---|
+| `/thinking external` | Enable external JSON reasoning |
+| `/thinking model` | Revert to standard model-driven thinking |
+
+### New Backend Event
+
+`BackendEvent::AgentThought(String)` — emitted during external reasoning steps.
+TUI renders as `[Thinking]: …` system lines. Telegram ignores it.
+
+### New Module
+
+`crates/runtime/src/ext_think.rs` — Self-contained external JSON reasoning loop.
+Exported types: `AgentStep`, `ExtThinkConfig`, `ExtThinkResult`, `run_external_thinking_loop`.
+
+### Backward Compatibility
+
+When `external_thinking = false` (default), **no new code paths are reached**.
+The existing native tool loop and ReAct loop are completely untouched.

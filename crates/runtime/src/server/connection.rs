@@ -168,8 +168,48 @@ pub(super) async fn handle_connection(
 
                 // Run the structured tool loop — registry/executor are Arc-cloned
                 // so we do NOT hold the DaemonState lock during LLM calls.
-                let loop_result = {
-                    crate::tool_loop::run_tool_loop(
+                //
+                // When external_thinking is enabled, we use the JSON reasoning
+                // loop instead of the standard tool loop.
+                let use_ext_thinking = rt_clone.config.agent.external_thinking;
+
+                let reply_result: Result<String, anyhow::Error> = if use_ext_thinking {
+                    // ── External JSON reasoning loop ────────────────────
+                    let ext_cfg = crate::ext_think::ExtThinkConfig {
+                        step_timeout: std::time::Duration::from_secs(
+                            rt_clone.config.agent.step_timeout_seconds,
+                        ),
+                        max_steps: rt_clone.config.agent.max_steps_per_turn,
+                    };
+                    let ext_result = crate::ext_think::run_external_thinking_loop(
+                        &ext_cfg,
+                        &rt_clone.llm,
+                        primary,
+                        &rt_clone.config.llm.ollama_model,
+                        &rt_clone.config.llm.openrouter_model,
+                        &mut messages,
+                        &registry,
+                        &executor,
+                        chunk_tx,
+                        Some(&event_tx),
+                    ).await;
+
+                    match ext_result {
+                        Ok(ref result) => {
+                            if !result.content.is_empty() {
+                                let _: Result<_, _> = memory.record(
+                                    aigent_memory::MemoryTier::Episodic,
+                                    crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
+                                    format!("assistant-reply:model={}", rt_clone.config.active_model()),
+                                ).await;
+                            }
+                            Ok(result.content.clone())
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    // ── Standard native tool loop ───────────────────────
+                    let loop_result = crate::tool_loop::run_tool_loop(
                         &rt_clone.llm,
                         primary,
                         &rt_clone.config.llm.ollama_model,
@@ -180,35 +220,35 @@ pub(super) async fn handle_connection(
                         &executor,
                         chunk_tx,
                         Some(&event_tx),
-                    ).await
-                };
+                    ).await;
 
-                let reply_result: Result<String, anyhow::Error> = match loop_result {
-                    Ok(ref result) => {
-                        // Record tool results to procedural memory
-                        for exec in &result.tool_executions {
-                            let outcome = format!(
-                                "Tool '{}' executed. Output (first 400 chars): {}",
-                                exec.tool_name,
-                                safe_truncate(&exec.output, 400),
-                            );
-                            let _: Result<_, _> = memory.record(
-                                MemoryTier::Procedural,
-                                outcome,
-                                format!("tool-use:{}", exec.tool_name),
-                            ).await;
+                    match loop_result {
+                        Ok(ref result) => {
+                            // Record tool results to procedural memory
+                            for exec in &result.tool_executions {
+                                let outcome = format!(
+                                    "Tool '{}' executed. Output (first 400 chars): {}",
+                                    exec.tool_name,
+                                    safe_truncate(&exec.output, 400),
+                                );
+                                let _: Result<_, _> = memory.record(
+                                    MemoryTier::Procedural,
+                                    outcome,
+                                    format!("tool-use:{}", exec.tool_name),
+                                ).await;
+                            }
+                            // Record assistant reply
+                            if !result.content.is_empty() {
+                                let _: Result<_, _> = memory.record(
+                                    aigent_memory::MemoryTier::Episodic,
+                                    crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
+                                    format!("assistant-reply:model={}", rt_clone.config.active_model()),
+                                ).await;
+                            }
+                            Ok(result.content.clone())
                         }
-                        // Record assistant reply
-                        if !result.content.is_empty() {
-                            let _: Result<_, _> = memory.record(
-                                aigent_memory::MemoryTier::Episodic,
-                                crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
-                                format!("assistant-reply:model={}", rt_clone.config.active_model()),
-                            ).await;
-                        }
-                        Ok(result.content.clone())
+                        Err(e) => Err(e),
                     }
-                    Err(e) => Err(e),
                 };
 
                 // Reflect on the exchange
