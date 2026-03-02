@@ -9,6 +9,7 @@ mod web;
 mod calendar;
 mod web_browse;
 mod scheduler;
+pub mod memory_search;
 
 pub use browse::BrowsePageTool;
 pub use coreutils::{
@@ -22,6 +23,7 @@ pub use web::{WebSearchTool, FetchPageTool};
 pub use calendar::CalendarAddEventTool;
 pub use web_browse::WebBrowseTool;
 pub use scheduler::{CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool};
+pub use memory_search::{SearchMemoryTool, MemoryQueryFn, MemorySearchResult};
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};

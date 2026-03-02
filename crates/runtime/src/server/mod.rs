@@ -337,6 +337,31 @@ pub async fn run_unified_daemon(
         scheduler_handle: None,
     }));
 
+    // ── Register SearchMemoryTool (needs daemon state handle) ────────────────
+    {
+        let state_for_memory = state.clone();
+        let memory_query_fn: aigent_tools::MemoryQueryFn = Arc::new(move |query, limit| {
+            let st = state_for_memory.clone();
+            Box::pin(async move {
+                let s = st.lock().await;
+                let ranked = s.memory.context_for_prompt_ranked(&query, limit);
+                ranked
+                    .into_iter()
+                    .map(|r| aigent_tools::MemorySearchResult {
+                        content: r.entry.content,
+                        tier: format!("{:?}", r.entry.tier),
+                        score: r.score,
+                        source: r.entry.source,
+                        created_at: r.entry.created_at.to_rfc3339(),
+                    })
+                    .collect()
+            })
+        });
+        let search_tool = aigent_tools::SearchMemoryTool { query_fn: memory_query_fn };
+        state.lock().await.tool_registry.register(Box::new(search_tool));
+        info!("registered search_memory tool with live daemon memory handle");
+    }
+
     let listener = UnixListener::bind(&socket_path)?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     info!(path = %socket_path.display(), "unified daemon listening");

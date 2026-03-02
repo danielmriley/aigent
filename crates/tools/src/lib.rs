@@ -547,6 +547,7 @@ pub use builtins::{
     SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool, UniqTool,
     WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool, WriteFileTool,
 };
+pub use builtins::memory_search::{SearchMemoryTool, MemoryQueryFn, MemorySearchResult};
 
 // ── ToolRegistry tests ───────────────────────────────────────────────────────
 

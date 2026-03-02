@@ -74,6 +74,7 @@ impl Default for ExecutionPolicy {
                 "web_search".to_string(),
                 "browse_page".to_string(),
                 "fetch_page".to_string(),
+                "search_memory".to_string(),
             ],
             git_auto_commit: false,
             sandbox_enabled: true,

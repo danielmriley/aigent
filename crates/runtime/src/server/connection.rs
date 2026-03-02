@@ -864,62 +864,114 @@ pub(super) async fn handle_connection(
             }
         }
         ClientCommand::TriggerProactive => {
-            // Snapshot beliefs/reflections, release lock, call LLM, re-acquire lock.
-            let (rt_clone, beliefs_summary, reflections_summary, event_tx_clone) = {
-                let s = state.lock().await;
-                let rt = s.runtime.clone();
-                let tx = s.event_tx.clone();
+            // Full AgentLoop proactive tick — the agent can use all tools.
+            let proactive_user_msg = "\
+You have woken up proactively. Look at your environment, schedule, and recent \
+memories. Are there any background tasks you need to complete, web searches to \
+run, or problems to solve for the user? Take action silently using your tools. \
+If you discover something important that the user must know immediately, output \
+a concise final message to them. Otherwise, respond with an empty string to \
+return to sleep.";
 
-                let beliefs = s.memory.all_beliefs();
-                let b_summary = if beliefs.is_empty() {
-                    "(none yet)".to_string()
-                } else {
-                    beliefs
-                        .iter()
-                        .take(8)
-                        .map(|e| format!("- {}", e.content))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                let ctx = s.memory.context_for_prompt_ranked_with_embed("recent", 5, None);
-                let r_summary = {
-                    let reflections: Vec<String> = ctx
-                        .iter()
-                        .filter(|item| item.entry.tier == MemoryTier::Reflective)
-                        .map(|item| {
-                            format!("- {}", crate::prompt_builder::truncate_for_prompt(&item.entry.content, 200))
-                        })
-                        .collect();
-                    if reflections.is_empty() {
-                        "(none yet)".to_string()
-                    } else {
-                        reflections.join("\n")
-                    }
-                };
-                (rt, b_summary, r_summary, tx)
+            let (rt_clone, mut memory, recent, tool_specs, registry, executor, event_tx_clone) = {
+                let mut s = state.lock().await;
+                let rt = s.runtime.clone();
+                let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
+                let mem = std::mem::take(&mut s.memory);
+                let specs = s.tool_registry.list_specs();
+                let reg = std::sync::Arc::clone(&s.tool_registry);
+                let exe = std::sync::Arc::clone(&s.tool_executor);
+                let tx = s.event_tx.clone();
+                (rt, mem, recent, specs, reg, exe, tx)
             };
-            let outcome = rt_clone
-                .run_proactive_check_from_summaries(&beliefs_summary, &reflections_summary)
-                .await;
+
+            let context = memory.context_for_prompt_ranked_with_embed("proactive background check", 8, None);
+            let stats = memory.stats();
+
+            let mut prompt_inputs = crate::prompt_builder::PromptInputs {
+                config: &rt_clone.config,
+                memory: &mut memory,
+                user_message: proactive_user_msg,
+                recent_turns: &recent,
+                tool_specs: &[],
+                pending_follow_ups: &[],
+                context_items: &context,
+                stats,
+            };
+            let system_prompt = crate::prompt_builder::build_chat_prompt(&mut prompt_inputs);
+
+            let mut messages = vec![aigent_llm::ChatMessage::system(&system_prompt)];
+            for turn in &recent {
+                messages.push(aigent_llm::ChatMessage::user(&turn.user));
+                messages.push(aigent_llm::ChatMessage::assistant(&turn.assistant));
+            }
+            messages.push(aigent_llm::ChatMessage::user(proactive_user_msg));
+
+            let tools_json = if tool_specs.is_empty() {
+                None
+            } else {
+                Some(crate::tool_loop::build_tools_json(&tool_specs))
+            };
+
+            let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
+                aigent_llm::Provider::OpenRouter
+            } else {
+                aigent_llm::Provider::Ollama
+            };
+
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);
+            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+
+            let loop_result = crate::tool_loop::run_tool_loop(
+                &rt_clone.llm,
+                primary,
+                &rt_clone.config.llm.ollama_model,
+                &rt_clone.config.llm.openrouter_model,
+                &mut messages,
+                tools_json.as_ref(),
+                &registry,
+                &executor,
+                sink_tx,
+                None,
+            ).await;
+
             let msg = {
                 let mut s = state.lock().await;
+                s.memory = memory;
                 let _ = s.memory.flush_all();
-                if let Some(out) = outcome {
-                    if let Some(ref m) = out.message {
-                        let ev = BackendEvent::ProactiveMessage { content: m.clone() };
-                        let _ = event_tx_clone.send(ev);
-                        let _ = s
-                            .memory
-                            .record(MemoryTier::Episodic, format!("[proactive] {m}"), "proactive")
-                            .await;
-                        s.proactive_total_sent += 1;
-                        s.last_proactive_at = Some(Utc::now());
-                        format!("proactive message sent: {m}")
-                    } else {
-                        "proactive check ran — no message to send".to_string()
+                match loop_result {
+                    Ok(ref result) => {
+                        for exec in &result.tool_executions {
+                            let outcome = format!(
+                                "[proactive] Tool '{}' executed. Output (first 400 chars): {}",
+                                exec.tool_name,
+                                safe_truncate(&exec.output, 400),
+                            );
+                            let _: Result<_, _> = s.memory.record(
+                                MemoryTier::Procedural,
+                                outcome,
+                                format!("proactive-tool:{}", exec.tool_name),
+                            ).await;
+                        }
+                        let reply = result.content.trim();
+                        if !reply.is_empty() {
+                            let ev = BackendEvent::ProactiveMessage { content: reply.to_string() };
+                            let _ = event_tx_clone.send(ev);
+                            let _ = s
+                                .memory
+                                .record(MemoryTier::Episodic, format!("[proactive] {reply}"), "proactive:agent-loop")
+                                .await;
+                            s.proactive_total_sent += 1;
+                            s.last_proactive_at = Some(Utc::now());
+                            format!("proactive agent loop completed — message sent: {reply}")
+                        } else {
+                            format!(
+                                "proactive agent loop completed silently ({} tool calls)",
+                                result.tool_executions.len()
+                            )
+                        }
                     }
-                } else {
-                    "proactive check ran — decided to stay silent".to_string()
+                    Err(ref err) => format!("proactive agent loop failed: {err}"),
                 }
             };
             send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
