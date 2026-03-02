@@ -211,7 +211,7 @@ impl Tool for CreateCronJobTool {
         let output = format!(
             "{verb} scheduled task '{name}' ({sched_type})\n\
              Action: {action_prompt}\n\
-             Note: restart the daemon or reload config for changes to take effect."
+             The scheduler will pick up this change automatically within the next tick."
         );
 
         Ok(ToolOutput { output, success: true })
@@ -262,7 +262,7 @@ impl Tool for RemoveCronJobTool {
             save_entries(&entries)?;
             Ok(ToolOutput {
                 output: format!("Removed scheduled task '{name}'.\n\
-                                 Note: restart the daemon or reload config for changes to take effect."),
+                                 The scheduler will pick up this change automatically within the next tick."),
                 success: true,
             })
         } else {

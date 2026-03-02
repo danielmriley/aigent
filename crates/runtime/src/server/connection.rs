@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tracing::{info, warn};
+use aigent_tools::Tool;
 
 use aigent_config::AppConfig;
 use aigent_memory::MemoryTier;
@@ -1114,22 +1115,36 @@ fn reload_dynamic_skills(
             }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
-                // For now, log the discovered skill.  Actual WASM instantiation
-                // will be wired up in Phase 2 (sandboxed compilation pipeline).
-                // This ensures the discovery + registration plumbing is tested.
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                info!(skill = %stem, path = %path.display(), "discovered dynamic skill");
-                loaded.push(stem);
+
+                // Load the WASM binary and register it as a dynamic tool.
+                match aigent_exec::wasm::WasmTool::load_with_workspace(
+                    &path,
+                    Some(workspace),
+                ) {
+                    Some(tool) => {
+                        let name = tool.spec().name.clone();
+                        registry.register_with_source(
+                            Box::new(tool),
+                            aigent_tools::ToolSource::Dynamic,
+                        );
+                        info!(skill = %name, path = %path.display(), "loaded dynamic skill");
+                        loaded.push(name);
+                    }
+                    None => {
+                        warn!(skill = %stem, path = %path.display(), "failed to load dynamic skill WASM");
+                    }
+                }
             }
         }
     }
 
     let msg = format!(
-        "skills reload: unloaded {} old, discovered {} new dynamic tool(s)",
+        "skills reload: unloaded {} old, loaded {} new dynamic tool(s)",
         old_names.len(),
         loaded.len()
     );

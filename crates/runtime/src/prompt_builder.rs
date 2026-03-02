@@ -414,6 +414,86 @@ UNDER NO CIRCUMSTANCES should you:\n\
 If a tool exists in your AVAILABLE TOOLS list, you CAN and SHOULD use it. \
 Do not apologize or redirect — act.";
 
+    let skill_creation = "\
+SKILL CREATION DIRECTIVE:\n\
+\n\
+You can CREATE NEW TOOLS for yourself as WASM skills. When you encounter \
+a task that would benefit from a reusable, dedicated tool (data parsing, \
+format conversions, domain-specific calculations, etc.), you should build \
+one rather than doing fragile ad-hoc shell scripting every time.\n\
+\n\
+=== HOW TO CREATE A SKILL ===\n\
+\n\
+Step 1: Scaffold the skill using the helper script:\n\
+  run_shell(command=\"cd extensions/skills-src && ./new-skill.sh my-skill-name \\\n\
+      \\\"One sentence describing what this tool does\\\"\")\n\
+This creates: my-skill-name/Cargo.toml, my-skill-name/tool.json, \n\
+  my-skill-name/src/main.rs with all boilerplate pre-filled.\n\
+\n\
+Step 2: Edit the tool manifest (my-skill-name/tool.json):\n\
+  {\n\
+    \"name\": \"my_skill_name\",\n\
+    \"description\": \"What this tool does \u{2014} shown to you in AVAILABLE TOOLS\",\n\
+    \"params\": [\n\
+      { \"name\": \"input\", \"description\": \"..\", \"required\": true, \"param_type\": \"string\" },\n\
+      { \"name\": \"format\", \"description\": \"..\", \"required\": false, \n\
+        \"param_type\": \"string\", \"enum_values\": [\"json\",\"text\"], \"default\": \"text\" }\n\
+    ],\n\
+    \"metadata\": { \"security_level\": \"low\", \"read_only\": true, \"group\": \"custom\" }\n\
+  }\n\
+\n\
+Step 3: Implement the tool logic in src/main.rs. The protocol is:\n\
+  - stdin: JSON object of param name/value pairs\n\
+  - stdout: { \"success\": true/false, \"output\": \"result text\" }\n\
+  Example main.rs:\n\
+    use std::collections::HashMap;\n\
+    use std::io::{self, BufRead, Write};\n\
+    fn main() {\n\
+        let mut input = String::new();\n\
+        for line in io::stdin().lock().lines() {\n\
+            match line { Ok(l) => input.push_str(&l), Err(_) => break }\n\
+        }\n\
+        let args: HashMap<String,String> = serde_json::from_str(&input).unwrap_or_default();\n\
+        let (success, output) = execute(&args);\n\
+        let result = serde_json::json!({ \"success\": success, \"output\": output });\n\
+        let _ = io::stdout().write_all(result.to_string().as_bytes());\n\
+    }\n\
+    fn execute(args: &HashMap<String, String>) -> (bool, String) {\n\
+        let input = match args.get(\"input\") {\n\
+            Some(v) => v,\n\
+            None => return (false, \"missing required param: input\".to_string()),\n\
+        };\n\
+        // ... your logic here ...\n\
+        (true, format!(\"Result: {input}\"))\n\
+    }\n\
+\n\
+Step 4: Build and deploy (the build script compiles AND copies to the skills dir):\n\
+  run_shell(command=\"cd extensions/skills-src && ./build.sh my-skill-name\")\n\
+  This compiles to WASM targeting wasm32-wasip1 and auto-deploys both\n\
+  the .wasm binary and .tool.json manifest to extensions/skills/.\n\
+\n\
+Step 5: Reload \u{2014} make the daemon pick up the new skill immediately:\n\
+  Use your reload_tools capability or tell the user to run: aigent tools reload\n\
+  On next daemon restart, skills load automatically from extensions/skills/.\n\
+\n\
+=== WHEN TO CREATE A SKILL ===\n\
+  - You find yourself doing the same multi-step shell pipeline repeatedly\n\
+  - A data transformation is complex enough to warrant dedicated code\n\
+  - The user asks for a capability that does not exist in your current tools\n\
+  - You want a tool that combines multiple operations atomically\n\
+\n\
+=== IMPORTANT CONSTRAINTS ===\n\
+  - Skills are stateless \u{2014} each call gets a fresh WASM instance\n\
+  - Filesystem access is sandboxed to the workspace directory (relative paths only)\n\
+  - stdout is buffered to 256KB \u{2014} keep output concise\n\
+  - Only serde_json is available as a dependency (no network access from inside WASM)\n\
+  - For tools needing HTTP/network, use run_shell to call curl or delegate to \n\
+    your existing web_search/fetch_page tools in a tool chain\n\
+  - Use descriptive tool names with underscores (my_skill_name, not my-skill-name)\n\
+  - Write clear param descriptions \u{2014} these are what you see in your AVAILABLE TOOLS list\n\
+  - All skill source code lives inside your workspace at extensions/skills-src/\n\
+  - Deployed skills go to extensions/skills/ (handled automatically by build.sh)";
+
     format!(
         "\n\nAVAILABLE TOOLS (you have FULL ACCESS to all of these):\n\
          {list}\n\n\
@@ -426,7 +506,8 @@ Do not apologize or redirect — act.";
          {tool_selection_guide}\n\n\
          {grounding}\n\n\
          {reflection_nudge}\n\n\
-         {autonomy_directive}"
+         {autonomy_directive}\n\n\
+         {skill_creation}"
     )
 }
 

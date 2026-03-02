@@ -12,8 +12,9 @@
 //! Built on top of `tokio::time` with the `cron` crate for expression parsing.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use cron::Schedule as CronSchedule;
@@ -263,6 +264,8 @@ pub fn spawn_scheduler(
     tasks: Vec<ScheduledTask>,
     state: SchedulerState,
     heartbeat: HeartbeatFn,
+    schedule_file: Option<PathBuf>,
+    schedule_prompts: Option<Arc<std::sync::RwLock<HashMap<String, String>>>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // The tick interval is the GCD of all task intervals, clamped to
@@ -283,9 +286,60 @@ pub fn spawn_scheduler(
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut tasks = tasks;
+        let mut last_mtime: Option<SystemTime> = schedule_file
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+
         loop {
             interval.tick().await;
             let now = Utc::now();
+
+            // ── Hot-reload: check if schedule file changed ──
+            if let Some(ref path) = schedule_file {
+                let current_mtime = std::fs::metadata(path)
+                    .ok()
+                    .and_then(|m| m.modified().ok());
+                if current_mtime != last_mtime {
+                    last_mtime = current_mtime;
+                    match crate::schedule_store::load_tasks(path) {
+                        Ok(entries) => {
+                            let mut new_tasks = Vec::new();
+                            if let Some(ref prompts) = schedule_prompts {
+                                let mut map = prompts.write().unwrap();
+                                map.clear();
+                                for entry in &entries {
+                                    match entry.to_scheduled_task() {
+                                        Ok(task) => {
+                                            map.insert(
+                                                task.name.clone(),
+                                                entry.action_prompt.clone(),
+                                            );
+                                            new_tasks.push(task);
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                name = %entry.name,
+                                                ?err,
+                                                "scheduler: skipping invalid task on reload"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            info!(
+                                count = new_tasks.len(),
+                                "scheduler: reloaded tasks from disk"
+                            );
+                            tasks = new_tasks;
+                        }
+                        Err(err) => {
+                            warn!(?err, "scheduler: failed to reload schedule file");
+                        }
+                    }
+                }
+            }
 
             for task in &tasks {
                 if !task.enabled {

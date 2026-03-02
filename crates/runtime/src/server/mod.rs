@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use aigent_tools::Tool;
 
 use anyhow::Result;
 use chrono::{DateTime, Timelike, Utc};
@@ -257,6 +258,48 @@ pub async fn run_unified_daemon(
     );
     let tool_executor = ToolExecutor::new(policy);
 
+    // ── Load dynamic skills from the skills directory at startup ─────────
+    if config.tools.skills.enabled {
+        let skills_dir = std::path::Path::new(&config.agent.workspace_path)
+            .join(&config.tools.skills.skills_dir);
+        if skills_dir.is_dir() {
+            info!(dir = %skills_dir.display(), "scanning skills directory at startup");
+            let workspace = std::path::Path::new(&config.agent.workspace_path);
+            let max = if config.tools.skills.max_skills == 0 {
+                usize::MAX
+            } else {
+                config.tools.skills.max_skills
+            };
+            let mut count = 0usize;
+            if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+                for entry in entries.flatten() {
+                    if count >= max { break; }
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
+                        if let Some(tool) = aigent_exec::wasm::WasmTool::load_with_workspace(
+                            &path,
+                            Some(workspace),
+                        ) {
+                            let name = tool.spec().name.clone();
+                            tool_registry.register_with_source(
+                                Box::new(tool),
+                                aigent_tools::ToolSource::Dynamic,
+                            );
+                            info!(skill = %name, "loaded dynamic skill at startup");
+                            count += 1;
+                        } else {
+                            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
+                            warn!(skill = %stem, "failed to load skill WASM at startup");
+                        }
+                    }
+                }
+            }
+            if count > 0 {
+                info!(count, "dynamic skills loaded at startup");
+            }
+        }
+    }
+
     // Extract sleep scheduling config before `config` is moved into the runtime.
     let sleep_quiet_start = config.memory.night_sleep_start_hour as u32;
     let sleep_quiet_end = config.memory.night_sleep_end_hour as u32;
@@ -457,7 +500,13 @@ pub async fn run_unified_daemon(
             })
         });
 
-        let handle = spawn_scheduler(tasks, sched_state, heartbeat);
+        let handle = spawn_scheduler(
+            tasks,
+            sched_state,
+            heartbeat,
+            Some(schedule_file.clone()),
+            Some(prompts.clone()),
+        );
         state.lock().await.scheduler_handle = Some(handle.abort_handle());
         info!("cron scheduler started");
     }
