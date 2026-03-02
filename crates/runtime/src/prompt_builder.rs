@@ -103,29 +103,41 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
 /// steps.  The Rust agent loop becomes the thinker — parsing, executing
 /// tools, and feeding observations back.
 ///
+/// The prompt is aggressively strict to work with local models (Qwen, Llama,
+/// Mistral, etc.) that tend to wrap JSON in markdown or add explanatory text.
+/// Ollama's `format: "json"` constraint is applied at the API level separately.
+///
 /// Includes the available tool names so the model knows exactly which tools
 /// it can invoke.
 fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> String {
     let mut buf = String::with_capacity(2048);
-    buf.push_str("\n\nEXTERNAL REASONING MODE ACTIVE.\n\
-        You MUST respond with EXACTLY one JSON object and nothing else \
-        (no markdown, no extra text, no <thinking> tags).\n\n");
 
-    // ── JSON schema ──────────────────────────────────────────────────────
-    buf.push_str("Required JSON schema (pick exactly one type):\n\n\
-        For a tool call:\n");
+    // ── Hard constraint preamble ─────────────────────────────────────────────────────
     buf.push_str(
-        r#"{"type":"tool_call","thought":"brief reasoning","tool_call":{"name":"TOOL_NAME","args":{...}}}"#,
+        "\n\n## STRICT JSON-ONLY MODE\n\n\
+         You are in STRICT JSON-ONLY MODE. Output ONLY the JSON object below.\n\
+         No markdown, no extra text, no explanations, no ```json fences, \
+         no <thinking> tags, no comments.\n\
+         Your entire response must be parseable by a JSON parser.\n\n",
     );
-    buf.push_str("\n\nFor a final answer to the user:\n");
+
+    // ── JSON schema ──────────────────────────────────────────────────────────
     buf.push_str(
-        r#"{"type":"final_answer","thought":"brief reasoning","final_answer":"your message"}"#,
+        "You must output EXACTLY ONE of these two JSON objects:\n\n\
+         OPTION A — tool call:\n",
+    );
+    buf.push_str(
+        r#"{"type":"tool_call","thought":"one sentence","tool_call":{"name":"TOOL_NAME","args":{"key":"value"}}}"#,
+    );
+    buf.push_str("\n\nOPTION B — final answer:\n");
+    buf.push_str(
+        r#"{"type":"final_answer","thought":"one sentence","final_answer":"your complete response to the user"}"#,
     );
     buf.push_str("\n\n");
 
-    // ── Available tools ──────────────────────────────────────────────────
+    // ── Available tools ────────────────────────────────────────────────────────
     if !tool_specs.is_empty() {
-        buf.push_str("AVAILABLE TOOLS (use only these names in tool_call.name):\n");
+        buf.push_str("AVAILABLE TOOLS (use ONLY these exact names in tool_call.name):\n");
         for spec in tool_specs {
             buf.push_str(&format!("- {}: {}", spec.name, spec.description));
             if !spec.params.is_empty() {
@@ -144,16 +156,17 @@ fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> Strin
         buf.push('\n');
     }
 
-    // ── Strict rules ─────────────────────────────────────────────────────
+    // ── Rules ───────────────────────────────────────────────────────────────
     buf.push_str(
-        "STRICT RULES:\n\
-        1. Output ONLY the JSON object \u{2014} no prose before or after.\n\
-        2. The \"type\" field must be exactly \"tool_call\" or \"final_answer\".\n\
-        3. The \"thought\" field must be 25 words or fewer.\n\
-        4. For tool_call: \"tool_call\" is required, \"final_answer\" must be null or omitted.\n\
-        5. For final_answer: \"final_answer\" is required, \"tool_call\" must be null or omitted.\n\
-        6. If you do not need a tool, respond with final_answer immediately.\n\
-        7. NEVER output free-form text \u{2014} always use the JSON schema above.\n",
+        "RULES (violation = system error):\n\
+         1. Your ENTIRE response is the JSON object. Nothing before, nothing after.\n\
+         2. \"type\" MUST be exactly \"tool_call\" or \"final_answer\".\n\
+         3. \"thought\" MUST be 1 sentence, max 25 words.\n\
+         4. tool_call: \"tool_call\" is required. Do NOT include \"final_answer\".\n\
+         5. final_answer: \"final_answer\" is required. Do NOT include \"tool_call\".\n\
+         6. If no tool is needed, respond with final_answer immediately.\n\
+         7. NEVER wrap in ```json``` or any markdown.\n\
+         8. NEVER output free text, apologies, or explanations outside the JSON.\n",
     );
 
     buf
@@ -678,10 +691,10 @@ mod ext_think_tests {
     #[test]
     fn external_thinking_block_empty_tools() {
         let block = build_external_thinking_block(&[]);
-        assert!(block.contains("EXTERNAL REASONING MODE ACTIVE"));
+        assert!(block.contains("STRICT JSON-ONLY MODE"));
         assert!(block.contains("tool_call"));
         assert!(block.contains("final_answer"));
-        assert!(block.contains("STRICT RULES"));
+        assert!(block.contains("RULES (violation = system error)"));
         assert!(!block.contains("AVAILABLE TOOLS"));
     }
 
