@@ -88,7 +88,7 @@ pub struct ExtThinkResult {
     pub content: String,
     /// Total reasoning steps consumed.
     pub steps: usize,
-    /// Tool executions performed during reasoning (for procedural memory).
+    /// All tool executions that happened during the loop, in order.
     pub tool_executions: Vec<ToolExecution>,
 }
 
@@ -104,19 +104,23 @@ pub struct ExtThinkConfig {
 
 // ── Core loop ────────────────────────────────────────────────────────────────
 
-/// Maximum retries per step on timeout or parse error.
-const MAX_RETRIES_PER_STEP: usize = 2;
+/// Maximum consecutive parse/timeout retries before bailing.
+const MAX_CONSECUTIVE_RETRIES: usize = 3;
+
+/// Exponential backoff durations for retries (1s, 2s, 3s).
+const RETRY_BACKOFF_MS: [u64; 3] = [1000, 2000, 3000];
 
 /// Run the externalized JSON reasoning loop.
 ///
 /// This function drives a Think→Act→Observe cycle entirely in Rust:
 ///
-/// 1. Send the current message history to the LLM (without streaming — we
-///    need the full JSON output before we can parse it).
-/// 2. Parse the JSON into an [`AgentStep`].
+/// 1. Send the current message history to the LLM (with Ollama `format: "json"`
+///    when the provider is Ollama so the model is forced into JSON mode at the
+///    API level).
+/// 2. Parse the JSON into an [`AgentStep`], with multi-layer fallback parsing.
 /// 3. If `ToolCall`: execute the tool, append the observation, loop.
 /// 4. If `FinalAnswer`: stream the answer to the user and return.
-/// 5. On timeout or parse error: inject an error observation and retry.
+/// 5. On timeout or parse error: inject an error observation, back off, retry.
 ///
 /// The `thought` field from each step is emitted via `BackendEvent::AgentThought`
 /// so the TUI can display it in real-time.
@@ -134,15 +138,16 @@ pub async fn run_external_thinking_loop(
     event_tx: Option<&broadcast::Sender<BackendEvent>>,
 ) -> Result<ExtThinkResult> {
     let mut steps = 0usize;
+    let mut consecutive_retries = 0usize;
     let mut tool_executions: Vec<ToolExecution> = Vec::new();
 
     loop {
         if steps >= config.max_steps {
             warn!(steps, max = config.max_steps, "external thinking: hit step limit, forcing answer");
-            // Ask the model to produce a final answer now.
             messages.push(ChatMessage::user(
                 "You have reached the maximum number of reasoning steps. \
-                 You MUST respond with a final_answer JSON now.",
+                 You MUST respond with a final_answer JSON now. Output ONLY: \
+                 {\"type\":\"final_answer\",\"thought\":\"...\",\"final_answer\":\"...\"}",
             ));
         }
 
@@ -158,37 +163,76 @@ pub async fn run_external_thinking_loop(
         .await;
 
         let raw = match raw_output {
-            Ok(text) => text,
+            Ok(text) => {
+                // Reset retry counter on successful LLM response.
+                consecutive_retries = 0;
+                text
+            }
             Err(err) => {
                 warn!(?err, step = steps, "external thinking: LLM call failed");
-                // Inject error observation and retry.
+                consecutive_retries += 1;
+                if consecutive_retries > MAX_CONSECUTIVE_RETRIES {
+                    bail!(
+                        "external thinking: exhausted {MAX_CONSECUTIVE_RETRIES} consecutive retries \
+                         after {steps} steps (last error: {err})"
+                    );
+                }
+                // Exponential backoff.
+                let delay = RETRY_BACKOFF_MS
+                    .get(consecutive_retries.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(3000);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+
                 let retry_msg = format!(
-                    "Step timed out or LLM error: {err}. Try again with a valid JSON response.",
+                    "Step timed out or LLM error: {err}. \
+                     Respond with ONLY the JSON object — no markdown, no extra text. Example: \
+                     {{\"type\":\"final_answer\",\"thought\":\"...\",\"final_answer\":\"...\"}}"
                 );
                 messages.push(ChatMessage::user(&retry_msg));
                 steps += 1;
-                if steps >= config.max_steps + MAX_RETRIES_PER_STEP {
-                    bail!("external thinking: exhausted all retries after {steps} steps");
-                }
                 continue;
             }
         };
 
         debug!(step = steps, raw_len = raw.len(), "external thinking: got LLM output");
 
-        // ── 2. Parse the JSON ────────────────────────────────────────────
+        // ── 2. Parse the JSON (multi-layer fallback) ─────────────────────
         let step = match parse_agent_step(&raw) {
-            Ok(s) => s,
+            Ok(s) => {
+                consecutive_retries = 0;
+                s
+            }
             Err(err) => {
-                warn!(?err, step = steps, "external thinking: JSON parse failed");
+                warn!(?err, step = steps, raw = %raw.chars().take(300).collect::<String>(),
+                      "external thinking: JSON parse failed");
+                consecutive_retries += 1;
+                if consecutive_retries > MAX_CONSECUTIVE_RETRIES {
+                    bail!(
+                        "external thinking: exhausted {MAX_CONSECUTIVE_RETRIES} consecutive \
+                         parse retries after {steps} steps (last error: {err})"
+                    );
+                }
+                // Exponential backoff.
+                let delay = RETRY_BACKOFF_MS
+                    .get(consecutive_retries.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(3000);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+
+                // Inject a very explicit correction message.
                 let retry_msg = format!(
-                    "Invalid JSON response: {err}. Respond with ONLY valid JSON matching the schema.",
+                    "Your last response was not valid JSON. Parse error: {err}\n\n\
+                     You MUST respond with ONLY the JSON object below — no markdown fences, \
+                     no explanation, no extra text:\n\
+                     {{\"type\":\"final_answer\",\"thought\":\"brief reasoning\",\
+                     \"final_answer\":\"your response to the user\"}}\n\n\
+                     Or for a tool call:\n\
+                     {{\"type\":\"tool_call\",\"thought\":\"brief reasoning\",\
+                     \"tool_call\":{{\"name\":\"TOOL_NAME\",\"args\":{{...}}}}}}"
                 );
                 messages.push(ChatMessage::user(&retry_msg));
                 steps += 1;
-                if steps >= config.max_steps + MAX_RETRIES_PER_STEP {
-                    bail!("external thinking: exhausted retries after {steps} parse failures");
-                }
                 continue;
             }
         };
@@ -230,7 +274,6 @@ pub async fn run_external_thinking_loop(
                     Err(err) => (false, format!("tool error: {err}")),
                 };
 
-                // Track for procedural memory.
                 tool_executions.push(ToolExecution {
                     tool_name: tool_call.name.clone(),
                     args: tool_call.args.clone(),
@@ -283,8 +326,8 @@ pub async fn run_external_thinking_loop(
             }
         }
 
-        // Safety check after max_steps + retries.
-        if steps > config.max_steps + MAX_RETRIES_PER_STEP {
+        // Safety check: hard cap at 2x max_steps.
+        if steps > config.max_steps * 2 {
             break;
         }
     }
@@ -296,6 +339,9 @@ pub async fn run_external_thinking_loop(
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Call the LLM and collect the full (non-streaming) response with a timeout.
+///
+/// When the provider is Ollama, enables `format: "json"` at the API level so
+/// the model is constrained to valid JSON output.
 async fn call_llm_with_timeout(
     config: &ExtThinkConfig,
     llm: &LlmRouter,
@@ -315,6 +361,10 @@ async fn call_llm_with_timeout(
         buf
     });
 
+    // Enable JSON mode for the request — this tells Ollama to add `format: "json"`
+    // which constrains the model's output to valid JSON at the token-sampling level.
+    let json_mode = true;
+
     let msgs = messages.to_vec();
     let fut = llm.chat_messages_stream(
         primary,
@@ -323,6 +373,7 @@ async fn call_llm_with_timeout(
         &msgs,
         None, // No tools schema — we use our JSON schema instead.
         tx,
+        json_mode,
     );
 
     let response = tokio::time::timeout(config.step_timeout, fut)
@@ -330,14 +381,11 @@ async fn call_llm_with_timeout(
         .context("step timed out")?
         .context("LLM call failed")?;
 
-    // Always await the collector task to avoid a dangling spawn.
-    let collected = collect_handle.await.unwrap_or_default();
-
-    // Prefer the response content; fall back to collected stream tokens.
+    // Prefer the response content; fall back to collected tokens.
     let text = if !response.content.is_empty() {
         response.content
     } else {
-        collected
+        collect_handle.await.unwrap_or_default()
     };
 
     if text.trim().is_empty() {
@@ -349,32 +397,100 @@ async fn call_llm_with_timeout(
 
 /// Parse an [`AgentStep`] from raw LLM output.
 ///
-/// Handles common model quirks:
-/// - Leading/trailing whitespace
-/// - ```json wrapper blocks
-/// - Stray text before/after the JSON object
+/// Multi-layer fallback parsing to handle common model quirks:
+///
+/// 1. **Direct**: try `serde_json::from_str` on the trimmed input.
+/// 2. **Strip fences**: remove ````json ... ```` wrappers.
+/// 3. **Extract object**: find the first `{...}` balanced JSON object.
+/// 4. **Heuristic repair**: if the JSON has the right fields but wrong/missing
+///    `"type"`, infer it from the presence of `"tool_call"` vs `"final_answer"`.
 pub fn parse_agent_step(raw: &str) -> Result<AgentStep> {
     let trimmed = raw.trim();
 
-    // Strip markdown code fences.
-    let json_str = if trimmed.starts_with("```") {
-        let inner = trimmed
-            .strip_prefix("```json")
-            .or_else(|| trimmed.strip_prefix("```"))
-            .unwrap_or(trimmed);
-        inner
-            .strip_suffix("```")
-            .unwrap_or(inner)
-            .trim()
+    // ── Layer 1: direct parse ────────────────────────────────────────────
+    if let Ok(step) = serde_json::from_str::<AgentStep>(trimmed) {
+        return Ok(step);
+    }
+
+    // ── Layer 2: strip markdown code fences ──────────────────────────────
+    let defenced = strip_code_fences(trimmed);
+    if let Ok(step) = serde_json::from_str::<AgentStep>(defenced) {
+        return Ok(step);
+    }
+
+    // ── Layer 3: extract first JSON object ───────────────────────────────
+    if let Some(json_str) = extract_json_object(defenced) {
+        if let Ok(step) = serde_json::from_str::<AgentStep>(json_str) {
+            return Ok(step);
+        }
+
+        // ── Layer 4: heuristic type repair ───────────────────────────────
+        if let Ok(step) = repair_and_parse(json_str) {
+            return Ok(step);
+        }
+    }
+
+    // Also try extracting from the original (pre-defence) text.
+    if let Some(json_str) = extract_json_object(trimmed) {
+        if let Ok(step) = serde_json::from_str::<AgentStep>(json_str) {
+            return Ok(step);
+        }
+        if let Ok(step) = repair_and_parse(json_str) {
+            return Ok(step);
+        }
+    }
+
+    anyhow::bail!(
+        "failed to parse AgentStep from: {}",
+        &trimmed[..trimmed.len().min(300)]
+    )
+}
+
+/// Strip markdown code fences: ````json ... ```` or ```` ... ````
+fn strip_code_fences(s: &str) -> &str {
+    let s = s.trim();
+    if !s.starts_with("```") {
+        return s;
+    }
+    let inner = s
+        .strip_prefix("```json")
+        .or_else(|| s.strip_prefix("```JSON"))
+        .or_else(|| s.strip_prefix("```"))
+        .unwrap_or(s);
+    inner.strip_suffix("```").unwrap_or(inner).trim()
+}
+
+/// Attempt to repair a JSON object that has the right fields but is missing
+/// or has a wrong `"type"` discriminator, then parse it.
+fn repair_and_parse(json_str: &str) -> Result<AgentStep> {
+    let mut obj: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(json_str).context("not a JSON object")?;
+
+    // Infer or fix the "type" field.
+    let has_tool_call = obj.get("tool_call").is_some_and(|v| !v.is_null());
+    let has_final_answer = obj
+        .get("final_answer")
+        .is_some_and(|v| v.is_string() && !v.as_str().unwrap_or("").is_empty());
+
+    let inferred_type = if has_tool_call && !has_final_answer {
+        "tool_call"
+    } else if has_final_answer {
+        "final_answer"
     } else {
-        trimmed
+        anyhow::bail!("cannot infer type: no tool_call or final_answer field found");
     };
 
-    // Try to extract the JSON object if there's surrounding text.
-    let json_str = extract_json_object(json_str).unwrap_or(json_str);
+    obj.insert(
+        "type".to_string(),
+        serde_json::Value::String(inferred_type.to_string()),
+    );
 
-    serde_json::from_str(json_str)
-        .with_context(|| format!("failed to parse AgentStep from: {}", &json_str[..json_str.len().min(200)]))
+    // Ensure "thought" exists (some models omit it).
+    obj.entry("thought".to_string())
+        .or_insert_with(|| serde_json::Value::String("(no thought)".to_string()));
+
+    let repaired = serde_json::Value::Object(obj);
+    serde_json::from_value(repaired).context("repaired JSON still failed to parse as AgentStep")
 }
 
 /// Extract the first `{...}` JSON object from a string, handling nested braces.
