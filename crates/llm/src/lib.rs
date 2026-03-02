@@ -183,6 +183,18 @@ impl From<ModelProvider> for Provider {
     }
 }
 
+impl From<&str> for Provider {
+    /// Case-insensitive conversion from a provider name string.
+    /// Unrecognised values default to `Provider::Ollama`.
+    fn from(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "openrouter" => Provider::OpenRouter,
+            "candle" => Provider::Candle,
+            _ => Provider::Ollama,
+        }
+    }
+}
+
 /// Unified trait for any LLM backend (Ollama, OpenRouter, Candle, …).
 ///
 /// The existing [`LlmRouter`] implements this directly.  New backends
@@ -227,6 +239,7 @@ pub trait LlmClient: Send + Sync {
     ) -> Result<ChatResponse>;
 }
 
+#[derive(Default)]
 pub struct LlmRouter {
     ollama: OllamaClient,
     openrouter: OpenRouterClient,
@@ -236,19 +249,6 @@ pub struct LlmRouter {
     /// Candle config for lazy init.
     #[cfg(feature = "candle")]
     candle_config: Option<candle_backend::CandleConfig>,
-}
-
-impl Default for LlmRouter {
-    fn default() -> Self {
-        Self {
-            ollama: OllamaClient::new(),
-            openrouter: OpenRouterClient::new(),
-            #[cfg(feature = "candle")]
-            candle: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
-            #[cfg(feature = "candle")]
-            candle_config: None,
-        }
-    }
 }
 
 impl Clone for LlmRouter {
@@ -446,10 +446,21 @@ impl LlmRouter {
         match primary {
             #[cfg(feature = "candle")]
             Provider::Candle => {
-                let mut guard = self.get_candle().await?;
-                let backend = guard.as_mut().expect("candle loaded");
-                let text = backend.generate(prompt, backend.config.max_seq_len).await?;
-                Ok((Provider::Candle, text))
+                let candle_result: Result<String> = async {
+                    let mut guard = self.get_candle().await?;
+                    let backend = guard.as_mut().expect("candle loaded");
+                    backend.generate(prompt, backend.config.max_seq_len).await
+                }.await;
+                match candle_result {
+                    Ok(text) => Ok((Provider::Candle, text)),
+                    Err(err) => {
+                        tracing::warn!(?err, "candle inference failed, falling back to ollama");
+                        Ok((
+                            Provider::Ollama,
+                            self.ollama.chat_model(ollama_model, prompt).await?,
+                        ))
+                    }
+                }
             }
             #[cfg(not(feature = "candle"))]
             Provider::Candle => {
@@ -483,11 +494,24 @@ impl LlmRouter {
         match primary {
             #[cfg(feature = "candle")]
             Provider::Candle => {
-                let mut guard = self.get_candle().await?;
-                let backend = guard.as_mut().expect("candle loaded");
-                let text = backend.generate(prompt, backend.config.max_seq_len).await?;
-                let _ = tx.send(text.clone()).await;
-                Ok((Provider::Candle, text))
+                let candle_result: Result<String> = async {
+                    let mut guard = self.get_candle().await?;
+                    let backend = guard.as_mut().expect("candle loaded");
+                    backend.generate(prompt, backend.config.max_seq_len).await
+                }.await;
+                match candle_result {
+                    Ok(text) => {
+                        let _ = tx.send(text.clone()).await;
+                        Ok((Provider::Candle, text))
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "candle inference failed, falling back to ollama (stream)");
+                        Ok((
+                            Provider::Ollama,
+                            self.ollama.chat_model_stream(ollama_model, prompt, tx).await?,
+                        ))
+                    }
+                }
             }
             #[cfg(not(feature = "candle"))]
             Provider::Candle => {

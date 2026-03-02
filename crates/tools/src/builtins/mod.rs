@@ -186,7 +186,7 @@ impl Tool for RemindMeTool {
         file.set_len(0)?;
         file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(rendered.as_bytes())?;
-        file.unlock()?;
+        drop(file);
 
         let when_note = args.get("when").filter(|s| !s.is_empty())
             .map(|w| format!(" (when: {w})"))

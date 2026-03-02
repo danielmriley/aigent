@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-candle = ["aigent-llm/candle", "aigent-runtime/candle"]
+candle = ["aigent-llm/candle", "aigent-runtime/candle", "aigent-ui/candle", "aigent-telegram/candle"]
 qdrant = ["aigent-memory/qdrant"]
 tui-advanced = ["aigent-ui/advanced"]
 uutils = ["aigent-exec/uutils"]

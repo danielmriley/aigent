@@ -468,12 +468,21 @@ pub(crate) fn parse_model_provider_from_command(line: &str) -> CliModelProvider 
 
 pub(crate) async fn update_model_provider(raw: &str, daemon: &DaemonClient) -> Result<String> {
     let provider = raw.trim().to_lowercase();
-    if provider != "ollama" && provider != "openrouter" && provider != "candle" {
+    let valid = if cfg!(feature = "candle") {
+        provider == "ollama" || provider == "openrouter" || provider == "candle"
+    } else {
+        provider == "ollama" || provider == "openrouter"
+    };
+    if !valid {
+        if provider == "candle" {
+            bail!("candle support not enabled — rebuild with --features candle");
+        }
         bail!("invalid provider, expected ollama, openrouter, or candle");
     }
 
     let mut config = AppConfig::load_from("config/default.toml")?;
     config.llm.provider = provider.clone();
+    config.inference.candle_enabled = provider == "candle";
     config.save_to("config/default.toml")?;
     daemon.reload_config().await?;
     let status = daemon.get_status().await?;
@@ -494,7 +503,14 @@ pub(crate) async fn update_model_selection(raw: &str, daemon: &DaemonClient) -> 
     if config.llm.provider.eq_ignore_ascii_case("openrouter") {
         config.llm.openrouter_model = model.to_string();
     } else if config.llm.provider.eq_ignore_ascii_case("candle") {
-        config.inference.candle_model_repo = model.to_string();
+        let parts: Vec<&str> = model.splitn(3, ' ').collect();
+        config.inference.candle_model_repo = parts[0].to_string();
+        if let Some(&file) = parts.get(1) {
+            config.inference.candle_model_file = file.to_string();
+        }
+        if let Some(&device) = parts.get(2) {
+            config.inference.candle_device = device.to_string();
+        }
     } else {
         config.llm.ollama_model = model.to_string();
     }

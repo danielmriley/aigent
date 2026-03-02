@@ -168,11 +168,7 @@ pub(super) async fn handle_connection(
                     Some(crate::tool_loop::build_tools_json(&tool_specs))
                 };
 
-                let primary = match rt_clone.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => aigent_llm::Provider::OpenRouter,
-                    "candle" => aigent_llm::Provider::Candle,
-                    _ => aigent_llm::Provider::Ollama,
-                };
+                let primary = aigent_llm::Provider::from(rt_clone.config.llm.provider.as_str());
 
                 // Run the structured tool loop — registry/executor are Arc-cloned
                 // so we do NOT hold the DaemonState lock during LLM calls.
@@ -316,7 +312,7 @@ pub(super) async fn handle_connection(
                                     let mut s = state2.lock().await;
                                     match gen_result {
                                         Ok(crate::SleepGenerationResult::Insights(insights)) => {
-                                            match s.memory.apply_agentic_sleep_insights(insights, Some("auto-turn sleep".into())).await {
+                                            match s.memory.apply_agentic_sleep_insights(*insights, Some("auto-turn sleep".into())).await {
                                                 Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
                                                 Err(ref err) => warn!(?err, "auto-turn sleep apply failed"),
                                             }
@@ -624,7 +620,7 @@ pub(super) async fn handle_connection(
                                 let mut s = state2.lock().await;
                                 match gen_result {
                                     Ok(crate::SleepGenerationResult::Insights(insights)) => {
-                                        match s.memory.apply_agentic_sleep_insights(insights, Some("auto-turn sleep".into())).await {
+                                        match s.memory.apply_agentic_sleep_insights(*insights, Some("auto-turn sleep".into())).await {
                                             Ok(ref sum) => info!(summary = %sum.distilled, "auto-turn sleep complete"),
                                             Err(ref err) => warn!(?err, "auto-turn sleep apply failed"),
                                         }
@@ -831,7 +827,7 @@ pub(super) async fn handle_connection(
                             match gen_result {
                                 Ok(crate::SleepGenerationResult::Insights(insights)) => {
                                     let summary_text = Some("User-triggered sleep cycle".into());
-                                    match s.memory.apply_agentic_sleep_insights(insights, summary_text).await {
+                                    match s.memory.apply_agentic_sleep_insights(*insights, summary_text).await {
                                         Ok(summary) => {
                                             let _ = s.memory.record(
                                                 aigent_memory::MemoryTier::Semantic,
@@ -893,7 +889,7 @@ pub(super) async fn handle_connection(
                             match gen_result {
                                 Ok(crate::SleepGenerationResult::Insights(insights)) => {
                                     let summary_text = Some("Multi-agent sleep cycle".into());
-                                    match s.memory.apply_agentic_sleep_insights(insights, summary_text).await {
+                                    match s.memory.apply_agentic_sleep_insights(*insights, summary_text).await {
                                         Ok(summary) => {
                                             let _ = s.memory.record(
                                                 aigent_memory::MemoryTier::Semantic,
@@ -989,11 +985,7 @@ pub(super) async fn handle_connection(
                 Some(crate::tool_loop::build_tools_json(&tool_specs))
             };
 
-            let primary = match rt_clone.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => aigent_llm::Provider::OpenRouter,
-                    "candle" => aigent_llm::Provider::Candle,
-                    _ => aigent_llm::Provider::Ollama,
-                };
+            let primary = aigent_llm::Provider::from(rt_clone.config.llm.provider.as_str());
 
             let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);
             tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });

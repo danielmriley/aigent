@@ -26,11 +26,7 @@ impl AgentRuntime {
         user_message: &str,
         assistant_reply: &str,
     ) -> Result<Vec<BackendEvent>> {
-        let primary = match self.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => Provider::OpenRouter,
-                    "candle" => Provider::Candle,
-                    _ => Provider::Ollama,
-                };
+        let primary = Provider::from(self.config.llm.provider.as_str());
 
         let prompt = format!(
             "You are a silent memory analyst.  Given the exchange below, extract up to 3 \

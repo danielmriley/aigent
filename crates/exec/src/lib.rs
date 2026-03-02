@@ -297,7 +297,7 @@ impl ToolExecutor {
         // Security level ceiling — check per-tool override first, then global.
         let effective_max = self.policy.tool_overrides.get(tool_name)
             .and_then(|ovr| ovr.max_security_level.as_deref())
-            .map(|s| parse_security_level_str(s))
+            .map(parse_security_level_str)
             .unwrap_or(self.policy.max_security_level);
         if !security_level_permitted(metadata.security_level, effective_max) {
             bail!(
@@ -509,6 +509,7 @@ fn parse_security_level_str(s: &str) -> SecurityLevel {
 
 // ── Convenience: create a default registry with built-in tools ───────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn default_registry(
     workspace_root: PathBuf,
     agent_data_dir: PathBuf,

@@ -30,7 +30,7 @@ use super::AgentRuntime;
 ///     passive distillation inside the MemoryManager, so the summary is final.
 pub enum SleepGenerationResult {
     /// Structured insights produced by the LLM (single-agent or multi-agent).
-    Insights(AgenticSleepInsights),
+    Insights(Box<AgenticSleepInsights>),
     /// LLM was unavailable — passive heuristic distillation was applied
     /// directly and this is the resulting summary.
     PassiveFallback(SleepSummary),
@@ -51,11 +51,7 @@ impl AgentRuntime {
         identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
     ) -> Result<SleepGenerationResult> {
-        let primary = match self.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => Provider::OpenRouter,
-                    "candle" => Provider::Candle,
-                    _ => Provider::Ollama,
-                };
+        let primary = Provider::from(self.config.llm.provider.as_str());
 
         let _ = progress.send("Reflecting on today's memories…".into());
         let (bot_name, user_name) = (&self.config.agent.name, &self.config.agent.user_name);
@@ -78,7 +74,7 @@ impl AgentRuntime {
                 info!(reply_len = reply.len(), "agentic sleep: LLM reply received");
                 let insights = parse_agentic_insights(&reply);
                 let _ = progress.send("Insights generated — ready to apply to memory.".into());
-                Ok(SleepGenerationResult::Insights(insights))
+                Ok(SleepGenerationResult::Insights(Box::new(insights)))
             }
             Err(err) => {
                 warn!(?err, "agentic sleep: LLM unavailable — caller should run passive distillation");
@@ -151,11 +147,7 @@ impl AgentRuntime {
         identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
     ) -> Result<SleepGenerationResult> {
-        let primary = match self.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => Provider::OpenRouter,
-                    "candle" => Provider::Candle,
-                    _ => Provider::Ollama,
-                };
+        let primary = Provider::from(self.config.llm.provider.as_str());
 
         let batch_size = self.config.memory.multi_agent_sleep_batch_size;
         let batches = batch_memories(memories, batch_size);
@@ -380,7 +372,7 @@ impl AgentRuntime {
             final_insights.reflective_thoughts.len(),
         ));
 
-        Ok(SleepGenerationResult::Insights(final_insights))
+        Ok(SleepGenerationResult::Insights(Box::new(final_insights)))
     }
 
 }

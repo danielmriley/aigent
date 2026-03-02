@@ -59,6 +59,8 @@ pub(super) enum WizardStep {
     DataDirectory,
     Provider,
     Model,
+    CandleModelFile,
+    CandleDevice,
     OpenRouterKey,
     Thinking,
     NightSleepStart,
@@ -81,6 +83,8 @@ impl WizardStep {
                 | WizardStep::UserName
                 | WizardStep::DataDirectory
                 | WizardStep::OpenRouterKey
+                | WizardStep::CandleModelFile
+                | WizardStep::CandleDevice
                 | WizardStep::ApiKeys
                 | WizardStep::NightSleepStart
                 | WizardStep::NightSleepEnd
@@ -99,6 +103,8 @@ pub(super) struct OnboardingDraft {
     pub(super) ollama_model: String,
     pub(super) openrouter_model: String,
     pub(super) candle_model_repo: String,
+    pub(super) candle_model_file: String,
+    pub(super) candle_device: String,
     pub(super) openrouter_key: String,
     pub(super) thinking_level: String,
     pub(super) night_sleep_start_hour: u8,
@@ -124,6 +130,8 @@ impl OnboardingDraft {
             ollama_model: config.llm.ollama_model.clone(),
             openrouter_model: config.llm.openrouter_model.clone(),
             candle_model_repo: config.inference.candle_model_repo.clone(),
+            candle_model_file: config.inference.candle_model_file.clone(),
+            candle_device: config.inference.candle_device.clone(),
             openrouter_key: String::new(),
             thinking_level: config.agent.thinking_level.clone(),
             night_sleep_start_hour: config.memory.night_sleep_start_hour,
@@ -162,6 +170,8 @@ impl OnboardingDraft {
                     self.ollama_model.clone()
                 }
             }
+            WizardStep::CandleModelFile => self.candle_model_file.clone(),
+            WizardStep::CandleDevice => self.candle_device.clone(),
             WizardStep::OpenRouterKey => self.openrouter_key.clone(),
             WizardStep::Thinking => self.thinking_level.clone(),
             WizardStep::NightSleepStart => self.night_sleep_start_hour.to_string(),
@@ -223,6 +233,16 @@ impl OnboardingDraft {
                 } else {
                     self.ollama_model = value.to_string();
                 }
+            }
+            WizardStep::CandleModelFile => {
+                if value.is_empty() {
+                    bail!("GGUF file name cannot be empty");
+                }
+                self.candle_model_file = value.to_string();
+            }
+            WizardStep::CandleDevice => {
+                let dev = if value.is_empty() { "cpu" } else { value };
+                self.candle_device = dev.to_string();
             }
             WizardStep::OpenRouterKey => {
                 self.openrouter_key = value.to_string();
@@ -400,6 +420,10 @@ impl OnboardingDraft {
         if self.provider.eq_ignore_ascii_case("candle") {
             config.inference.candle_enabled = true;
             config.inference.candle_model_repo = self.candle_model_repo.clone();
+            config.inference.candle_model_file = self.candle_model_file.clone();
+            config.inference.candle_device = self.candle_device.clone();
+            config.inference.candle_model_file = self.candle_model_file.clone();
+            config.inference.candle_device = self.candle_device.clone();
         }
         config.agent.thinking_level = super::wizard::normalize_thinking_level(&self.thinking_level)?;
         config.memory.night_sleep_start_hour = self.night_sleep_start_hour;
@@ -468,10 +492,14 @@ pub(super) fn next_step(current: WizardStep, draft: &OnboardingDraft, mode: Setu
             (ConfigSection::Llm, WizardStep::Model) => {
                 if draft.provider.eq_ignore_ascii_case("openrouter") {
                     WizardStep::OpenRouterKey
+                } else if draft.provider.eq_ignore_ascii_case("candle") {
+                    WizardStep::CandleModelFile
                 } else {
                     WizardStep::ConfigMenu
                 }
             }
+            (ConfigSection::Llm, WizardStep::CandleModelFile) => WizardStep::CandleDevice,
+            (ConfigSection::Llm, WizardStep::CandleDevice) => WizardStep::ConfigMenu,
             (ConfigSection::Llm, WizardStep::OpenRouterKey) => WizardStep::ConfigMenu,
 
             (ConfigSection::Telegram, WizardStep::ConfigMenu) => WizardStep::Messaging,
@@ -508,10 +536,14 @@ pub(super) fn next_step(current: WizardStep, draft: &OnboardingDraft, mode: Setu
         WizardStep::Model => {
             if draft.provider.eq_ignore_ascii_case("openrouter") {
                 WizardStep::OpenRouterKey
+            } else if draft.provider.eq_ignore_ascii_case("candle") {
+                WizardStep::CandleModelFile
             } else {
                 WizardStep::Thinking
             }
         }
+        WizardStep::CandleModelFile => WizardStep::CandleDevice,
+        WizardStep::CandleDevice => WizardStep::Thinking,
         WizardStep::OpenRouterKey => WizardStep::Thinking,
         WizardStep::Thinking => WizardStep::NightSleepStart,
         WizardStep::NightSleepStart => WizardStep::NightSleepEnd,
@@ -566,10 +598,14 @@ pub(super) fn prev_step(current: WizardStep, draft: &OnboardingDraft, mode: Setu
         WizardStep::DataDirectory => WizardStep::BotName,
         WizardStep::Provider => WizardStep::DataDirectory,
         WizardStep::Model => WizardStep::Provider,
+        WizardStep::CandleModelFile => WizardStep::Model,
+        WizardStep::CandleDevice => WizardStep::CandleModelFile,
         WizardStep::OpenRouterKey => WizardStep::Model,
         WizardStep::Thinking => {
             if draft.provider.eq_ignore_ascii_case("openrouter") {
                 WizardStep::OpenRouterKey
+            } else if draft.provider.eq_ignore_ascii_case("candle") {
+                WizardStep::CandleDevice
             } else {
                 WizardStep::Model
             }

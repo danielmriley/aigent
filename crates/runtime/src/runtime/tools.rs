@@ -73,11 +73,7 @@ impl AgentRuntime {
              JSON RESPONSE:"
         );
 
-        let primary = match self.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => Provider::OpenRouter,
-                    "candle" => Provider::Candle,
-                    _ => Provider::Ollama,
-                };
+        let primary = Provider::from(self.config.llm.provider.as_str());
 
         let Ok((_provider, raw)) = self
             .llm
@@ -107,10 +103,6 @@ impl AgentRuntime {
         info!(tool = %call.tool, args = ?call.args, "maybe_tool_call: LLM requested tool");
         Some(call)
     }
-
-    /// Legacy single-shot turn helper. Callers should use the server path
-    /// (`respond_and_remember_stream` via `DaemonClient`) for persistent memory.
-    /// This stub exists to avoid breaking call-sites; it does NOT persist memory.
 
     /// Legacy single-shot turn helper. Callers should use the server path
     /// (`respond_and_remember_stream` via `DaemonClient`) for persistent memory.
@@ -280,7 +272,7 @@ mod tests {
             Ok(crate::SleepGenerationResult::Insights(insights)) => {
                 // Apply insights to prove the end-to-end flow doesn't panic.
                 let summary_text = Some("test multi-agent cycle".to_string());
-                let summary = memory.apply_agentic_sleep_insights(insights, summary_text).await?;
+                let summary = memory.apply_agentic_sleep_insights(*insights, summary_text).await?;
                 assert!(
                     !summary.distilled.is_empty() || !summary.promoted_ids.is_empty(),
                     "summary should contain some output"

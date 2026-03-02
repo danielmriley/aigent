@@ -98,7 +98,7 @@ impl Tool for CalendarAddEventTool {
         file.set_len(0)?;
         file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(rendered.as_bytes())?;
-        file.unlock()?;
+        drop(file);
 
         Ok(ToolOutput {
             success: true,

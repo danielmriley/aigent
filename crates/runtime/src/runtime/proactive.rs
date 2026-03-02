@@ -18,11 +18,7 @@ impl AgentRuntime {
         beliefs_summary: &str,
         reflections_summary: &str,
     ) -> Option<ProactiveOutput> {
-        let primary = match self.config.llm.provider.to_lowercase().as_str() {
-                    "openrouter" => Provider::OpenRouter,
-                    "candle" => Provider::Candle,
-                    _ => Provider::Ollama,
-                };
+        let primary = Provider::from(self.config.llm.provider.as_str());
 
         let prompt = format!(
             "You are {name}, an AI companion.  Based on your current beliefs and recent \

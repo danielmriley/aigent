@@ -1837,8 +1837,6 @@ New `[inference]` section in `config/default.toml`:
 | `candle_top_p` | `f64` | `0.9` | Nucleus sampling top-p |
 | `candle_repeat_penalty` | `f32` | `1.1` | Repetition penalty |
 | `candle_device` | `String` | `"cpu"` | Device: `"cpu"`, `"cuda"`, or `"metal"` |
-| `candle_complexity_threshold` | `f32` | `0.6` | Complexity threshold for routing |
-| `candle_fast_tools` | `Vec<String>` | `[]` | Tool names always routed to candle |
 
 All fields have serde defaults — existing configs work unchanged.
 
@@ -1858,21 +1856,50 @@ Without the feature enabled, all Candle code is compiled out. Zero runtime overh
 |---|---|
 | `/model provider candle` | Switch to local Candle inference |
 | `/model list candle` | Show configured Candle model |
-| `/model set <repo>` | When provider is candle, updates `candle_model_repo` |
+| `/model set <repo> <file> [device]` | Set model repo, GGUF file, and optional device (cpu/cuda/metal) |
 
 ### Provider Resolution
 
-All provider detection points now use a three-way match:
+Provider detection uses `impl From<&str> for Provider` (case-insensitive):
 - `"openrouter"` → `Provider::OpenRouter`
 - `"candle"` → `Provider::Candle`
 - `_` (default) → `Provider::Ollama`
 
+### Fallback Behavior
+
+When `Provider::Candle` is the primary provider:
+- On success → returns the Candle response
+- On error → logs a warning and **automatically falls back to Ollama**
+- This matches the existing Ollama → OpenRouter fallback pattern
+
+### Feature Flag Safety
+
+The `candle` provider is **hidden from all UIs** when not compiled with `--features candle`:
+- CLI: `/model provider candle` returns a helpful error message
+- TUI: onboarding wizard omits "candle" from provider list
+- Telegram: `/model list candle` is suppressed
+
+Feature forwarding chain: `aigent-app` → `aigent-ui`, `aigent-telegram`, `aigent-runtime` → `aigent-llm`.
+
+### GGUF Model File & Device Selection
+
+All interfaces now prompt for both the **GGUF file name** and **compute device**:
+- CLI: `/model set <repo> <file> [device]` (e.g., `/model set Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF qwen2.5-coder-1.5b-instruct-q4_k_m.gguf cuda`)
+- TUI wizard: dedicated steps for "GGUF Model File" and "Compute Device" (cpu/cuda/metal)
+
 ### New Types
 
 - `Provider::Candle` — variant added to `aigent_llm::Provider` enum
+- `impl From<&str> for Provider` — DRY provider string resolution
 - `InferenceConfig` — configuration struct in `aigent_config`
 - `LlmRouter::with_candle_config()` — builder method (cfg-gated)
 - `LlmRouter::candle_chat()` — ChatML prompt dispatch (cfg-gated)
+
+### Removed Config Fields
+
+The following fields were removed as unnecessary:
+- `candle_complexity_threshold` — prompt routing is not needed for single-backend inference
+- `candle_fast_tools` — all tools now use the same inference path
 
 ### Backward Compatibility
 
