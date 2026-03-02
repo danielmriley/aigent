@@ -73,11 +73,11 @@ impl AgentRuntime {
              JSON RESPONSE:"
         );
 
-        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
-            Provider::OpenRouter
-        } else {
-            Provider::Ollama
-        };
+        let primary = match self.config.llm.provider.to_lowercase().as_str() {
+                    "openrouter" => Provider::OpenRouter,
+                    "candle" => Provider::Candle,
+                    _ => Provider::Ollama,
+                };
 
         let Ok((_provider, raw)) = self
             .llm

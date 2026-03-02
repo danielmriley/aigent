@@ -51,11 +51,11 @@ impl AgentRuntime {
         identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
     ) -> Result<SleepGenerationResult> {
-        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
-            Provider::OpenRouter
-        } else {
-            Provider::Ollama
-        };
+        let primary = match self.config.llm.provider.to_lowercase().as_str() {
+                    "openrouter" => Provider::OpenRouter,
+                    "candle" => Provider::Candle,
+                    _ => Provider::Ollama,
+                };
 
         let _ = progress.send("Reflecting on today's memories…".into());
         let (bot_name, user_name) = (&self.config.agent.name, &self.config.agent.user_name);
@@ -151,11 +151,11 @@ impl AgentRuntime {
         identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
     ) -> Result<SleepGenerationResult> {
-        let primary = if self.config.llm.provider.to_lowercase() == "openrouter" {
-            Provider::OpenRouter
-        } else {
-            Provider::Ollama
-        };
+        let primary = match self.config.llm.provider.to_lowercase().as_str() {
+                    "openrouter" => Provider::OpenRouter,
+                    "candle" => Provider::Candle,
+                    _ => Provider::Ollama,
+                };
 
         let batch_size = self.config.memory.multi_agent_sleep_batch_size;
         let batches = batch_memories(memories, batch_size);

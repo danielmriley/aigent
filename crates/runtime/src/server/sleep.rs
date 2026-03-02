@@ -439,11 +439,11 @@ pub(super) fn spawn_proactive_task(
                 Some(crate::tool_loop::build_tools_json(&tool_specs))
             };
 
-            let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
-                aigent_llm::Provider::OpenRouter
-            } else {
-                aigent_llm::Provider::Ollama
-            };
+            let primary = match rt_clone.config.llm.provider.to_lowercase().as_str() {
+                    "openrouter" => aigent_llm::Provider::OpenRouter,
+                    "candle" => aigent_llm::Provider::Candle,
+                    _ => aigent_llm::Provider::Ollama,
+                };
 
             // Create a sink channel — proactive tokens are NOT shown to the user.
             let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);

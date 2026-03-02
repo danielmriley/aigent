@@ -170,6 +170,7 @@ dependencies = [
 name = "aigent-telegram"
 version = "0.1.0"
 dependencies = [
+ "aigent-config",
  "aigent-llm",
  "aigent-memory",
  "aigent-runtime",

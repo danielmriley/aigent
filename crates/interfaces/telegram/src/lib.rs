@@ -127,7 +127,7 @@ async fn handle_telegram_input(
             "/context",
             "/model show",
             "/model list [ollama|openrouter]",
-            "/model provider <ollama|openrouter>",
+            "/model provider <ollama|openrouter|candle>",
             "/model set <model>",
             "/model test",
             "/think <low|balanced|deep>",
@@ -372,6 +372,7 @@ enum ModelProviderFilter {
     All,
     Ollama,
     Openrouter,
+    Candle,
 }
 
 fn parse_model_provider_from_command(line: &str) -> ModelProviderFilter {
@@ -382,6 +383,9 @@ fn parse_model_provider_from_command(line: &str) -> ModelProviderFilter {
         }
         if provider == "openrouter" {
             return ModelProviderFilter::Openrouter;
+        }
+        if provider == "candle" {
+            return ModelProviderFilter::Candle;
         }
     }
     ModelProviderFilter::All
@@ -406,6 +410,12 @@ async fn collect_model_lines(provider: ModelProviderFilter) -> Result<Vec<String
         let openrouter = list_openrouter_models().await?;
         lines.push(format!("openrouter models ({})", openrouter.len()));
         lines.extend(openrouter.into_iter().map(|model| format!("- {model}")));
+    }
+
+    if matches!(provider, ModelProviderFilter::All | ModelProviderFilter::Candle) {
+        let config = aigent_config::AppConfig::load_from("config/default.toml")?;
+        lines.push("candle models (configured)".to_string());
+        lines.push(format!("- {} ({})", config.inference.candle_model_repo, config.inference.candle_model_file));
     }
 
     Ok(lines)
