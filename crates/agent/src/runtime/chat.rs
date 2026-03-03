@@ -1,7 +1,7 @@
 //! Conversation turn handling — respond, remember, and stream.
 
 use uuid::Uuid;
-use anyhow::Result;
+use crate::AgentResult;
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, instrument, warn};
 use tokio::sync::mpsc;
@@ -19,7 +19,7 @@ impl AgentRuntime {
         memory: &mut MemoryManager,
         user_message: &str,
         recent_turns: &[ConversationTurn],
-    ) -> Result<String> {
+    ) -> AgentResult<String> {
         let (tx, _rx) = mpsc::channel(100);
         self.respond_and_remember_stream(memory, user_message, recent_turns, None, tx, &[])
             .await
@@ -34,7 +34,7 @@ impl AgentRuntime {
         last_turn_at: Option<DateTime<Utc>>,
         tx: mpsc::Sender<String>,
         tool_specs: &[aigent_tools::ToolSpec],
-    ) -> Result<String> {
+    ) -> AgentResult<String> {
         let primary = Provider::from(self.config.llm.provider.as_str());
 
         // Persist the user turn immediately so it survives a restart.

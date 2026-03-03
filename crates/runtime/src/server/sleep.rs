@@ -245,7 +245,7 @@ pub(super) fn spawn_nightly_consolidation(
                         elapsed_secs = llm_start.elapsed().as_secs(),
                         "nightly consolidation: timed out after 10 minutes"
                     );
-                    Err(anyhow::anyhow!("nightly consolidation timed out"))
+                    Err(crate::AgentError::Sleep(anyhow::anyhow!("nightly consolidation timed out")))
                 }
             };
 

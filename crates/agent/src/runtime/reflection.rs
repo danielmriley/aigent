@@ -1,6 +1,6 @@
 //! Inline post-turn reflection — extract beliefs, sentiments, and follow-ups.
 
-use anyhow::Result;
+use crate::AgentResult;
 use tracing::{debug, warn};
 use aigent_llm::{Provider, extract_json_output};
 use aigent_memory::{MemoryManager, MemoryTier};
@@ -25,7 +25,7 @@ impl AgentRuntime {
         memory: &mut MemoryManager,
         user_message: &str,
         assistant_reply: &str,
-    ) -> Result<Vec<BackendEvent>> {
+    ) -> AgentResult<Vec<BackendEvent>> {
         let primary = Provider::from(self.config.llm.provider.as_str());
 
         let prompt = format!(

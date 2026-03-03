@@ -6,9 +6,14 @@
 //! global state.
 
 pub mod agent_loop;
+mod error;
 mod events;
 pub mod micro_profile;
 mod runtime;
+
+// ── Error types ───────────────────────────────────────────────────────────────
+
+pub use error::{AgentError, AgentResult};
 
 // ── Agent loop types ──────────────────────────────────────────────────────────
 

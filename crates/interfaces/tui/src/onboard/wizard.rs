@@ -97,7 +97,7 @@ pub(super) fn test_llm_connection_for_draft(draft: &OnboardingDraft) -> Result<S
     draft.apply_partial(&mut config)?;
     let runtime = AgentRuntime::new(config);
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(runtime.test_model_connection())
+    Ok(rt.block_on(runtime.test_model_connection())?)
 }
 
 pub(super) fn test_telegram_connection(token: &str) -> Result<()> {

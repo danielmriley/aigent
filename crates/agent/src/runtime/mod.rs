@@ -8,7 +8,7 @@ mod tools;
 
 pub use sleep::SleepGenerationResult;
 
-use anyhow::Result;
+use crate::AgentResult;
 
 use aigent_config::AppConfig;
 use aigent_llm::{LlmRouter, Provider};
@@ -58,11 +58,11 @@ impl AgentRuntime {
         Self { config, llm }
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self) -> AgentResult<()> {
         Ok(())
     }
 
-    pub async fn test_model_connection(&self) -> Result<String> {
+    pub async fn test_model_connection(&self) -> AgentResult<String> {
         let primary = Provider::from(self.config.llm.provider.as_str());
 
         let prompt = format!(

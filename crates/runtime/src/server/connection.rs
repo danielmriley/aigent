@@ -455,7 +455,7 @@ pub(super) async fn handle_connection(
             };
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
             let (done_tx, mut done_rx) =
-                tokio::sync::oneshot::channel::<Result<crate::SleepGenerationResult, anyhow::Error>>();
+                tokio::sync::oneshot::channel::<crate::AgentResult<crate::SleepGenerationResult>>();
             tokio::spawn(async move {
                 let result = runtime
                     .generate_multi_agent_sleep_insights(&memories, &identity, &progress_tx)
@@ -517,7 +517,7 @@ pub(super) async fn handle_connection(
             };
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<String>();
             let (done_tx, mut done_rx) =
-                tokio::sync::oneshot::channel::<Result<crate::SleepGenerationResult, anyhow::Error>>();
+                tokio::sync::oneshot::channel::<crate::AgentResult<crate::SleepGenerationResult>>();
             tokio::spawn(async move {
                 let result = runtime
                     .generate_multi_agent_sleep_insights(&memories, &identity, &progress_tx)

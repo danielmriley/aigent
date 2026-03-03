@@ -7,7 +7,7 @@
 //! insights via `memory.apply_agentic_sleep_insights(...)` once it
 //! re-acquires mutable access.
 
-use anyhow::Result;
+use crate::AgentResult;
 use tracing::{info, instrument, warn};
 use tokio::sync::mpsc;
 use aigent_llm::{Provider};
@@ -50,7 +50,7 @@ impl AgentRuntime {
         memories: &[MemoryEntry],
         identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
-    ) -> Result<SleepGenerationResult> {
+    ) -> AgentResult<SleepGenerationResult> {
         let primary = Provider::from(self.config.llm.provider.as_str());
 
         let _ = progress.send("Reflecting on today's memories…".into());
@@ -146,7 +146,7 @@ impl AgentRuntime {
         memories: &[MemoryEntry],
         identity: &IdentityKernel,
         progress: &mpsc::UnboundedSender<String>,
-    ) -> Result<SleepGenerationResult> {
+    ) -> AgentResult<SleepGenerationResult> {
         let primary = Provider::from(self.config.llm.provider.as_str());
 
         let batch_size = self.config.memory.multi_agent_sleep_batch_size;
