@@ -431,6 +431,7 @@ pub(super) fn spawn_proactive_task(
                 beliefs_block,
                 user_name,
                 relational_block,
+                conversation_summary: None,
             };
             let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
 

@@ -31,4 +31,4 @@ pub use aigent_thinker::{ToolCallInfo, ToolResult};
 
 // ── Runtime types ─────────────────────────────────────────────────────────────
 
-pub use runtime::{AgentRuntime, ConversationTurn, SleepGenerationResult};
+pub use runtime::{AgentRuntime, ConversationTurn, SleepGenerationResult, SUMMARIZE_THRESHOLD};

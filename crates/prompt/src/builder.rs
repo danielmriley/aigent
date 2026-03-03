@@ -32,6 +32,9 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     let environment_block =
         build_environment_block(config, &inputs.stats, inputs.recent_turns.len());
     let conversation_block = build_conversation_block(inputs.recent_turns);
+    let prior_summary = inputs.conversation_summary.as_deref()
+        .map(|s| format!("PRIOR CONVERSATION SUMMARY:\n{s}\n\n         "))
+        .unwrap_or_default();
     // When external_thinking is active, suppress the prose tool-awareness and
     // autonomy directives — they conflict with the strict JSON-only instructions
     // appended below by build_external_thinking_block, which lists tools in its
@@ -69,7 +72,7 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
          {relational_block}{follow_ups}{proactive_directive}\n\n\
          {identity}{beliefs}{tools_section}\n\n\
          ENVIRONMENT CONTEXT:\n{env}\n\n\
-         RECENT CONVERSATION:\n{conv}\n\n\
+         {prior_summary}RECENT CONVERSATION:\n{conv}\n\n\
          MEMORY CONTEXT:\n{mem}\n\n\
          {ext_think}\
          LATEST USER MESSAGE:\n{msg}{response_tag}",
@@ -83,6 +86,7 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
         tools_section = tools_section,
         env = environment_block,
         conv = conversation_block,
+        prior_summary = prior_summary,
         mem = context_block,
         ext_think = if config.agent.external_thinking {
             aigent_thinker::build_external_thinking_block(inputs.tool_specs)

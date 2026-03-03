@@ -5,8 +5,10 @@ mod proactive;
 mod reflection;
 mod sleep;
 mod tools;
+mod summarize;
 
 pub use sleep::SleepGenerationResult;
+pub use summarize::SUMMARIZE_THRESHOLD;
 
 use crate::AgentResult;
 
