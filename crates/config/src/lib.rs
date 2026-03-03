@@ -62,7 +62,7 @@ impl Default for AgentConfig {
 }
 
 fn default_step_timeout_seconds() -> u64 {
-    12
+    120
 }
 
 fn default_max_steps_per_turn() -> usize {

@@ -171,12 +171,12 @@ fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> Strin
 
     // ── Anti-internal-thinking directive ─────────────────────────────────
     // When external thinking is active the LLM backend receives
-    // `disable_native_thinking = true` (Ollama's `"think": false`).
-    // This prompt reinforcement is a safety-net for models that still
-    // attempt thinking despite the API flag.
+    // `"think": false` in every Ollama payload (set automatically from config
+    // via `suppress_thinking`).  This prompt reinforcement is a safety-net
+    // for models that still attempt thinking despite the API flag.
     buf.push_str(
         "\nINTERNAL THINKING IS DISABLED.\n\
-         Do not output <think> tags or any reasoning preamble.\n\
+         You MUST NOT think step-by-step or output any <think> tags.\n\
          Output ONLY the exact JSON structure required.\n",
     );
 
