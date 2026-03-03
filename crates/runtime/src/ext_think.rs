@@ -337,36 +337,14 @@ pub async fn run_external_thinking_loop(
                 ].iter().any(|p| thought_lc.contains(p));
 
                 // (b) Hallucinated-fact detector — does the answer contain
-                //     date/time patterns or file paths that the model should
-                //     have verified with a tool?
-                let has_date_pattern = answer_lc.contains("january")
-                    || answer_lc.contains("february")
-                    || answer_lc.contains("march")
-                    || answer_lc.contains("april")
-                    || answer_lc.contains("may 2")     // avoid "may" alone
-                    || answer_lc.contains("june")
-                    || answer_lc.contains("july")
-                    || answer_lc.contains("august")
-                    || answer_lc.contains("september")
-                    || answer_lc.contains("october")
-                    || answer_lc.contains("november")
-                    || answer_lc.contains("december")
-                    || answer_lc.contains("2024")
-                    || answer_lc.contains("2025")
-                    || answer_lc.contains("2026")
-                    || answer_lc.contains("today is")
-                    || answer_lc.contains("monday")
-                    || answer_lc.contains("tuesday")
-                    || answer_lc.contains("wednesday")
-                    || answer_lc.contains("thursday")
-                    || answer_lc.contains("friday")
-                    || answer_lc.contains("saturday")
-                    || answer_lc.contains("sunday");
+                //     file paths that the model should have verified with a
+                //     tool?  Date/time patterns are NOT flagged because
+                //     CURRENT_DATETIME is now injected into the prompt.
                 let has_file_path = answer_lc.contains("/home/")
                     || answer_lc.contains("/usr/")
                     || answer_lc.contains("/tmp/")
                     || answer_lc.contains("/etc/");
-                let answer_has_factual_claims = has_date_pattern || has_file_path;
+                let answer_has_factual_claims = has_file_path;
 
                 // Trigger challenge if:
                 //  - passive resignation detected (any step), OR
@@ -402,10 +380,8 @@ pub async fn run_external_thinking_loop(
                          RULES:\n\
                          - If a tool can fetch/verify facts, you MUST call it.\n\
                          - Saying you lack real-time access when run_shell exists is a FAILURE.\n\
-                         - Dates, times, file contents, system info → ALWAYS use a tool.\n\n\
-                         For the current date/time, output EXACTLY:\n\
-                         {{\"type\":\"tool_call\",\"thought\":\"I will use run_shell to get the date.\",\
-                         \"tool_call\":{{\"name\":\"run_shell\",\"args\":{{\"command\":\"date\"}}}}}}\n\n\
+                         - File contents, system info, web lookups → ALWAYS use a tool.\n\
+                         - For date/time, use CURRENT_DATETIME from the prompt.\n\n\
                          For file listing:\n\
                          {{\"type\":\"tool_call\",\"thought\":\"I will list files.\",\
                          \"tool_call\":{{\"name\":\"run_shell\",\"args\":{{\"command\":\"ls -la\"}}}}}}\n\n\
