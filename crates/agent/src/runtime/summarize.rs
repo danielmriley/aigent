@@ -100,3 +100,40 @@ impl AgentRuntime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aigent_config::AppConfig;
+
+    fn make_runtime() -> AgentRuntime {
+        AgentRuntime::new(AppConfig::default())
+    }
+
+    fn make_turns(n: usize) -> Vec<ConversationTurn> {
+        (0..n)
+            .map(|i| ConversationTurn {
+                user: format!("user message {i}"),
+                assistant: format!("assistant reply {i}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn below_threshold_returns_none() {
+        let rt = make_runtime();
+        let turns = make_turns(5);
+        let result = rt.summarize_conversation(None, &turns).await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn at_threshold_minus_one_returns_none() {
+        let rt = make_runtime();
+        let turns = make_turns(SUMMARIZE_THRESHOLD - 1);
+        let result = rt.summarize_conversation(None, &turns).await.unwrap();
+        assert!(result.is_none());
+    }
+
+
+}
