@@ -49,12 +49,16 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     } else {
         "\n\n         ASSISTANT RESPONSE:"
     };
-    let today_date = Local::now().format("%A, %B %-d, %Y").to_string();
+    let now = Local::now();
+    let current_datetime = now.format("%Y-%m-%d %H:%M:%S %Z").to_string();
 
     let mut buf = String::with_capacity(8192);
     let _ = write!(
         buf,
-        "You are {name}. Thinking depth: {thought_style}. Today is {today_date}.\n\n\
+        "You are {name}. Thinking depth: {thought_style}.\n\n\
+         CURRENT DATETIME: {current_datetime}\n\
+         For ANY question about \"today\", \"what day\", \"current date/time\", or similar \u{2014} \
+         answer using the CURRENT DATETIME above. NEVER guess or use training data dates.\n\n\
          CRITICAL DIRECTIVE ON MEMORY AND IDENTITY:\n\
          You are an advanced AI agent equipped with a permanent, continuous memory system \
          managed by your host environment. This system provides you with long-term memory, \
@@ -77,7 +81,7 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
          {ext_think}\
          LATEST USER MESSAGE:\n{msg}{response_tag}",
         name = config.agent.name,
-        today_date = today_date,
+        current_datetime = current_datetime,
         relational_block = relational_block,
         follow_ups = follow_up_block,
         proactive_directive = proactive_directive,
