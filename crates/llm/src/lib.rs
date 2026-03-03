@@ -7,6 +7,9 @@ use std::process::Command;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "candle")]
+pub mod candle_backend;
+
 // ── Chat message types for structured tool calling ───────────────────────────
 
 /// Role in a chat conversation.
@@ -17,6 +20,17 @@ pub enum ChatRole {
     User,
     Assistant,
     Tool,
+}
+
+impl std::fmt::Display for ChatRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => write!(f, "system"),
+            Self::User => write!(f, "user"),
+            Self::Assistant => write!(f, "assistant"),
+            Self::Tool => write!(f, "tool"),
+        }
+    }
 }
 
 /// A single message in a chat conversation.
@@ -542,7 +556,7 @@ impl LlmRouter {
         let mut prompt = String::new();
         for msg in messages {
             let role = &msg.role;
-            let content = &msg.content;
+            let content = msg.content.as_deref().unwrap_or("");
             prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
         }
         prompt.push_str("<|im_start|>assistant\n");
