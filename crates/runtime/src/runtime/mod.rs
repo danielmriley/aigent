@@ -13,11 +13,8 @@ use anyhow::Result;
 use aigent_config::AppConfig;
 use aigent_llm::{LlmRouter, Provider};
 
-#[derive(Debug, Clone)]
-pub struct ConversationTurn {
-    pub user: String,
-    pub assistant: String,
-}
+// ConversationTurn is defined in the prompt crate; re-export for backward compat.
+pub use aigent_prompt::ConversationTurn;
 
 #[derive(Debug, Clone)]
 pub struct AgentRuntime {

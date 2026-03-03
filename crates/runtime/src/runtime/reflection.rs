@@ -5,7 +5,7 @@ use tracing::{debug, warn};
 use aigent_llm::{Provider, extract_json_output};
 use aigent_memory::{MemoryManager, MemoryTier};
 use crate::agent_loop::ReflectionOutput;
-use crate::prompt_builder::truncate_for_prompt;
+use aigent_prompt::truncate_for_prompt;
 use crate::{BackendEvent};
 
 use super::AgentRuntime;

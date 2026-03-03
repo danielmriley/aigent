@@ -2,21 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_loop::{ReactPhase, SwarmRole};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallInfo {
-    pub name: String,
-    pub args: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolResult {
-    pub name: String,
-    pub success: bool,
-    pub output: String,
-    /// Wall-clock duration of the tool invocation in milliseconds.
-    #[serde(default)]
-    pub duration_ms: u64,
-}
+// ToolCallInfo and ToolResult are defined in the thinker crate.
+// Re-export them here so BackendEvent can use them and downstream code
+// that pattern-matches on BackendEvent variants continues to work.
+pub use aigent_thinker::{ToolCallInfo, ToolResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BackendEvent {
@@ -80,4 +69,3 @@ pub enum BackendEvent {
         provider: String,
     },
 }
-

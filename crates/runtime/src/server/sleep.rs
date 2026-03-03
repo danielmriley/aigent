@@ -413,17 +413,26 @@ pub(super) fn spawn_proactive_task(
             let context = memory.context_for_prompt_ranked_with_embed("proactive background check", 8, None);
             let stats = memory.stats();
 
-            let mut prompt_inputs = crate::prompt_builder::PromptInputs {
+            // Pre-compute memory blocks for the prompt builder (pure function).
+            let identity_block = memory.cached_identity_block().to_string();
+            let beliefs_block = memory.cached_beliefs_block(rt_clone.config.memory.max_beliefs_in_prompt).to_string();
+            let user_name = memory.user_name_from_core();
+            let relational_block = memory.relational_state_block();
+
+            let prompt_inputs = aigent_prompt::PromptInputs {
                 config: &rt_clone.config,
-                memory: &mut memory,
                 user_message: proactive_user_msg,
                 recent_turns: &recent,
                 tool_specs: &[],   // tools go via API, not baked into text
                 pending_follow_ups: &[],
                 context_items: &context,
                 stats,
+                identity_block,
+                beliefs_block,
+                user_name,
+                relational_block,
             };
-            let system_prompt = crate::prompt_builder::build_chat_prompt(&mut prompt_inputs);
+            let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
 
             let mut messages = vec![aigent_llm::ChatMessage::system(&system_prompt)];
             for turn in &recent {
@@ -436,7 +445,7 @@ pub(super) fn spawn_proactive_task(
             let tools_json = if tool_specs.is_empty() {
                 None
             } else {
-                Some(crate::tool_loop::build_tools_json(&tool_specs))
+                Some(aigent_thinker::build_tools_json(&tool_specs))
             };
 
             let primary = aigent_llm::Provider::from(rt_clone.config.llm.provider.as_str());
@@ -446,7 +455,7 @@ pub(super) fn spawn_proactive_task(
             tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
 
             // Run the full tool loop (silent — no event broadcast to TUI).
-            let loop_result = crate::tool_loop::run_tool_loop(
+            let loop_result = aigent_thinker::run_tool_loop(
                 &rt_clone.llm,
                 primary,
                 &rt_clone.config.llm.ollama_model,

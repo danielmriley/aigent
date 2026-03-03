@@ -7,7 +7,7 @@ use tracing::{debug, info, instrument, warn};
 use tokio::sync::mpsc;
 use aigent_llm::{Provider};
 use aigent_memory::{MemoryEntry, MemoryManager, MemoryTier};
-use crate::prompt_builder::truncate_for_prompt;
+use aigent_prompt::truncate_for_prompt;
 
 use super::AgentRuntime;
 use super::ConversationTurn;
