@@ -2168,3 +2168,49 @@ model could jump straight to `final_answer` without using any tools.
 - "List my files" → should call `run_shell ls -la`
 - "What were we talking about?" → should answer from memory context (no tool)
 - Memory question → should call `search_memory` or answer from injected context
+
+## 2026-03-02 — Aggressive tool-use enforcement in external thinking
+
+Addresses the problem where Qwen 3.5 35B refuses to call tools and hallucinates
+answers (e.g. guesses the wrong date instead of running `date`).
+
+### Changes
+
+1. **Planning hint injection** — before the first LLM call in the ext-think
+   loop, a `ChatMessage::user(...)` is injected that explicitly tells the model
+   to plan tool usage and output a `tool_call` JSON unless it is 100% certain
+   no tool is needed.
+
+2. **`has_used_tool` tracking** — a boolean flag tracks whether the model has
+   called *any* tool during the current turn.  This is used by the early-answer
+   guard to distinguish "model verified via tool" from "model guessed."
+
+3. **Enhanced early-answer guard (3 independent triggers):**
+   - **(a) Passive-resignation detector** — catches 22 phrases like "I don't
+     have access", "as an AI", "training data", "knowledge cutoff".
+   - **(b) Hallucinated-fact detector** — if `has_used_tool == false` and the
+     `final_answer` text contains date patterns (month names, year numbers,
+     day-of-week, "today is") or file paths (`/home/`, `/usr/`, `/tmp/`,
+     `/etc/`), the answer is challenged.
+   - **(c) Short-thought detector** — if `has_used_tool == false` and the
+     `thought` field is < 40 characters, challenge.
+   - Maximum 3 challenges (`MAX_CHALLENGES`) before accepting the answer.
+   - Override message includes the specific reason for rejection and concrete
+     JSON examples for `run_shell date` and `run_shell ls -la`.
+
+4. **BAD BEHAVIOR section in prompt** — `build_external_thinking_block()` now
+   includes an explicit list of anti-patterns the model must never exhibit:
+   guessing dates, answering about files without tools, saying "I don't have
+   access", hallucinated facts, first-step `final_answer` for live-data queries.
+
+**Files modified:**
+- `crates/runtime/src/ext_think.rs` — planning hint, `has_used_tool` flag,
+  `challenge_count`, 3-trigger early-answer guard with `MAX_CHALLENGES = 3`
+- `crates/runtime/src/prompt_builder.rs` — BAD BEHAVIOR anti-pattern section
+- `MIGRATION.md`
+
+**Testing:**
+- "What day is it?" → must call `run_shell date`, not guess
+- "What's in my home directory?" → must call `run_shell ls -la ~`
+- "What is 2 + 2?" → should answer directly (no tool needed, no challenge)
+- "Tell me about Rust" → should answer directly (general knowledge, no date/path claims)
