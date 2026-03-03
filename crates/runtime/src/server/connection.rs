@@ -99,7 +99,7 @@ pub(super) async fn handle_connection(
                 // ═══════════════════════════════════════════════════════════════
                 // NEW PATH: Native structured tool calling via chat messages API
                 // ═══════════════════════════════════════════════════════════════
-                let (rt_clone, mut memory, recent, _last_turn_at, tool_specs, registry, executor) = {
+                let (rt_clone, mut memory, recent, _last_turn_at, tool_specs, registry, executor, conv_summary) = {
                     let mut s = state.lock().await;
                     let rt = s.runtime.clone();
                     let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
@@ -108,7 +108,8 @@ pub(super) async fn handle_connection(
                     let specs = s.tool_registry.list_specs();
                     let reg = Arc::clone(&s.tool_registry);
                     let exe = Arc::clone(&s.tool_executor);
-                    (rt, mem, recent, lta, specs, reg, exe)
+                    let csumm = s.conversation_summary.clone();
+                    (rt, mem, recent, lta, specs, reg, exe, csumm)
                 };
 
                 // Persist the user turn and do memory work before calling the LLM.
@@ -141,6 +142,7 @@ pub(super) async fn handle_connection(
                     beliefs_block,
                     user_name,
                     relational_block,
+                    conversation_summary: conv_summary,
                 };
                 let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
 
@@ -259,10 +261,40 @@ pub(super) async fn handle_connection(
                                 user: user.clone(),
                                 assistant: reply,
                             });
-                            while s.recent_turns.len() > 8 {
-                                let _ = s.recent_turns.pop_front();
-                            }
                             s.turn_count += 1;
+
+                            // Spawn background conversation summarization when
+                            // the turn buffer crosses the threshold.
+                            if s.recent_turns.len() >= aigent_agent::SUMMARIZE_THRESHOLD {
+                                let state3 = state.clone();
+                                let rt3 = s.runtime.clone();
+                                tokio::spawn(async move {
+                                    let (summary_opt, turns_snapshot) = {
+                                        let s = state3.lock().await;
+                                        let turns: Vec<ConversationTurn> =
+                                            s.recent_turns.iter().cloned().collect();
+                                        (s.conversation_summary.clone(), turns)
+                                    };
+                                    match rt3.summarize_conversation(
+                                        summary_opt.as_deref(),
+                                        &turns_snapshot,
+                                    ).await {
+                                        Ok(Some((summary, kept))) => {
+                                            let mut s = state3.lock().await;
+                                            s.conversation_summary = Some(summary);
+                                            s.recent_turns = kept.into_iter().collect();
+                                            tracing::info!(
+                                                kept = s.recent_turns.len(),
+                                                "conversation summarized"
+                                            );
+                                        }
+                                        Ok(None) => {} // below threshold after re-check
+                                        Err(e) => {
+                                            tracing::warn!(?e, "background summarization failed");
+                                        }
+                                    }
+                                });
+                            }
 
                             if s.runtime.config.memory.auto_sleep_turn_interval > 0
                                 && s.turn_count % s.runtime.config.memory.auto_sleep_turn_interval == 0

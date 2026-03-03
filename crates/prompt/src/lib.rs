@@ -58,4 +58,9 @@ pub struct PromptInputs<'a> {
     pub user_name: Option<String>,
     /// Output of `MemoryManager::relational_state_block()`.
     pub relational_block: Option<String>,
+
+    /// Condensed summary of earlier conversation turns that were evicted from
+    /// `recent_turns`.  When present, this is rendered as a "PRIOR CONVERSATION
+    /// SUMMARY" block so the agent retains context across long sessions.
+    pub conversation_summary: Option<String>,
 }

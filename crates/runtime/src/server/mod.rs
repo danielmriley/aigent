@@ -61,6 +61,8 @@ struct DaemonState {
     tool_executor: Arc<ToolExecutor>,
     recent_turns: VecDeque<ConversationTurn>,
     turn_count: usize,
+    /// Condensed summary of evicted conversation turns for long-session context.
+    conversation_summary: Option<String>,
     started_at: Instant,
     /// Timestamp of the last completed conversation turn (persisted in-process).
     last_turn_at: Option<DateTime<Utc>>,
@@ -378,6 +380,7 @@ pub async fn run_unified_daemon(
         tool_executor: Arc::new(tool_executor),
         recent_turns: VecDeque::new(),
         turn_count: 0,
+        conversation_summary: None,
         started_at: Instant::now(),
         last_turn_at: None,
         event_tx,
