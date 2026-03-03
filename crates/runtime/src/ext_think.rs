@@ -298,8 +298,8 @@ pub async fn run_external_thinking_loop(
                 // If the model leaps straight to final_answer without calling
                 // any tool, challenge it once.  Queries involving the current
                 // date/time, files, live data, or memory should always go
-                // through a tool first.  We only challenge on step 1 to keep
-                // the loop from cycling indefinitely.
+                // through a tool first.  We challenge up to 2 times to keep
+                // the loop from cycling indefinitely (max 2 challenges).
                 let thought_lc = thought.to_lowercase();
                 let weak_thought = thought.len() < 40
                     || thought_lc.contains("do not have")
