@@ -32,6 +32,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use aigent_llm::{ChatMessage, LlmRouter, Provider};
 use aigent_tools::{ToolOutput, ToolRegistry};
 
 // ── Chain types ──────────────────────────────────────────────────────────────
@@ -253,21 +254,80 @@ impl ToolChainExecutor {
         })
     }
 
-    /// Post-chain LLM reflection hook (stub).
+    /// Post-chain LLM reflection — evaluates chain output quality.
     ///
-    /// After a chain completes, this method can be called to send the chain
-    /// result to an LLM for quality assessment and improvement suggestions.
-    /// Currently returns the result unchanged.
-    pub fn reflect_on_result(result: &ChainResult) -> String {
-        // TODO: Call LLM to evaluate chain output quality and suggest
-        // parameter adjustments or step reordering.
-        info!(
-            chain = %result.chain_name,
-            success = result.success,
-            steps = %result.steps_run,
-            "chain reflection: stub — returning final output as-is"
+    /// After a chain completes, sends the result summary to an LLM for
+    /// quality assessment.  Returns the LLM's evaluation or falls back to
+    /// the raw `final_output` if the LLM call fails.
+    pub async fn reflect_on_result(
+        result: &ChainResult,
+        llm: &LlmRouter,
+        primary: Provider,
+        ollama_model: &str,
+        openrouter_model: &str,
+    ) -> String {
+        let bindings_summary: String = result
+            .bindings
+            .iter()
+            .map(|(k, v)| {
+                let snip = if v.len() > 200 {
+                    format!("{}…", &v[..200])
+                } else {
+                    v.clone()
+                };
+                format!("  {k}: {snip}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let eval_prompt = format!(
+            "Evaluate the quality of this tool chain execution:\n\
+             Chain: {}\n\
+             Success: {}\n\
+             Steps run: {} / {}\n\
+             Final output (first 500 chars): {}\n\
+             Bindings:\n{}\n\n\
+             Score the result 1-10 and suggest any improvements in 2-3 sentences.",
+            result.chain_name,
+            result.success,
+            result.steps_run,
+            result.steps_total,
+            if result.final_output.len() > 500 {
+                format!("{}…", &result.final_output[..500])
+            } else {
+                result.final_output.clone()
+            },
+            bindings_summary,
         );
-        result.final_output.clone()
+
+        let messages = vec![
+            ChatMessage::system(
+                "You are a concise evaluator for automated tool chain executions. \
+                 Score results and suggest step reordering or parameter adjustments.",
+            ),
+            ChatMessage::user(&eval_prompt),
+        ];
+
+        match llm
+            .chat_messages(primary, ollama_model, openrouter_model, &messages, None, false, false)
+            .await
+        {
+            Ok(resp) => {
+                info!(
+                    chain = %result.chain_name,
+                    "chain reflection: LLM evaluation complete"
+                );
+                resp.content
+            }
+            Err(err) => {
+                warn!(
+                    chain = %result.chain_name,
+                    ?err,
+                    "chain reflection: LLM call failed, returning raw output"
+                );
+                result.final_output.clone()
+            }
+        }
     }
 }
 

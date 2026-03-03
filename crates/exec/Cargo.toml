@@ -26,6 +26,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 aigent-config = { path = "../config" }
+aigent-llm = { path = "../llm" }
 aigent-tools = { path = "../tools" }
 
 # WASM runtime (optional – loaded at runtime when .wasm guests are present)

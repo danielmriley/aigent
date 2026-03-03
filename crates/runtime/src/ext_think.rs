@@ -35,7 +35,6 @@ use aigent_llm::{ChatMessage, LlmRouter, Provider};
 use aigent_tools::ToolRegistry;
 
 use crate::agent_loop::LlmToolCall;
-use crate::tool_loop::ToolExecution;
 use crate::events::{BackendEvent, ToolCallInfo, ToolResult as ToolResultEvent};
 
 // ── AgentStep: the structured JSON schema the model must produce ─────────────
@@ -88,8 +87,6 @@ pub struct ExtThinkResult {
     pub content: String,
     /// Total reasoning steps consumed.
     pub steps: usize,
-    /// All tool executions that happened during the loop, in order.
-    pub tool_executions: Vec<ToolExecution>,
 }
 
 // ── Configuration (read from AppConfig at call site) ─────────────────────────
@@ -139,7 +136,6 @@ pub async fn run_external_thinking_loop(
 ) -> Result<ExtThinkResult> {
     let mut steps = 0usize;
     let mut consecutive_retries = 0usize;
-    let mut tool_executions: Vec<ToolExecution> = Vec::new();
 
     loop {
         if steps >= config.max_steps {
@@ -274,14 +270,6 @@ pub async fn run_external_thinking_loop(
                     Err(err) => (false, format!("tool error: {err}")),
                 };
 
-                tool_executions.push(ToolExecution {
-                    tool_name: tool_call.name.clone(),
-                    args: tool_call.args.clone(),
-                    success,
-                    output: output.clone(),
-                    duration_ms,
-                });
-
                 // Emit tool end.
                 if let Some(tx) = event_tx {
                     let _ = tx.send(BackendEvent::ToolCallEnd(ToolResultEvent {
@@ -321,7 +309,6 @@ pub async fn run_external_thinking_loop(
                 return Ok(ExtThinkResult {
                     content: final_answer,
                     steps,
-                    tool_executions,
                 });
             }
         }
@@ -374,6 +361,7 @@ async fn call_llm_with_timeout(
         None, // No tools schema — we use our JSON schema instead.
         tx,
         json_mode,
+        true, // Suppress native <think> reasoning — we drive thinking externally.
     );
 
     let response = tokio::time::timeout(config.step_timeout, fut)
