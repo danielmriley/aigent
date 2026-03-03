@@ -106,12 +106,20 @@ impl ChatPanel {
 
         if !cache_hit {
             let cw = content_width.max(1);
-            // Use Line::width() — no allocation, unlike .to_string().chars().count().
+            // Per-line heights for history-mode scroll-to-message anchoring.
+            // div_ceil is a fast approximation; word-wrap differences are
+            // acceptable here because this is only used to jump to a message.
             let heights: Vec<usize> = chat_lines
                 .iter()
                 .map(|line| line.width().max(1).div_ceil(cw))
                 .collect();
-            let visual_total: usize = heights.iter().sum();
+            // div_ceil is an approximation: word-wrap at word boundaries
+            // can produce more rows than the character-count formula suggests.
+            // Add a small constant padding so max_scroll is never
+            // under-estimated, ensuring the last message is never clipped
+            // when auto_follow is active. Ratatui silently shows blank space
+            // for any overshoot, so this is safe.
+            let visual_total: usize = heights.iter().sum::<usize>().saturating_add(2);
             let msg_visual_offsets: Vec<usize> = msg_starts
                 .iter()
                 .map(|&start| heights[..start].iter().sum())

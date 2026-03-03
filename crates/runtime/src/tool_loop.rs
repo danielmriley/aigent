@@ -9,7 +9,7 @@
 //! the model doesn't support native tool calling.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -72,6 +72,7 @@ pub async fn run_tool_loop(
     tool_executor: &ToolExecutor,
     token_tx: mpsc::Sender<String>,
     event_tx: Option<&tokio::sync::broadcast::Sender<BackendEvent>>,
+    step_timeout: Duration,
 ) -> Result<ToolLoopResult> {
     let mut all_executions: Vec<ToolExecution> = Vec::new();
     let mut final_content = String::new();
@@ -88,18 +89,27 @@ pub async fn run_tool_loop(
             None
         };
 
-        let response: ChatResponse = llm
-            .chat_messages_stream(
-                primary,
-                ollama_model,
-                openrouter_model,
-                messages,
-                effective_tools,
-                token_tx.clone(),
-                false,
-                false,
-            )
-            .await?;
+        let llm_fut = llm.chat_messages_stream(
+            primary,
+            ollama_model,
+            openrouter_model,
+            messages,
+            effective_tools,
+            token_tx.clone(),
+            false,
+            false,
+        );
+        let response: ChatResponse = match tokio::time::timeout(step_timeout, llm_fut).await {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(
+                    round,
+                    timeout_secs = step_timeout.as_secs(),
+                    "LLM call timed out, returning partial content",
+                );
+                break;
+            }
+        };
 
         final_provider = response.provider;
 

@@ -457,6 +457,8 @@ pub(super) fn spawn_proactive_task(
                 &executor,
                 sink_tx,
                 None,   // no event_tx → tool events are hidden from the user
+            
+                std::time::Duration::from_secs(rt_clone.config.agent.step_timeout_seconds),
             ).await;
 
             // ── Apply phase: re-acquire lock, record results ──

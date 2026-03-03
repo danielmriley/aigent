@@ -8,7 +8,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tracing::{info, warn};
-use aigent_tools::Tool;
 
 use aigent_config::AppConfig;
 use aigent_memory::MemoryTier;
@@ -130,19 +129,12 @@ pub(super) async fn handle_connection(
                 let context = memory.context_for_prompt_ranked_with_embed(&user, 10, query_embedding);
                 let stats = memory.stats();
 
-                // Decide now whether we're using external thinking, since it
-                // affects both prompt construction and tool dispatch.
-                let use_ext_thinking = rt_clone.config.agent.external_thinking;
-
                 let mut prompt_inputs = crate::prompt_builder::PromptInputs {
                     config: &rt_clone.config,
                     memory: &mut memory,
                     user_message: &user,
                     recent_turns: &recent,
-                    // External thinking mode needs tool specs in the text prompt
-                    // because tools are NOT passed via the structured API.
-                    // Standard mode omits them — they go via the tools JSON API.
-                    tool_specs: if use_ext_thinking { &tool_specs } else { &[] },
+                    tool_specs: &[],  // Don't inject tools into the text prompt — they go via API
                     pending_follow_ups: &[],
                     context_items: &context,
                     stats,
@@ -160,63 +152,26 @@ pub(super) async fn handle_connection(
                 }
                 messages.push(aigent_llm::ChatMessage::user(&user));
 
-                // Build tools JSON from specs (only needed for native tool loop,
-                // not for external thinking which uses text-prompt tool listing).
-                let tools_json = if use_ext_thinking || tool_specs.is_empty() {
+                // Build tools JSON from specs
+                let tools_json = if tool_specs.is_empty() {
                     None
                 } else {
                     Some(crate::tool_loop::build_tools_json(&tool_specs))
                 };
 
-                let primary = aigent_llm::Provider::from(rt_clone.config.llm.provider.as_str());
+                let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
+                    aigent_llm::Provider::OpenRouter
+                } else {
+                    aigent_llm::Provider::Ollama
+                };
 
                 // Run the structured tool loop — registry/executor are Arc-cloned
                 // so we do NOT hold the DaemonState lock during LLM calls.
-                //
-                // When external_thinking is enabled, we use the JSON reasoning
-                // loop instead of the standard tool loop.
-                let reply_result: Result<String, anyhow::Error> = if use_ext_thinking {
-                    // ── External JSON reasoning loop ────────────────────
-                    let ext_cfg = crate::ext_think::ExtThinkConfig {
-                        step_timeout: std::time::Duration::from_secs(
-                            rt_clone.config.agent.step_timeout_seconds,
-                        ),
-                        max_steps: rt_clone.config.agent.max_steps_per_turn,
-                    };
-                    let ext_result = crate::ext_think::run_external_thinking_loop(
-                        &ext_cfg,
-                        &rt_clone.llm,
-                        primary,
-                        &rt_clone.config.llm.ollama_model,
-                        &rt_clone.config.llm.openrouter_model,
-                        &mut messages,
-                        &registry,
-                        &executor,
-                        chunk_tx,
-                        Some(&event_tx),
-                    ).await;
-
-                    match ext_result {
-                        Ok(ref result) => {
-                            // Tool executions are recorded inside the
-                            // external-thinking loop itself; no need
-                            // to iterate them here.
-
-                            // Record assistant reply
-                            if !result.content.is_empty() {
-                                let _: Result<_, _> = memory.record(
-                                    aigent_memory::MemoryTier::Episodic,
-                                    crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
-                                    format!("assistant-reply:model={}", rt_clone.config.active_model()),
-                                ).await;
-                            }
-                            Ok(result.content.clone())
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    // ── Standard native tool loop ───────────────────────
-                    let loop_result = crate::tool_loop::run_tool_loop(
+                let step_timeout = std::time::Duration::from_secs(
+                    rt_clone.config.agent.step_timeout_seconds,
+                );
+                let loop_result = {
+                    crate::tool_loop::run_tool_loop(
                         &rt_clone.llm,
                         primary,
                         &rt_clone.config.llm.ollama_model,
@@ -227,44 +182,52 @@ pub(super) async fn handle_connection(
                         &executor,
                         chunk_tx,
                         Some(&event_tx),
-                    ).await;
-
-                    match loop_result {
-                        Ok(ref result) => {
-                            // Record tool results to procedural memory
-                            for exec in &result.tool_executions {
-                                let outcome = format!(
-                                    "Tool '{}' executed. Output (first 400 chars): {}",
-                                    exec.tool_name,
-                                    safe_truncate(&exec.output, 400),
-                                );
-                                let _: Result<_, _> = memory.record(
-                                    MemoryTier::Procedural,
-                                    outcome,
-                                    format!("tool-use:{}", exec.tool_name),
-                                ).await;
-                            }
-                            // Record assistant reply
-                            if !result.content.is_empty() {
-                                let _: Result<_, _> = memory.record(
-                                    aigent_memory::MemoryTier::Episodic,
-                                    crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
-                                    format!("assistant-reply:model={}", rt_clone.config.active_model()),
-                                ).await;
-                            }
-                            Ok(result.content.clone())
-                        }
-                        Err(e) => Err(e),
-                    }
+                        step_timeout,
+                    ).await
                 };
 
-                // Reflect on the exchange
-                let reflect_events: Vec<BackendEvent> = match reply_result {
-                    Ok(ref reply) => rt_clone
-                        .inline_reflect(&mut memory, &user, reply)
-                        .await
-                        .unwrap_or_default(),
-                    Err(_) => vec![],
+                let reply_result: Result<String, anyhow::Error> = match loop_result {
+                    Ok(ref result) => {
+                        // Record tool results to procedural memory
+                        for exec in &result.tool_executions {
+                            let outcome = format!(
+                                "Tool '{}' executed. Output (first 400 chars): {}",
+                                exec.tool_name,
+                                safe_truncate(&exec.output, 400),
+                            );
+                            let _: Result<_, _> = memory.record(
+                                MemoryTier::Procedural,
+                                outcome,
+                                format!("tool-use:{}", exec.tool_name),
+                            ).await;
+                        }
+                        // Record assistant reply
+                        if !result.content.is_empty() {
+                            let _: Result<_, _> = memory.record(
+                                aigent_memory::MemoryTier::Episodic,
+                                crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
+                                format!("assistant-reply:model={}", rt_clone.config.active_model()),
+                            ).await;
+                        }
+                        Ok(result.content.clone())
+                    }
+                    Err(e) => Err(e),
+                };
+
+                // Reflect on the exchange — skip when using external thinking
+                // mode because the extra LLM call adds 30-60s of latency on
+                // large local models, causing the spinner to hang long after
+                // the answer is displayed.
+                let reflect_events: Vec<BackendEvent> = if rt_clone.config.agent.external_thinking {
+                    vec![]
+                } else {
+                    match reply_result {
+                        Ok(ref reply) => rt_clone
+                            .inline_reflect(&mut memory, &user, reply)
+                            .await
+                            .unwrap_or_default(),
+                        Err(_) => vec![],
+                    }
                 };
 
                 let _ = streamer.await;
@@ -297,7 +260,11 @@ pub(super) async fn handle_connection(
                                         let s = state2.lock().await;
                                         (s.runtime.clone(), s.memory.all().to_vec(), s.memory.identity.clone())
                                     };
-                                    let _ = event_tx2.send(BackendEvent::SleepCycleRunning);
+                                    // NOTE: do NOT broadcast SleepCycleRunning or Done here.
+                                    // Auto-sleep runs in the background after the turn is
+                                    // already complete.  Broadcasting lifecycle events would
+                                    // interfere with the TUI's spinner state if the user
+                                    // starts a new turn before auto-sleep finishes.
                                     let (noop_tx, _) = mpsc::unbounded_channel::<String>();
                                     let gen_result = rt.generate_agentic_sleep_insights(&memories, &identity, &noop_tx).await;
                                     let mut s = state2.lock().await;
@@ -318,7 +285,6 @@ pub(super) async fn handle_connection(
                                     }
                                     let _ = s.memory.flush_all();
                                     let _ = event_tx2.send(BackendEvent::MemoryUpdated);
-                                    let _ = event_tx2.send(BackendEvent::Done);
                                 });
                             }
                             Ok(reflect_events)
@@ -605,7 +571,11 @@ pub(super) async fn handle_connection(
                                     let s = state2.lock().await;
                                     (s.runtime.clone(), s.memory.all().to_vec(), s.memory.identity.clone())
                                 };
-                                let _ = event_tx2.send(BackendEvent::SleepCycleRunning);
+                                // NOTE: do NOT broadcast SleepCycleRunning or Done here.
+                                // Auto-sleep runs in the background after the turn is
+                                // already complete.  Broadcasting lifecycle events would
+                                // interfere with the TUI's spinner state if the user
+                                // starts a new turn before auto-sleep finishes.
                                 let (noop_tx, _) = mpsc::unbounded_channel::<String>();
                                 let gen_result = rt.generate_agentic_sleep_insights(&memories, &identity, &noop_tx).await;
                                 let mut s = state2.lock().await;
@@ -626,7 +596,6 @@ pub(super) async fn handle_connection(
                                 }
                                 let _ = s.memory.flush_all();
                                 let _ = event_tx2.send(BackendEvent::MemoryUpdated);
-                                let _ = event_tx2.send(BackendEvent::Done);
                             });
                         }
 
@@ -738,7 +707,7 @@ pub(super) async fn handle_connection(
             // secrets saved via onboarding) takes effect immediately without
             // requiring a daemon restart.
             let _ = dotenvy::from_path_override(std::path::Path::new(".env"));
-            let updated = AppConfig::load_from(AppConfig::config_path())?;
+            let updated = AppConfig::load_from("config/default.toml")?;
 
             // Hot-reload dynamic skills when the skills subsystem is enabled
             // and auto_reload is on.
@@ -912,125 +881,62 @@ pub(super) async fn handle_connection(
             }
         }
         ClientCommand::TriggerProactive => {
-            // Full AgentLoop proactive tick — the agent can use all tools.
-            let proactive_user_msg = "\
-[PROACTIVE WAKE-UP] You have woken up autonomously. Follow the protocol:\n\
-\n\
-1. ORIENT — Run these two calls first:\n\
-   - search_memory(query=\"recent topics open questions user goals\", limit=10)\n\
-   - list_cron_jobs()\n\
-\n\
-2. DECIDE — Based on what you find, pick ONE high-value action:\n\
-   Priority order: unresolved user problems > active scheduled research > \n\
-   curiosity-driven exploration of user interests.\n\
-\n\
-3. ACT — Execute your chosen action using as many tool calls as needed. \n\
-   Chain web_search -> browse_page -> search_memory as appropriate.\n\
-\n\
-4. RECORD — Summarize what you learned or accomplished in your final message. \n\
-   Use specific keywords so search_memory can find this later. If your \n\
-   investigation raised follow-up questions, call create_cron_job to \n\
-   schedule the next step.\n\
-\n\
-5. OUTPUT — If you discovered something the user needs to know, output a \n\
-   concise message. If your work was routine maintenance with nothing \n\
-   urgent, respond with an empty string to return to sleep silently.";
-
-            let (rt_clone, mut memory, recent, tool_specs, registry, executor, event_tx_clone) = {
-                let mut s = state.lock().await;
+            // Snapshot beliefs/reflections, release lock, call LLM, re-acquire lock.
+            let (rt_clone, beliefs_summary, reflections_summary, event_tx_clone) = {
+                let s = state.lock().await;
                 let rt = s.runtime.clone();
-                let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
-                let mem = std::mem::take(&mut s.memory);
-                let specs = s.tool_registry.list_specs();
-                let reg = std::sync::Arc::clone(&s.tool_registry);
-                let exe = std::sync::Arc::clone(&s.tool_executor);
                 let tx = s.event_tx.clone();
-                (rt, mem, recent, specs, reg, exe, tx)
+
+                let beliefs = s.memory.all_beliefs();
+                let b_summary = if beliefs.is_empty() {
+                    "(none yet)".to_string()
+                } else {
+                    beliefs
+                        .iter()
+                        .take(8)
+                        .map(|e| format!("- {}", e.content))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let ctx = s.memory.context_for_prompt_ranked_with_embed("recent", 5, None);
+                let r_summary = {
+                    let reflections: Vec<String> = ctx
+                        .iter()
+                        .filter(|item| item.entry.tier == MemoryTier::Reflective)
+                        .map(|item| {
+                            format!("- {}", crate::prompt_builder::truncate_for_prompt(&item.entry.content, 200))
+                        })
+                        .collect();
+                    if reflections.is_empty() {
+                        "(none yet)".to_string()
+                    } else {
+                        reflections.join("\n")
+                    }
+                };
+                (rt, b_summary, r_summary, tx)
             };
-
-            let context = memory.context_for_prompt_ranked_with_embed("proactive background check", 8, None);
-            let stats = memory.stats();
-
-            let mut prompt_inputs = crate::prompt_builder::PromptInputs {
-                config: &rt_clone.config,
-                memory: &mut memory,
-                user_message: proactive_user_msg,
-                recent_turns: &recent,
-                tool_specs: &[],
-                pending_follow_ups: &[],
-                context_items: &context,
-                stats,
-            };
-            let system_prompt = crate::prompt_builder::build_chat_prompt(&mut prompt_inputs);
-
-            let mut messages = vec![aigent_llm::ChatMessage::system(&system_prompt)];
-            for turn in &recent {
-                messages.push(aigent_llm::ChatMessage::user(&turn.user));
-                messages.push(aigent_llm::ChatMessage::assistant(&turn.assistant));
-            }
-            messages.push(aigent_llm::ChatMessage::user(proactive_user_msg));
-
-            let tools_json = if tool_specs.is_empty() {
-                None
-            } else {
-                Some(crate::tool_loop::build_tools_json(&tool_specs))
-            };
-
-            let primary = aigent_llm::Provider::from(rt_clone.config.llm.provider.as_str());
-
-            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);
-            tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
-
-            let loop_result = crate::tool_loop::run_tool_loop(
-                &rt_clone.llm,
-                primary,
-                &rt_clone.config.llm.ollama_model,
-                &rt_clone.config.llm.openrouter_model,
-                &mut messages,
-                tools_json.as_ref(),
-                &registry,
-                &executor,
-                sink_tx,
-                None,
-            ).await;
-
+            let outcome = rt_clone
+                .run_proactive_check_from_summaries(&beliefs_summary, &reflections_summary)
+                .await;
             let msg = {
                 let mut s = state.lock().await;
-                s.memory = memory;
                 let _ = s.memory.flush_all();
-                match loop_result {
-                    Ok(ref result) => {
-                        for exec in &result.tool_executions {
-                            let outcome = format!(
-                                "[proactive] Tool '{}' executed. Output (first 400 chars): {}",
-                                exec.tool_name,
-                                safe_truncate(&exec.output, 400),
-                            );
-                            let _: Result<_, _> = s.memory.record(
-                                MemoryTier::Procedural,
-                                outcome,
-                                format!("proactive-tool:{}", exec.tool_name),
-                            ).await;
-                        }
-                        let reply = result.content.trim();
-                        if !reply.is_empty() {
-                            let ev = BackendEvent::ProactiveMessage { content: reply.to_string() };
-                            let _ = event_tx_clone.send(ev);
-                            let _ = s
-                                .memory
-                                .record(MemoryTier::Episodic, format!("[proactive] {reply}"), "proactive:agent-loop")
-                                .await;
-                            s.proactive_total_sent += 1;
-                            s.last_proactive_at = Some(Utc::now());
-                            format!("proactive agent loop completed — message sent: {reply}")
-                        } else {
-                            format!(
-                                "proactive agent loop completed silently ({} tool calls)",
-                                result.tool_executions.len()
-                            )
-                        }
+                if let Some(out) = outcome {
+                    if let Some(ref m) = out.message {
+                        let ev = BackendEvent::ProactiveMessage { content: m.clone() };
+                        let _ = event_tx_clone.send(ev);
+                        let _ = s
+                            .memory
+                            .record(MemoryTier::Episodic, format!("[proactive] {m}"), "proactive")
+                            .await;
+                        s.proactive_total_sent += 1;
+                        s.last_proactive_at = Some(Utc::now());
+                        format!("proactive message sent: {m}")
+                    } else {
+                        "proactive check ran — no message to send".to_string()
                     }
-                    Err(ref err) => format!("proactive agent loop failed: {err}"),
+                } else {
+                    "proactive check ran — decided to stay silent".to_string()
                 }
             };
             send_event(&mut write_half, ServerEvent::Ack(msg)).await?;
@@ -1158,41 +1064,22 @@ fn reload_dynamic_skills(
             }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
+                // For now, log the discovered skill.  Actual WASM instantiation
+                // will be wired up in Phase 2 (sandboxed compilation pipeline).
+                // This ensures the discovery + registration plumbing is tested.
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-
-                // Load the WASM binary and register it as a dynamic tool.
-                match aigent_exec::wasm::WasmTool::load_with_workspace(
-                    &path,
-                    Some(workspace),
-                ) {
-                    Some(tool) => {
-                        let name = tool.spec().name.clone();
-                        if loaded.contains(&name) {
-                            warn!(skill = %name, path = %path.display(),
-                                "duplicate skill name \u{2014} skipping");
-                            continue;
-                        }
-                        registry.register_with_source(
-                            Box::new(tool),
-                            aigent_tools::ToolSource::Dynamic,
-                        );
-                        info!(skill = %name, path = %path.display(), "loaded dynamic skill");
-                        loaded.push(name);
-                    }
-                    None => {
-                        warn!(skill = %stem, path = %path.display(), "failed to load dynamic skill WASM");
-                    }
-                }
+                info!(skill = %stem, path = %path.display(), "discovered dynamic skill");
+                loaded.push(stem);
             }
         }
     }
 
     let msg = format!(
-        "skills reload: unloaded {} old, loaded {} new dynamic tool(s)",
+        "skills reload: unloaded {} old, discovered {} new dynamic tool(s)",
         old_names.len(),
         loaded.len()
     );
