@@ -126,22 +126,41 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
 fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> String {
     let mut buf = String::with_capacity(2048);
 
+    // Inject current datetime so the model can answer date/time questions
+    // instantly without calling a tool.
+    let now = chrono::Local::now();
+    let datetime_str = now.format("%A, %B %-d, %Y %H:%M:%S %Z").to_string();
+    buf.push_str(&format!("\n\nCURRENT_DATETIME: {datetime_str}\n\n"));
+
     // ── Concise mode header + schema ─────────────────────────────────────
     buf.push_str(
-        "\n\n## JSON AGENT MODE\n\
+        "## JSON AGENT MODE\n\
          Output ONLY a single JSON object. No prose, no markdown, no fences.\n\n\
          TOOL CALL: {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
          FINAL ANSWER: {\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<response>\"}\n\n\
-         Use a tool for anything that needs current/live data (date, files, web, system info).\n\
-         Example — date: {\"type\":\"tool_call\",\"thought\":\"get date\",\"tool_call\":{\"name\":\"run_shell\",\"args\":{\"command\":\"date\"}}}\n\n",
+         Use a tool for anything that needs current/live data (files, web, system info).\n\
+         For date/time questions, use CURRENT_DATETIME above {2014} no tool needed.\n\n",
     );
 
-    // ── Compact tool list (names only, no params) ────────────────────────
+    // ── Compact tool list + web workflow hint ─────────────────────────────
     if !tool_specs.is_empty() {
         buf.push_str("TOOLS: ");
         let names: Vec<&str> = tool_specs.iter().map(|s| s.name.as_str()).collect();
         buf.push_str(&names.join(", "));
-        buf.push_str("\nrun_shell can execute ANY shell command (date, ls, curl, etc.)\n\n");
+        buf.push_str("\nrun_shell can execute ANY shell command (ls, curl, etc.)\n");
+
+        // Teach the search->browse two-step pattern so the model doesn't
+        // hallucinate from search snippets alone.
+        let has_web_search = tool_specs.iter().any(|s| s.name == "web_search");
+        let has_browse = tool_specs.iter().any(|s| s.name == "browse_page");
+        if has_web_search && has_browse {
+            buf.push_str(
+                "WEB WORKFLOW: web_search returns only titles/snippets. \
+                 To get full content, follow up with browse_page on the best URL.\n",
+            );
+        }
+
+        buf.push('\n');
     }
 
     buf
