@@ -368,28 +368,17 @@ pub async fn run_external_thinking_loop(
                     || answer_lc.contains("/etc/");
                 let answer_has_factual_claims = has_date_pattern || has_file_path;
 
-                // (d) First-step catch-all: if the model jumps straight to
-                //     final_answer on step 1 without having called ANY tool,
-                //     always challenge.  This is the strongest guard — it does
-                //     not rely on pattern matching and catches every new phrase
-                //     the model invents to avoid tool use.
-                let first_step_no_tool = steps <= 1 && !has_used_tool;
-
                 // Trigger challenge if:
-                //  - FIRST STEP and no tool used (catch-all), OR
                 //  - passive resignation detected (any step), OR
                 //  - model hasn't used ANY tool and answer has factual claims, OR
                 //  - model hasn't used ANY tool and thought is suspiciously short
                 let should_challenge = challenge_count < MAX_CHALLENGES
-                    && (first_step_no_tool
-                        || passive_resignation
+                    && (passive_resignation
                         || (!has_used_tool && answer_has_factual_claims)
                         || (!has_used_tool && thought.len() < 40));
 
                 if should_challenge {
-                    let reason = if first_step_no_tool && !passive_resignation {
-                        "first step without any tool use"
-                    } else if passive_resignation {
+                    let reason = if passive_resignation {
                         "passive resignation language"
                     } else if answer_has_factual_claims {
                         "factual claims without tool verification"
