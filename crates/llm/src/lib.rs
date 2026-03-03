@@ -792,7 +792,7 @@ impl OllamaClient {
             // reasoning at the inference level for thinking-capable models
             // (Qwen 3, DeepSeek R1, etc.).  Non-thinking models ignore the flag.
             // `self.suppress_thinking` is set from config.agent.external_thinking;
-            // `disable_native_thinking` is set per-call by ext_think.rs.
+            // `disable_native_thinking` is set per-call by the tool loop.
             payload["think"] = json!(false);
         }
         if let Some(tools_val) = tools {

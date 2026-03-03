@@ -139,7 +139,7 @@ fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> Strin
          TOOL CALL: {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
          FINAL ANSWER: {\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<response>\"}\n\n\
          Use a tool for anything that needs current/live data (files, web, system info).\n\
-         For date/time questions, use CURRENT_DATETIME above {2014} no tool needed.\n\n",
+         For date/time questions, use CURRENT_DATETIME above or call get_current_datetime.\n\n",
     );
 
     // ── Compact tool list + web workflow hint ─────────────────────────────
