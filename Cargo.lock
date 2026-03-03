@@ -39,6 +39,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aigent-agent"
+version = "0.1.0"
+dependencies = [
+ "aigent-config",
+ "aigent-llm",
+ "aigent-memory",
+ "aigent-prompt",
+ "aigent-thinker",
+ "aigent-tools",
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aigent-app"
 version = "0.1.0"
 dependencies = [
@@ -158,6 +177,7 @@ dependencies = [
 name = "aigent-runtime"
 version = "0.1.0"
 dependencies = [
+ "aigent-agent",
  "aigent-config",
  "aigent-exec",
  "aigent-llm",

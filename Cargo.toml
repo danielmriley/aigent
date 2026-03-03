@@ -8,6 +8,7 @@ members = [
   "crates/tools",
   "crates/thinker",
   "crates/prompt",
+  "crates/agent",
   "crates/interfaces/tui",
   "crates/interfaces/telegram",
   "crates/runtime",
