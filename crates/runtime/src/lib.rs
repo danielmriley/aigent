@@ -6,6 +6,7 @@
 
 mod client;
 mod commands;
+mod error;
 pub mod history;
 pub mod schedule_store;
 pub mod scheduler;
@@ -15,6 +16,7 @@ mod server;
 
 pub use client::DaemonClient;
 pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, SleepStatusPayload, ServerEvent};
+pub use error::ServerError;
 pub use scheduler::{HeartbeatFn, ScheduledTask, SchedulerState, TaskSchedule, spawn_scheduler};
 pub use server::run_unified_daemon;
 
@@ -26,7 +28,7 @@ pub use aigent_agent::{
     AgentLoop, AgentRuntime, BackendEvent, ConversationTurn, EvalScore,
     LlmToolCall, ProactiveOutput, ReactPhase, ReactSnapshot,
     ReflectionBelief, ReflectionOutput, SleepGenerationResult, SwarmRole,
-    ToolCallInfo, ToolResult, TurnSource,
+    AgentError, AgentResult, ToolCallInfo, ToolResult, TurnSource,
 };
 
 pub use aigent_agent::agent_loop;
