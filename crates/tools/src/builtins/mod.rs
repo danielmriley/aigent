@@ -10,6 +10,7 @@ mod calendar;
 mod web_browse;
 mod scheduler;
 pub mod memory_search;
+mod datetime;
 
 pub use browse::BrowsePageTool;
 pub use coreutils::{
@@ -24,6 +25,7 @@ pub use calendar::CalendarAddEventTool;
 pub use web_browse::WebBrowseTool;
 pub use scheduler::{CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool};
 pub use memory_search::{SearchMemoryTool, MemoryQueryFn, MemorySearchResult};
+pub use datetime::GetCurrentDatetimeTool;
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, Write};

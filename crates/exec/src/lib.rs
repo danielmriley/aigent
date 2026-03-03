@@ -522,7 +522,7 @@ pub fn default_registry(
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
         BrowsePageTool, CalendarAddEventTool, CpTool, CutTool, DraftEmailTool,
-        EchoTool, FindTool, GitRollbackTool, GrepTool, HeadTool,
+        EchoTool, FindTool, GetCurrentDatetimeTool, GitRollbackTool, GrepTool, HeadTool,
         ListDirTool, MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool,
         RunShellTool, SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool,
         UniqTool, WcTool, WebSearchTool, WorkspaceStatusTool,
@@ -698,6 +698,11 @@ pub fn default_registry(
             Box::new(ListSkillsTool {
                 skills_dir: workspace_root.join("extensions/skills"),
             }),
+        ),
+        // ── Utility ────────────────────────────────────────────────────
+        (
+            "get_current_datetime",
+            Box::new(GetCurrentDatetimeTool),
         ),
     ];
 
