@@ -525,6 +525,7 @@ impl App {
                     {
                         last.content =
                             format!("[stream]{}", self.pending_stream);
+                        self.chat.auto_follow = true;
                         return;
                     }
                 }
@@ -724,6 +725,7 @@ impl App {
                     rendered_md: None,
                 });
                 self.state.status = "thinking…".to_string();
+                self.chat.auto_follow = true;
             }
             BackendEvent::ConfigUpdated { model, provider } => {
                 self.state.model_name = Some(model.clone());

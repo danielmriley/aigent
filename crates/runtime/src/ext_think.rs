@@ -301,7 +301,7 @@ pub async fn run_external_thinking_loop(
                         tool_call.name,
                     )
                 };
-                let truncated_obs = crate::prompt_builder::truncate_for_prompt(&obs, 2048);
+                let truncated_obs = crate::prompt_builder::truncate_for_prompt(&obs, 4096);
                 messages.push(ChatMessage::user(&truncated_obs));
             }
 

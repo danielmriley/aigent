@@ -824,6 +824,13 @@ fn extract_body_text(html: &str, max_chars: usize) -> String {
     let selectors = [
         "article", "main", "[role=\"main\"]",
         ".post-content", ".entry-content", ".article-body",
+        // Weather / data-heavy sites
+        ".forecast", ".current-conditions", ".weather-detail",
+        "#forecast", "#current", ".ten-day", ".daily-forecast",
+        ".region-content-main", ".content-module",
+        "[data-testid=\"forecast\"]",
+        // Generic content wrappers
+        "#content", ".content", "#main-content", ".page-content",
     ];
     for sel_str in &selectors {
         if let Ok(sel) = Selector::parse(sel_str) {
@@ -850,7 +857,13 @@ fn extract_body_text(html: &str, max_chars: usize) -> String {
 fn extract_text_from_element(el: &scraper::ElementRef<'_>, max_chars: usize) -> String {
     let skip_tags: &[&str] = &[
         "script", "style", "nav", "header", "footer", "noscript", "svg",
-        "aside", "form", "iframe",
+        "aside", "form", "iframe", "button",
+    ];
+    // Also skip elements by class name (cookie banners, ads, navigation chrome)
+    let skip_classes: &[&str] = &[
+        "cookie", "consent", "banner", "modal", "popup", "overlay",
+        "ad-", "advert", "sidebar", "social-share", "newsletter",
+        "privacy", "gdpr", "onetrust", "nav-", "menu",
     ];
     let block_tags: &[&str] = &[
         "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -859,7 +872,7 @@ fn extract_text_from_element(el: &scraper::ElementRef<'_>, max_chars: usize) -> 
     ];
 
     let mut buf = String::with_capacity(max_chars + 256);
-    collect_text(el, &mut buf, skip_tags, block_tags, max_chars);
+    collect_text(el, &mut buf, skip_tags, skip_classes, block_tags, max_chars);
 
     // Decode common HTML entities.
     let decoded = buf
@@ -878,6 +891,7 @@ fn collect_text(
     node: &scraper::ElementRef<'_>,
     buf: &mut String,
     skip_tags: &[&str],
+    skip_classes: &[&str],
     block_tags: &[&str],
     max_chars: usize,
 ) {
@@ -896,11 +910,28 @@ fn collect_text(
                 if skip_tags.contains(&tag) {
                     continue;
                 }
+                // Skip elements whose class contains noise keywords.
+                if let Some(class_attr) = el.attr("class") {
+                    let class_lower = class_attr.to_ascii_lowercase();
+                    if skip_classes.iter().any(|c| class_lower.contains(c)) {
+                        continue;
+                    }
+                }
+                // Extract alt text from images (useful for weather icons, etc.)
+                if tag == "img" {
+                    if let Some(alt) = el.attr("alt") {
+                        let alt = alt.trim();
+                        if !alt.is_empty() && alt.len() < 200 {
+                            buf.push_str(&format!(" [{alt}] "));
+                        }
+                    }
+                    continue;
+                }
                 if block_tags.contains(&tag) {
                     buf.push('\n');
                 }
                 if let Some(child_ref) = scraper::ElementRef::wrap(child) {
-                    collect_text(&child_ref, buf, skip_tags, block_tags, max_chars);
+                    collect_text(&child_ref, buf, skip_tags, skip_classes, block_tags, max_chars);
                 }
             }
             _ => {}
