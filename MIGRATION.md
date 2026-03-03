@@ -2119,3 +2119,52 @@ strengthened to: "You MUST NOT think step-by-step or output any `<think>` tags."
 - `crates/runtime/src/runtime/mod.rs` — wires `config.agent.external_thinking` into `LlmRouter`
 - `crates/runtime/src/prompt_builder.rs` — strengthened anti-thinking directive
 - `MIGRATION.md`
+
+---
+
+## External Thinking: Strong Planning + Proactive Tool-Use
+
+External thinking mode now includes strong planning directives, few-shot examples,
+and a self-check gate to prevent passive "I don't have access" final answers.
+
+**Previous behaviour:** The `build_external_thinking_block` emitted a minimal
+"STRICT JSON-ONLY MODE" preamble with a basic schema and neutral rules. The prose
+tool-awareness and autonomy directives from `build_tools_and_grounding` were still
+injected into the system prompt, conflicting with the JSON-only constraint. The
+model could jump straight to `final_answer` without using any tools.
+
+**New behaviour:**
+
+1. **Conflicting prose instructions suppressed** — when `external_thinking = true`,
+   `build_tools_and_grounding` receives an empty tool list, so the lengthy
+   tool-awareness and autonomy prose block is omitted. The ext-think block lists
+   tools in its own compact format instead.
+
+2. **`ASSISTANT RESPONSE:` completion prefix removed** — the system prompt no
+   longer ends with `ASSISTANT RESPONSE:` when external thinking is active. This
+   prefix was a completion-style artifact that fired the model's continuation
+   instinct before reaching the JSON-only block.
+
+3. **Stronger ext-think prompt with few-shot examples** — the new block includes:
+   - Explicit rule: "NEVER guess or answer from memory for facts a tool can verify"
+   - Mandatory tool-first rule for current data (date, files, web, memory)
+   - Three concrete few-shot examples (`date`, `ls -la`, `web_search`)
+   - Clear "no tool needed" counter-example to prevent over-tooling
+
+4. **Self-check on step 1 final answers** — if the model jumps to `final_answer`
+   on the very first step with a weak thought (passive phrase or < 40 chars),
+   the loop challenges it once: "check your AVAILABLE TOOLS — call a tool if
+   any applies." This fires only once (`steps == 1`) to prevent infinite loops.
+
+**Files modified:**
+- `crates/runtime/src/prompt_builder.rs` — gated prose tool specs, removed
+  `ASSISTANT RESPONSE:` prefix, rewrote `build_external_thinking_block`
+- `crates/runtime/src/ext_think.rs` — added self-check for weak first-step
+  `final_answer` in the `AgentStep::FinalAnswer` arm
+- `MIGRATION.md`
+
+**Testing:**
+- "What day is it?" → should call `run_shell date` then answer with real date
+- "List my files" → should call `run_shell ls -la`
+- "What were we talking about?" → should answer from memory context (no tool)
+- Memory question → should call `search_memory` or answer from injected context

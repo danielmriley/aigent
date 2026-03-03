@@ -294,6 +294,52 @@ pub async fn run_external_thinking_loop(
 
             // ── 4. Final answer ──────────────────────────────────────────
             AgentStep::FinalAnswer { thought, final_answer } => {
+                // ── Self-check on step 1 (no tools used yet) ──────────────────
+                // If the model leaps straight to final_answer without calling
+                // any tool, challenge it once.  Queries involving the current
+                // date/time, files, live data, or memory should always go
+                // through a tool first.  We only challenge on step 1 to keep
+                // the loop from cycling indefinitely.
+                let thought_lc = thought.to_lowercase();
+                let weak_thought = thought.len() < 40
+                    || thought_lc.contains("do not have")
+                    || thought_lc.contains("don't have")
+                    || thought_lc.contains("i don't have")
+                    || thought_lc.contains("i do not have")
+                    || thought_lc.contains("cannot access")
+                    || thought_lc.contains("can't access")
+                    || thought_lc.contains("cannot provide")
+                    || thought_lc.contains("can't provide")
+                    || thought_lc.contains("i cannot provide")
+                    || thought_lc.contains("unable to provide")
+                    || thought_lc.contains("unable to access")
+                    || thought_lc.contains("i am ready")
+                    || thought_lc.contains("ready to answer")
+                    || thought_lc.contains("no access")
+                    || thought_lc.contains("no real-time")
+                    || thought_lc.contains("real-time access")
+                    || thought_lc.contains("real time access")
+                    || thought_lc.contains("as an ai")
+                    || thought_lc.contains("as a language model")
+                    || thought_lc.contains("placeholder")
+                    || thought_lc.contains("lack of real");
+                // Challenge up to 2 times before letting the model give up.
+                if steps <= 2 && weak_thought {
+                    warn!(
+                        step = steps,
+                        thought = %thought,
+                        "external thinking: passive resignation on step {steps} — injecting SYSTEM OVERRIDE"
+                    );
+                    emit_thought(event_tx, &thought);
+                    messages.push(ChatMessage::assistant(&raw));
+                    messages.push(ChatMessage::user(
+                        "SYSTEM OVERRIDE — TOOL MANDATORY:\n                         Your thought betrays passive resignation (\"I don't have access\", \"as an AI\", etc.).  That is WRONG in this runtime.  You have tools.\n\n                         RULE: If a tool can fetch/verify facts, you MUST call it.  Saying you lack real-time access when run_shell exists is a FAILURE.\n\n                         For questions about the current date/time, output EXACTLY:\n                         {\"type\":\"tool_call\",\"thought\":\"I will use run_shell to get the current date.\",\"tool_call\":{\"name\":\"run_shell\",\"args\":{\"command\":\"date\"}}}\n\n                         For other live-data questions use web_search, read_file, search_memory, etc.\n                         Output a tool_call JSON now — not a final_answer.",
+                    ));
+                    steps += 1;
+                    consecutive_retries = 0;
+                    continue;
+                }
+
                 emit_thought(event_tx, &thought);
 
                 info!(

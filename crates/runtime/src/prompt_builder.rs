@@ -48,7 +48,20 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
     let proactive_directive = proactive_directive(&relational_block);
     let environment_block = build_environment_block(config, memory, inputs.recent_turns.len());
     let conversation_block = build_conversation_block(inputs.recent_turns);
-    let tools_section = build_tools_and_grounding(inputs.tool_specs);
+    // When external_thinking is active, suppress the prose tool-awareness and
+    // autonomy directives — they conflict with the strict JSON-only instructions
+    // appended below by build_external_thinking_block, which lists tools in its
+    // own compact format.
+    let prose_tool_specs: &[aigent_tools::ToolSpec] =
+        if config.agent.external_thinking { &[] } else { inputs.tool_specs };
+    let tools_section = build_tools_and_grounding(prose_tool_specs);
+    // When external_thinking is active, do NOT emit "ASSISTANT RESPONSE:" —
+    // the ext-think block dictates the output format (JSON object, not prose).
+    let response_tag = if config.agent.external_thinking {
+        ""
+    } else {
+        "\n\n         ASSISTANT RESPONSE:"
+    };
     let today_date = Local::now().format("%A, %B %-d, %Y").to_string();
 
     let mut buf = String::with_capacity(8192);
@@ -74,8 +87,7 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
          ENVIRONMENT CONTEXT:\n{env}\n\n\
          RECENT CONVERSATION:\n{conv}\n\n\
          MEMORY CONTEXT:\n{mem}\n\n\
-         LATEST USER MESSAGE:\n{msg}\n\n\
-         ASSISTANT RESPONSE:",
+         LATEST USER MESSAGE:\n{msg}{response_tag}",
         name = config.agent.name,
         today_date = today_date,
         relational_block = relational_block,
@@ -88,6 +100,7 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
         conv = conversation_block,
         mem = context_block,
         msg = inputs.user_message,
+        response_tag = response_tag,
     );
 
     // ── External thinking mode ───────────────────────────────────────────
@@ -110,32 +123,60 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
 /// Includes the available tool names so the model knows exactly which tools
 /// it can invoke.
 fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> String {
-    let mut buf = String::with_capacity(2048);
+    let mut buf = String::with_capacity(4096);
 
-    // ── Hard constraint preamble ─────────────────────────────────────────────────────
+    // ── Mode header ───────────────────────────────────────────────────────────────────────
     buf.push_str(
-        "\n\n## STRICT JSON-ONLY MODE\n\n\
-         You are in STRICT JSON-ONLY MODE. Output ONLY the JSON object below.\n\
-         No markdown, no extra text, no explanations, no ```json fences, \
-         no <thinking> tags, no comments.\n\
-         Your entire response must be parseable by a JSON parser.\n\n",
+        "\n\n## EXTERNAL REASONING MODE ACTIVE — YOU ARE AN AGENT WITH TOOLS\n\n\
+         You MUST output ONLY a single valid JSON object. No prose, no markdown,\n\
+         no ```json fences, no <think> tags, no explanations before or after.\n\n",
     );
 
-    // ── JSON schema ──────────────────────────────────────────────────────────
+    // ── Mandatory planning rules ───────────────────────────────────────────────
     buf.push_str(
-        "You must output EXACTLY ONE of these two JSON objects:\n\n\
-         OPTION A — tool call:\n",
+        "RULES YOU MUST FOLLOW:\n\
+         1. Think step-by-step in the \"thought\" field before deciding what to do.\n\
+         2. NEVER guess, hallucinate, or answer from memory for facts that a tool can verify.\n\
+         3. If the question involves current data (date/time, files, memory, web, weather,\n\
+            code, prices, news) — call a tool FIRST. Do not assume you know the answer.\n\
+         4. Use tools proactively: run_shell, web_search, read_file, search_memory,\n\
+            find, grep, web_browse and more. Prefer acting over guessing.\n\
+         5. Output ONLY a tool_call or final_answer JSON — never both.\n\
+         6. \"type\" MUST be exactly \"tool_call\" or \"final_answer\".\n\
+         7. NEVER wrap in markdown or add any text outside the JSON object.\n\n",
     );
+
+    // ── Few-shot examples ──────────────────────────────────────────────────────────
+    buf.push_str("EXAMPLES OF CORRECT BEHAVIOR:\n\nUser asks: \"What day is it today?\"\n");
     buf.push_str(
-        r#"{"type":"tool_call","thought":"one sentence","tool_call":{"name":"TOOL_NAME","args":{"key":"value"}}}"#,
+        r#"{"type":"tool_call","thought":"I should use run_shell to get the current date rather than guessing.","tool_call":{"name":"run_shell","args":{"command":"date"}}}"#,
     );
-    buf.push_str("\n\nOPTION B — final answer:\n");
+    buf.push_str("\n\nUser asks: \"List my files\"\n");
     buf.push_str(
-        r#"{"type":"final_answer","thought":"one sentence","final_answer":"your complete response to the user"}"#,
+        r#"{"type":"tool_call","thought":"I should list the workspace files using run_shell.","tool_call":{"name":"run_shell","args":{"command":"ls -la"}}}"#,
+    );
+    buf.push_str("\n\nUser asks: \"What's the weather in London?\"\n");
+    buf.push_str(
+        r#"{"type":"tool_call","thought":"This requires current data. I will use web_search.","tool_call":{"name":"web_search","args":{"query":"current weather London"}}}"#,
+    );
+    buf.push_str("\n\nUser asks a simple question answerable from conversation context:\n");
+    buf.push_str(
+        r#"{"type":"final_answer","thought":"Answerable from context, no tool needed.","final_answer":"Your complete response here."}"#,
     );
     buf.push_str("\n\n");
 
-    // ── Available tools ────────────────────────────────────────────────────────
+    // ── JSON schema reminder ───────────────────────────────────────────────────────
+    buf.push_str("OUTPUT ONE OF THESE TWO SCHEMAS ONLY:\nTOOL CALL: ");
+    buf.push_str(
+        r#"{"type":"tool_call","thought":"<1-sentence reasoning>","tool_call":{"name":"<TOOL_NAME>","args":{"<key>":"<value>"}}}"#,
+    );
+    buf.push_str("\nFINAL ANSWER: ");
+    buf.push_str(
+        r#"{"type":"final_answer","thought":"<1-sentence reasoning>","final_answer":"<complete response to user>"}"#,
+    );
+    buf.push_str("\n\n");
+
+    // ── Available tools ──────────────────────────────────────────────────────
     if !tool_specs.is_empty() {
         buf.push_str("AVAILABLE TOOLS (use ONLY these exact names in tool_call.name):\n");
         for spec in tool_specs {
@@ -156,28 +197,12 @@ fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> Strin
         buf.push('\n');
     }
 
-    // ── Rules ───────────────────────────────────────────────────────────────
+    // ── Anti-internal-thinking directive ─────────────────────────────────────
+    // The LLM backend sends `"think": false` to Ollama — this is a safety-net
+    // for models that still emit <think> tags despite the API flag.
     buf.push_str(
-        "RULES (violation = system error):\n\
-         1. Your ENTIRE response is the JSON object. Nothing before, nothing after.\n\
-         2. \"type\" MUST be exactly \"tool_call\" or \"final_answer\".\n\
-         3. \"thought\" MUST be 1 sentence, max 25 words.\n\
-         4. tool_call: \"tool_call\" is required. Do NOT include \"final_answer\".\n\
-         5. final_answer: \"final_answer\" is required. Do NOT include \"tool_call\".\n\
-         6. If no tool is needed, respond with final_answer immediately.\n\
-         7. NEVER wrap in ```json``` or any markdown.\n\
-         8. NEVER output free text, apologies, or explanations outside the JSON.\n",
-    );
-
-    // ── Anti-internal-thinking directive ─────────────────────────────────
-    // When external thinking is active the LLM backend receives
-    // `"think": false` in every Ollama payload (set automatically from config
-    // via `suppress_thinking`).  This prompt reinforcement is a safety-net
-    // for models that still attempt thinking despite the API flag.
-    buf.push_str(
-        "\nINTERNAL THINKING IS DISABLED.\n\
-         You MUST NOT think step-by-step or output any <think> tags.\n\
-         Output ONLY the exact JSON structure required.\n",
+        "INTERNAL THINKING DISABLED: do NOT output <think> tags or chain-of-thought text.\n\
+         Your ENTIRE response must be the single JSON object above — nothing else.\n",
     );
 
     buf
@@ -702,10 +727,10 @@ mod ext_think_tests {
     #[test]
     fn external_thinking_block_empty_tools() {
         let block = build_external_thinking_block(&[]);
-        assert!(block.contains("STRICT JSON-ONLY MODE"));
+        assert!(block.contains("EXTERNAL REASONING MODE ACTIVE"));
         assert!(block.contains("tool_call"));
         assert!(block.contains("final_answer"));
-        assert!(block.contains("RULES (violation = system error)"));
+        assert!(block.contains("RULES YOU MUST FOLLOW"));
         assert!(!block.contains("AVAILABLE TOOLS"));
     }
 
