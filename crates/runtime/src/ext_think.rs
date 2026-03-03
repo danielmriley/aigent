@@ -325,7 +325,18 @@ pub async fn run_external_thinking_loop(
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Call the LLM and collect the full (non-streaming) response with a timeout.
+/// Call the LLM and collect the full response with an **activity-based** timeout.
+///
+/// Instead of applying a hard cap on total response time (which fails for
+/// large models with slow time-to-first-token), the timeout resets every time
+/// the model produces a new token.  This accommodates:
+///
+/// - Slow model loading on first request (Ollama loads into VRAM lazily).
+/// - Long prefill / TTFT for large models (35B+) with big system prompts.
+/// - JSON-constrained decoding which can be slower than free-form generation.
+///
+/// The timeout only fires when the model goes **completely silent** for
+/// `config.step_timeout` (default 60 s), which indicates a genuine hang.
 ///
 /// When the provider is Ollama, enables `format: "json"` at the API level so
 /// the model is constrained to valid JSON output.
@@ -337,23 +348,14 @@ async fn call_llm_with_timeout(
     openrouter_model: &str,
     messages: &[ChatMessage],
 ) -> Result<String> {
-    // We use a non-streaming call since we need the complete JSON before parsing.
-    // Create a dummy channel to collect tokens into a buffer.
     let (tx, mut rx) = mpsc::channel::<String>(256);
-    let collect_handle = tokio::spawn(async move {
-        let mut buf = String::new();
-        while let Some(chunk) = rx.recv().await {
-            buf.push_str(&chunk);
-        }
-        buf
-    });
 
     // Enable JSON mode for the request — this tells Ollama to add `format: "json"`
     // which constrains the model's output to valid JSON at the token-sampling level.
     let json_mode = true;
 
     let msgs = messages.to_vec();
-    let fut = llm.chat_messages_stream(
+    let llm_fut = llm.chat_messages_stream(
         primary,
         ollama_model,
         openrouter_model,
@@ -363,22 +365,62 @@ async fn call_llm_with_timeout(
         json_mode,
         true, // Suppress native <think> reasoning — we drive thinking externally.
     );
+    tokio::pin!(llm_fut);
 
-    let response = tokio::time::timeout(config.step_timeout, fut)
-        .await
-        .context("step timed out")?
+    let mut buf = String::new();
+    let mut llm_result: Option<Result<_>> = None;
+
+    // Activity-based timeout loop: the countdown resets every time the model
+    // produces a token.  When the LLM future completes we drain any residual
+    // buffered tokens before breaking.
+    loop {
+        if llm_result.is_some() {
+            // LLM future already completed — drain remaining buffered tokens.
+            match rx.try_recv() {
+                Ok(chunk) => {
+                    buf.push_str(&chunk);
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+
+        tokio::select! {
+            // Prefer detecting LLM completion over reading tokens to avoid an
+            // unnecessary extra loop iteration.
+            biased;
+
+            result = &mut llm_fut, if llm_result.is_none() => {
+                llm_result = Some(result);
+                // Don't break yet — drain remaining buffered tokens on next iteration.
+            }
+
+            maybe = tokio::time::timeout(config.step_timeout, rx.recv()) => {
+                match maybe {
+                    Ok(Some(chunk)) => buf.push_str(&chunk),
+                    Ok(None) => break, // Channel closed — all tokens drained.
+                    Err(_) => bail!(
+                        "step timed out (no tokens received for {}s)",
+                        config.step_timeout.as_secs(),
+                    ),
+                }
+            }
+        }
+    }
+
+    let response = llm_result
+        .context("LLM stream ended without completing")?
         .context("LLM call failed")?;
 
-    // Prefer the response content; fall back to collected tokens.
+    // Prefer the assembled response from the provider; fall back to the token
+    // buffer which contains the same data collected piecemeal.
     let text = if !response.content.is_empty() {
         response.content
+    } else if !buf.is_empty() {
+        buf
     } else {
-        collect_handle.await.unwrap_or_default()
-    };
-
-    if text.trim().is_empty() {
         bail!("LLM returned empty response");
-    }
+    };
 
     Ok(text)
 }

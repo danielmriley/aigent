@@ -110,6 +110,9 @@ pub struct ChatResponse {
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
     client: reqwest::Client,
+    /// When `true`, every Ollama payload receives `"think": false`.
+    /// Set automatically when `config.agent.external_thinking = true`.
+    suppress_thinking: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +124,7 @@ impl OllamaClient {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
+            suppress_thinking: false,
         }
     }
 }
@@ -287,6 +291,15 @@ impl LlmRouter {
             #[cfg(feature = "candle")]
             candle_config: None,
         }
+    }
+
+    /// Enable automatic `"think": false` on every Ollama request.
+    ///
+    /// Called when `config.agent.external_thinking = true` so the model
+    /// never wastes time on internal chain-of-thought reasoning.
+    pub fn with_suppress_thinking(mut self, suppress: bool) -> Self {
+        self.ollama.suppress_thinking = suppress;
+        self
     }
 
     /// Configure the Candle backend for local inference.
@@ -774,11 +787,12 @@ impl OllamaClient {
         if json_mode {
             payload["format"] = json!("json");
         }
-        if disable_native_thinking {
+        if self.suppress_thinking || disable_native_thinking {
             // Ollama's `"think": false` flag disables internal chain-of-thought
             // reasoning at the inference level for thinking-capable models
             // (Qwen 3, DeepSeek R1, etc.).  Non-thinking models ignore the flag.
-            // When omitted, Ollama uses the model's default behaviour.
+            // `self.suppress_thinking` is set from config.agent.external_thinking;
+            // `disable_native_thinking` is set per-call by ext_think.rs.
             payload["think"] = json!(false);
         }
         if let Some(tools_val) = tools {
@@ -826,8 +840,9 @@ impl OllamaClient {
         if json_mode {
             payload["format"] = json!("json");
         }
-        if disable_native_thinking {
+        if self.suppress_thinking || disable_native_thinking {
             // Mirror the non-streaming path: suppress internal reasoning.
+            // `self.suppress_thinking` from config; `disable_native_thinking` per-call.
             payload["think"] = json!(false);
         }
         if let Some(tools_val) = tools {

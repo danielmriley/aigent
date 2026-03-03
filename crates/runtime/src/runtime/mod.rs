@@ -28,7 +28,8 @@ pub struct AgentRuntime {
 impl AgentRuntime {
     pub fn new(config: AppConfig) -> Self {
         #[allow(unused_mut)]
-        let mut llm = LlmRouter::new();
+        let mut llm = LlmRouter::new()
+            .with_suppress_thinking(config.agent.external_thinking);
 
         // Wire Candle local inference backend when the feature is compiled in
         // and the user has enabled it in [inference].

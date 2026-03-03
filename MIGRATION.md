@@ -2093,3 +2093,29 @@ non-external-thinking Ollama paths.
 - `crates/runtime/src/react_loop.rs`
 - `crates/exec/src/tool_chain.rs`
 - `MIGRATION.md`
+
+---
+
+## Automatic `"think": false` from Config
+
+Ollama now automatically receives `"think": false` in every JSON payload when
+`config.agent.external_thinking = true`.
+
+**Previous behaviour:** The `disable_native_thinking` parameter had to be passed
+explicitly per call site. Only `ext_think.rs` passed `true`.
+
+**New behaviour:** `OllamaClient` stores a `suppress_thinking: bool` field, set
+at construction time from `config.agent.external_thinking` via
+`LlmRouter::with_suppress_thinking()`. Every Ollama request (both `chat_messages`
+and `chat_messages_stream`) checks `self.suppress_thinking || disable_native_thinking`
+before injecting `"think": false`. This ensures the flag is sent globally — not
+just from the external thinking loop.
+
+**Prompt reinforcement:** The anti-thinking directive in `prompt_builder.rs` was
+strengthened to: "You MUST NOT think step-by-step or output any `<think>` tags."
+
+**Files modified:**
+- `crates/llm/src/lib.rs` — `suppress_thinking` field on `OllamaClient`, `with_suppress_thinking()` on `LlmRouter`
+- `crates/runtime/src/runtime/mod.rs` — wires `config.agent.external_thinking` into `LlmRouter`
+- `crates/runtime/src/prompt_builder.rs` — strengthened anti-thinking directive
+- `MIGRATION.md`
