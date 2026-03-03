@@ -544,3 +544,46 @@ mod tests {
         assert!(section.contains("GROUNDING RULES"));
     }
 }
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use crate::PromptInputs;
+    use aigent_config::AppConfig;
+
+    fn make_inputs(summary: Option<String>) -> String {
+        let config = AppConfig::default();
+        let inputs = PromptInputs {
+            config: &config,
+            user_message: "Hello",
+            recent_turns: &[],
+            tool_specs: &[],
+            pending_follow_ups: &[],
+            context_items: &[],
+            stats: Default::default(),
+            identity_block: String::new(),
+            beliefs_block: String::new(),
+            user_name: None,
+            relational_block: None,
+            conversation_summary: summary,
+        };
+        build_chat_prompt(&inputs)
+    }
+
+    #[test]
+    fn no_summary_block_when_none() {
+        let prompt = make_inputs(None);
+        assert!(!prompt.contains("PRIOR CONVERSATION SUMMARY"));
+    }
+
+    #[test]
+    fn summary_block_rendered_when_present() {
+        let prompt = make_inputs(Some("User asked about Rust lifetimes. Agent explained borrowing.".into()));
+        assert!(prompt.contains("PRIOR CONVERSATION SUMMARY"));
+        assert!(prompt.contains("Rust lifetimes"));
+        // Summary appears before RECENT CONVERSATION
+        let summary_pos = prompt.find("PRIOR CONVERSATION SUMMARY").unwrap();
+        let conv_pos = prompt.find("RECENT CONVERSATION:\n").unwrap();
+        assert!(summary_pos < conv_pos, "summary should precede the RECENT CONVERSATION section");
+    }
+}
