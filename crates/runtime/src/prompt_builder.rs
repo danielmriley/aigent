@@ -87,6 +87,7 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
          ENVIRONMENT CONTEXT:\n{env}\n\n\
          RECENT CONVERSATION:\n{conv}\n\n\
          MEMORY CONTEXT:\n{mem}\n\n\
+         {ext_think}\
          LATEST USER MESSAGE:\n{msg}{response_tag}",
         name = config.agent.name,
         today_date = today_date,
@@ -99,14 +100,14 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
         env = environment_block,
         conv = conversation_block,
         mem = context_block,
+        ext_think = if config.agent.external_thinking {
+            build_external_thinking_block(inputs.tool_specs)
+        } else {
+            String::new()
+        },
         msg = inputs.user_message,
         response_tag = response_tag,
     );
-
-    // ── External thinking mode ───────────────────────────────────────────
-    if config.agent.external_thinking {
-        buf.push_str(&build_external_thinking_block(inputs.tool_specs));
-    }
 
     buf
 }
@@ -123,87 +124,25 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
 /// Includes the available tool names so the model knows exactly which tools
 /// it can invoke.
 fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> String {
-    let mut buf = String::with_capacity(4096);
+    let mut buf = String::with_capacity(2048);
 
-    // ── Mode header ───────────────────────────────────────────────────────────────────────
+    // ── Concise mode header + schema ─────────────────────────────────────
     buf.push_str(
-        "\n\n## EXTERNAL REASONING MODE ACTIVE — YOU ARE AN AGENT WITH TOOLS\n\n\
-         You MUST output ONLY a single valid JSON object. No prose, no markdown,\n\
-         no ```json fences, no <think> tags, no explanations before or after.\n\n",
-    );
-
-    // ── Mandatory planning rules ───────────────────────────────────────────────
-    buf.push_str(
-        "RULES YOU MUST FOLLOW:\n\
-         1. Think step-by-step in the \"thought\" field before deciding what to do.\n\
-         2. NEVER guess, hallucinate, or answer from memory for facts that a tool can verify.\n\
-         3. If the question involves current data (date/time, files, memory, web, weather,\n\
-            code, prices, news) — call a tool FIRST. Do not assume you know the answer.\n\
-         4. Use tools proactively: run_shell, web_search, read_file, search_memory,\n\
-            find, grep, web_browse and more. Prefer acting over guessing.\n\
-         5. Output ONLY a tool_call or final_answer JSON — never both.\n\
-         6. \"type\" MUST be exactly \"tool_call\" or \"final_answer\".\n\
-         7. NEVER wrap in markdown or add any text outside the JSON object.\n\n",
+        "\n\n## JSON AGENT MODE\n\
+         Output ONLY a single JSON object. No prose, no markdown, no fences.\n\n\
+         TOOL CALL: {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
+         FINAL ANSWER: {\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<response>\"}\n\n\
+         Use a tool for anything that needs current/live data (date, files, web, system info).\n\
+         Example — date: {\"type\":\"tool_call\",\"thought\":\"get date\",\"tool_call\":{\"name\":\"run_shell\",\"args\":{\"command\":\"date\"}}}\n\n",
     );
 
-    // ── Few-shot examples ──────────────────────────────────────────────────────────
-    buf.push_str("EXAMPLES OF CORRECT BEHAVIOR:\n\nUser asks: \"What day is it today?\"\n");
-    buf.push_str(
-        r#"{"type":"tool_call","thought":"I should use run_shell to get the current date rather than guessing.","tool_call":{"name":"run_shell","args":{"command":"date"}}}"#,
-    );
-    buf.push_str("\n\nUser asks: \"List my files\"\n");
-    buf.push_str(
-        r#"{"type":"tool_call","thought":"I should list the workspace files using run_shell.","tool_call":{"name":"run_shell","args":{"command":"ls -la"}}}"#,
-    );
-    buf.push_str("\n\nUser asks: \"What's the weather in London?\"\n");
-    buf.push_str(
-        r#"{"type":"tool_call","thought":"This requires current data. I will use web_search.","tool_call":{"name":"web_search","args":{"query":"current weather London"}}}"#,
-    );
-    buf.push_str("\n\nUser asks a simple question answerable from conversation context:\n");
-    buf.push_str(
-        r#"{"type":"final_answer","thought":"Answerable from context, no tool needed.","final_answer":"Your complete response here."}"#,
-    );
-    buf.push_str("\n\n");
-
-    // ── JSON schema reminder ───────────────────────────────────────────────────────
-    buf.push_str("OUTPUT ONE OF THESE TWO SCHEMAS ONLY:\nTOOL CALL: ");
-    buf.push_str(
-        r#"{"type":"tool_call","thought":"<1-sentence reasoning>","tool_call":{"name":"<TOOL_NAME>","args":{"<key>":"<value>"}}}"#,
-    );
-    buf.push_str("\nFINAL ANSWER: ");
-    buf.push_str(
-        r#"{"type":"final_answer","thought":"<1-sentence reasoning>","final_answer":"<complete response to user>"}"#,
-    );
-    buf.push_str("\n\n");
-
-    // ── Available tools ──────────────────────────────────────────────────────
+    // ── Compact tool list (names only, no params) ────────────────────────
     if !tool_specs.is_empty() {
-        buf.push_str("AVAILABLE TOOLS (use ONLY these exact names in tool_call.name):\n");
-        for spec in tool_specs {
-            buf.push_str(&format!("- {}: {}", spec.name, spec.description));
-            if !spec.params.is_empty() {
-                let params: Vec<String> = spec
-                    .params
-                    .iter()
-                    .map(|p| {
-                        let req = if p.required { ", required" } else { "" };
-                        format!("\"{}\" ({}{})", p.name, p.description, req)
-                    })
-                    .collect();
-                buf.push_str(&format!("  args: {{{}}}", params.join(", ")));
-            }
-            buf.push('\n');
-        }
-        buf.push('\n');
+        buf.push_str("TOOLS: ");
+        let names: Vec<&str> = tool_specs.iter().map(|s| s.name.as_str()).collect();
+        buf.push_str(&names.join(", "));
+        buf.push_str("\nrun_shell can execute ANY shell command (date, ls, curl, etc.)\n\n");
     }
-
-    // ── Anti-internal-thinking directive ─────────────────────────────────────
-    // The LLM backend sends `"think": false` to Ollama — this is a safety-net
-    // for models that still emit <think> tags despite the API flag.
-    buf.push_str(
-        "INTERNAL THINKING DISABLED: do NOT output <think> tags or chain-of-thought text.\n\
-         Your ENTIRE response must be the single JSON object above — nothing else.\n",
-    );
 
     buf
 }
@@ -727,11 +666,10 @@ mod ext_think_tests {
     #[test]
     fn external_thinking_block_empty_tools() {
         let block = build_external_thinking_block(&[]);
-        assert!(block.contains("EXTERNAL REASONING MODE ACTIVE"));
+        assert!(block.contains("JSON AGENT MODE"));
         assert!(block.contains("tool_call"));
         assert!(block.contains("final_answer"));
-        assert!(block.contains("RULES YOU MUST FOLLOW"));
-        assert!(!block.contains("AVAILABLE TOOLS"));
+        assert!(!block.contains("TOOLS:"));
     }
 
     #[test]
@@ -748,10 +686,8 @@ mod ext_think_tests {
             metadata: aigent_tools::ToolMetadata::default(),
         }];
         let block = build_external_thinking_block(&specs);
-        assert!(block.contains("AVAILABLE TOOLS"));
+        assert!(block.contains("TOOLS:"));
         assert!(block.contains("read_file"));
-        assert!(block.contains("Read a file from disk"));
-        assert!(block.contains("\"path\""));
     }
 
     #[test]

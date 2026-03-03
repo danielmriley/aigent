@@ -136,6 +136,8 @@ pub async fn run_external_thinking_loop(
 ) -> Result<ExtThinkResult> {
     let mut steps = 0usize;
     let mut consecutive_retries = 0usize;
+    let mut has_used_tool = false;
+    let mut challenge_count = 0usize;
 
     loop {
         if steps >= config.max_steps {
@@ -283,58 +285,146 @@ pub async fn run_external_thinking_loop(
                 // Record assistant message (the JSON we got).
                 messages.push(ChatMessage::assistant(&raw));
 
-                // Build observation and feed it back.
-                let obs = format!(
-                    "Tool `{}` returned (success={success}):\n{output}",
-                    tool_call.name,
-                );
+                has_used_tool = true;
+
+                // Build observation and feed it back, with a nudge toward
+                // final_answer if the tool succeeded — this cuts prefill
+                // time because the model doesn't deliberate about next steps.
+                let obs = if success {
+                    format!(
+                        "Tool `{}` returned (success=true):\n{output}\n\nNow give a final_answer with this result.",
+                        tool_call.name,
+                    )
+                } else {
+                    format!(
+                        "Tool `{}` returned (success=false):\n{output}",
+                        tool_call.name,
+                    )
+                };
                 let truncated_obs = crate::prompt_builder::truncate_for_prompt(&obs, 2048);
                 messages.push(ChatMessage::user(&truncated_obs));
             }
 
             // ── 4. Final answer ──────────────────────────────────────────
             AgentStep::FinalAnswer { thought, final_answer } => {
-                // ── Self-check on step 1 (no tools used yet) ──────────────────
-                // If the model leaps straight to final_answer without calling
-                // any tool, challenge it once.  Queries involving the current
-                // date/time, files, live data, or memory should always go
-                // through a tool first.  We challenge up to 2 times to keep
-                // the loop from cycling indefinitely (max 2 challenges).
+                // ── Self-check: force tool use before accepting final_answer ──
+                // Three independent triggers can challenge the model:
+                //  (a) Passive-resignation language ("I don't have access", etc.)
+                //  (b) Hallucinated factual claims (dates, file paths) without
+                //      having called any tool first
+                //  (c) Suspiciously short thought with no tool used
+                // We challenge up to MAX_CHALLENGES times to keep the loop
+                // from cycling indefinitely.
+                const MAX_CHALLENGES: usize = 3;
+
                 let thought_lc = thought.to_lowercase();
-                let weak_thought = thought.len() < 40
-                    || thought_lc.contains("do not have")
-                    || thought_lc.contains("don't have")
-                    || thought_lc.contains("i don't have")
-                    || thought_lc.contains("i do not have")
-                    || thought_lc.contains("cannot access")
-                    || thought_lc.contains("can't access")
-                    || thought_lc.contains("cannot provide")
-                    || thought_lc.contains("can't provide")
-                    || thought_lc.contains("i cannot provide")
-                    || thought_lc.contains("unable to provide")
-                    || thought_lc.contains("unable to access")
-                    || thought_lc.contains("i am ready")
-                    || thought_lc.contains("ready to answer")
-                    || thought_lc.contains("no access")
-                    || thought_lc.contains("no real-time")
-                    || thought_lc.contains("real-time access")
-                    || thought_lc.contains("real time access")
-                    || thought_lc.contains("as an ai")
-                    || thought_lc.contains("as a language model")
-                    || thought_lc.contains("placeholder")
-                    || thought_lc.contains("lack of real");
-                // Challenge up to 2 times before letting the model give up.
-                if steps <= 2 && weak_thought {
+                let answer_lc = final_answer.to_lowercase();
+
+                // (a) Passive-resignation detector
+                let passive_resignation = [
+                    "do not have", "don't have", "i don't have", "i do not have",
+                    "cannot access", "can't access", "cannot provide", "can't provide",
+                    "i cannot provide", "unable to provide", "unable to access",
+                    "i am ready", "ready to answer", "no access",
+                    "no real-time", "real-time access", "real time access",
+                    "as an ai", "as a language model", "placeholder",
+                    "lack of real", "training data", "knowledge cutoff",
+                    // Catch phrases the model invents to avoid tool use
+                    "i lack", "lack a tool", "no tool", "no way to",
+                    "not able to", "not possible to", "no means to",
+                    "no capability", "no function", "don't know",
+                    "do not know", "not equipped", "not designed to",
+                ].iter().any(|p| thought_lc.contains(p));
+
+                // (b) Hallucinated-fact detector — does the answer contain
+                //     date/time patterns or file paths that the model should
+                //     have verified with a tool?
+                let has_date_pattern = answer_lc.contains("january")
+                    || answer_lc.contains("february")
+                    || answer_lc.contains("march")
+                    || answer_lc.contains("april")
+                    || answer_lc.contains("may 2")     // avoid "may" alone
+                    || answer_lc.contains("june")
+                    || answer_lc.contains("july")
+                    || answer_lc.contains("august")
+                    || answer_lc.contains("september")
+                    || answer_lc.contains("october")
+                    || answer_lc.contains("november")
+                    || answer_lc.contains("december")
+                    || answer_lc.contains("2024")
+                    || answer_lc.contains("2025")
+                    || answer_lc.contains("2026")
+                    || answer_lc.contains("today is")
+                    || answer_lc.contains("monday")
+                    || answer_lc.contains("tuesday")
+                    || answer_lc.contains("wednesday")
+                    || answer_lc.contains("thursday")
+                    || answer_lc.contains("friday")
+                    || answer_lc.contains("saturday")
+                    || answer_lc.contains("sunday");
+                let has_file_path = answer_lc.contains("/home/")
+                    || answer_lc.contains("/usr/")
+                    || answer_lc.contains("/tmp/")
+                    || answer_lc.contains("/etc/");
+                let answer_has_factual_claims = has_date_pattern || has_file_path;
+
+                // (d) First-step catch-all: if the model jumps straight to
+                //     final_answer on step 1 without having called ANY tool,
+                //     always challenge.  This is the strongest guard — it does
+                //     not rely on pattern matching and catches every new phrase
+                //     the model invents to avoid tool use.
+                let first_step_no_tool = steps <= 1 && !has_used_tool;
+
+                // Trigger challenge if:
+                //  - FIRST STEP and no tool used (catch-all), OR
+                //  - passive resignation detected (any step), OR
+                //  - model hasn't used ANY tool and answer has factual claims, OR
+                //  - model hasn't used ANY tool and thought is suspiciously short
+                let should_challenge = challenge_count < MAX_CHALLENGES
+                    && (first_step_no_tool
+                        || passive_resignation
+                        || (!has_used_tool && answer_has_factual_claims)
+                        || (!has_used_tool && thought.len() < 40));
+
+                if should_challenge {
+                    let reason = if first_step_no_tool && !passive_resignation {
+                        "first step without any tool use"
+                    } else if passive_resignation {
+                        "passive resignation language"
+                    } else if answer_has_factual_claims {
+                        "factual claims without tool verification"
+                    } else {
+                        "suspiciously short reasoning without tool use"
+                    };
+
                     warn!(
                         step = steps,
                         thought = %thought,
-                        "external thinking: passive resignation on step {steps} — injecting SYSTEM OVERRIDE"
+                        reason = reason,
+                        "external thinking: challenging final_answer — {reason}"
                     );
                     emit_thought(event_tx, &thought);
                     messages.push(ChatMessage::assistant(&raw));
-                    messages.push(ChatMessage::user(
-                        "SYSTEM OVERRIDE — TOOL MANDATORY:\n                         Your thought betrays passive resignation (\"I don't have access\", \"as an AI\", etc.).  That is WRONG in this runtime.  You have tools.\n\n                         RULE: If a tool can fetch/verify facts, you MUST call it.  Saying you lack real-time access when run_shell exists is a FAILURE.\n\n                         For questions about the current date/time, output EXACTLY:\n                         {\"type\":\"tool_call\",\"thought\":\"I will use run_shell to get the current date.\",\"tool_call\":{\"name\":\"run_shell\",\"args\":{\"command\":\"date\"}}}\n\n                         For other live-data questions use web_search, read_file, search_memory, etc.\n                         Output a tool_call JSON now — not a final_answer.",
-                    ));
+
+                    let override_msg = format!(
+                        "SYSTEM OVERRIDE — TOOL MANDATORY (reason: {reason}):\n\
+                         Your answer was rejected because: {reason}.\n\
+                         You have NOT used any tool yet. That is WRONG.\n\n\
+                         RULES:\n\
+                         - If a tool can fetch/verify facts, you MUST call it.\n\
+                         - Saying you lack real-time access when run_shell exists is a FAILURE.\n\
+                         - Dates, times, file contents, system info → ALWAYS use a tool.\n\n\
+                         For the current date/time, output EXACTLY:\n\
+                         {{\"type\":\"tool_call\",\"thought\":\"I will use run_shell to get the date.\",\
+                         \"tool_call\":{{\"name\":\"run_shell\",\"args\":{{\"command\":\"date\"}}}}}}\n\n\
+                         For file listing:\n\
+                         {{\"type\":\"tool_call\",\"thought\":\"I will list files.\",\
+                         \"tool_call\":{{\"name\":\"run_shell\",\"args\":{{\"command\":\"ls -la\"}}}}}}\n\n\
+                         Output a tool_call JSON now — NOT a final_answer."
+                    );
+                    messages.push(ChatMessage::user(&override_msg));
+
+                    challenge_count += 1;
                     steps += 1;
                     consecutive_retries = 0;
                     continue;
