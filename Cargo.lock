@@ -85,6 +85,7 @@ name = "aigent-exec"
 version = "0.1.0"
 dependencies = [
  "aigent-config",
+ "aigent-llm",
  "aigent-tools",
  "anyhow",
  "async-trait",

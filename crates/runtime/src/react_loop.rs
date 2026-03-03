@@ -14,6 +14,8 @@
 //! When critique is disabled (default for fast mode), the loop behaves
 //! identically to [`run_tool_loop`] but with phase tracking overlaid.
 
+
+
 use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -120,6 +122,7 @@ pub async fn run_react_loop(
                         messages,
                         effective_tools,
                         token_tx.clone(),
+                        false,
                         false,
                     )
                     .await?;

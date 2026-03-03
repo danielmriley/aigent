@@ -169,6 +169,17 @@ fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> Strin
          8. NEVER output free text, apologies, or explanations outside the JSON.\n",
     );
 
+    // ── Anti-internal-thinking directive ─────────────────────────────────
+    // When external thinking is active the LLM backend receives
+    // `disable_native_thinking = true` (Ollama's `"think": false`).
+    // This prompt reinforcement is a safety-net for models that still
+    // attempt thinking despite the API flag.
+    buf.push_str(
+        "\nINTERNAL THINKING IS DISABLED.\n\
+         Do not output <think> tags or any reasoning preamble.\n\
+         Output ONLY the exact JSON structure required.\n",
+    );
+
     buf
 }
 

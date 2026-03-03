@@ -2029,3 +2029,67 @@ steps" errors.
 **Backward compatibility:** When `external_thinking = false` (default), none of
 these code paths are reached.  The `json_mode` parameter defaults to `false` at
 all non-external-thinking call sites.
+
+---
+
+## Phase 1.2 — Disable Ollama Internal Thinking (`disable_native_thinking`)
+
+**Date:** 2026-03-02
+
+When `config.agent.external_thinking = true`, internal thinking is now
+automatically disabled for Ollama to prevent the model from producing long
+`<think>` monologues that break the JSON-only external reasoning loop.
+
+### Architecture
+
+A new `disable_native_thinking: bool` parameter is threaded through the
+entire LLM call chain:
+
+```
+ext_think.rs  ──(true)──►  LlmRouter  ──►  OllamaClient   → payload["think"] = false
+tool_loop.rs  ──(false)──►  LlmRouter  ──►  OllamaClient   → (omitted, model default)
+react_loop.rs ──(false)──►  LlmRouter  ──►  OpenRouterClient → (ignored)
+```
+
+This is independent of `json_mode` — the `"format": "json"` constraint and
+the `"think": false` suppression are separate concerns controlled by separate
+parameters.
+
+### Changes
+
+1. **`disable_native_thinking: bool` parameter** — added to:
+   - `LlmRouter::chat_messages()` and `LlmRouter::chat_messages_stream()`
+   - `OllamaClient::chat_messages()` and `OllamaClient::chat_messages_stream()`
+   - `OpenRouterClient::chat_messages()` and `OpenRouterClient::chat_messages_stream()`
+     (accepted but ignored — prefixed `_disable_native_thinking`)
+
+2. **Ollama `"think": false` injection** — when `disable_native_thinking = true`,
+   `OllamaClient` sets `"think": false` in the `/api/chat` request body.
+   When `false`, the field is omitted entirely, letting Ollama use the model's
+   default behaviour.  Non-thinking models ignore the flag regardless.
+
+3. **Prompt directive (safety-net)** — `build_external_thinking_block()` appends:
+   ```
+   INTERNAL THINKING IS DISABLED.
+   Do not output <think> tags or any reasoning preamble.
+   Output ONLY the exact JSON structure required.
+   ```
+   This catches models that attempt internal reasoning despite the API flag.
+
+4. **Legacy wrappers** — `chat()` and `chat_stream()` on `LlmClient` trait pass
+   `false` for both `json_mode` and `disable_native_thinking`, preserving
+   backward compatibility.
+
+**Backward compatibility:** When `external_thinking = false` (default), all call
+sites pass `disable_native_thinking = false` and the `"think"` field is never
+sent.  Behaviour is identical to before for OpenRouter, Candle, and all
+non-external-thinking Ollama paths.
+
+**Files modified:**
+- `crates/llm/src/lib.rs`
+- `crates/runtime/src/ext_think.rs`
+- `crates/runtime/src/prompt_builder.rs`
+- `crates/runtime/src/tool_loop.rs`
+- `crates/runtime/src/react_loop.rs`
+- `crates/exec/src/tool_chain.rs`
+- `MIGRATION.md`

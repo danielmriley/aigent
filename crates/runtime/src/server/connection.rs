@@ -198,19 +198,10 @@ pub(super) async fn handle_connection(
 
                     match ext_result {
                         Ok(ref result) => {
-                            // Record tool executions to procedural memory
-                            for exec in &result.tool_executions {
-                                let outcome = format!(
-                                    "Tool '{}' executed. Output (first 400 chars): {}",
-                                    exec.tool_name,
-                                    safe_truncate(&exec.output, 400),
-                                );
-                                let _: Result<_, _> = memory.record(
-                                    MemoryTier::Procedural,
-                                    outcome,
-                                    format!("tool-use:{}", exec.tool_name),
-                                ).await;
-                            }
+                            // Tool executions are recorded inside the
+                            // external-thinking loop itself; no need
+                            // to iterate them here.
+
                             // Record assistant reply
                             if !result.content.is_empty() {
                                 let _: Result<_, _> = memory.record(
