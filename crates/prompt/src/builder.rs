@@ -1,8 +1,4 @@
-//! Centralized prompt assembly for the main LLM conversation call.
-//!
-//! Extracted from [`crate::runtime::AgentRuntime::respond_and_remember_stream`]
-//! to keep `runtime.rs` focused on orchestration while this module owns the
-//! prompt layout, grounding rules, and truth-seeking directives.
+//! Core prompt assembly — `build_chat_prompt` and private block helpers.
 
 use std::fmt::Write as _;
 
@@ -10,43 +6,31 @@ use chrono::{Local, Utc};
 use uuid::Uuid;
 
 use aigent_config::AppConfig;
-use aigent_memory::{MemoryManager, MemoryStats, retrieval::RankedMemoryContext};
+use aigent_memory::{MemoryStats, retrieval::RankedMemoryContext};
 
-use crate::ConversationTurn;
+use crate::truncate::truncate_for_prompt;
+use crate::{ConversationTurn, PromptInputs};
 
 // ─── public entry point ──────────────────────────────────────────────────────
 
-/// All pre-computed data needed to assemble the final LLM prompt.
-///
-/// Callers build this struct (doing async work like embeddings beforehand) and
-/// then pass it to [`build_chat_prompt`] which is purely synchronous.
-pub struct PromptInputs<'a> {
-    pub config: &'a AppConfig,
-    pub memory: &'a mut MemoryManager,
-    pub user_message: &'a str,
-    pub recent_turns: &'a [ConversationTurn],
-    pub tool_specs: &'a [aigent_tools::ToolSpec],
-    pub pending_follow_ups: &'a [(Uuid, String)],
-    /// Ranked memory context items (pre-computed with optional embeddings).
-    pub context_items: &'a [RankedMemoryContext],
-    /// Memory statistics snapshot (taken once before prompt assembly).
-    pub stats: MemoryStats,
-}
-
 /// Assemble the full system + user prompt for the main LLM streaming call.
-pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
+///
+/// This is a **pure function** of its inputs — no I/O, no mutation.
+pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     let config = inputs.config;
 
     let thought_style = config.agent.thinking_level.to_lowercase();
-    // Build cached blocks first (requires &mut) before taking immutable refs.
-    let identity_block = inputs.memory.cached_identity_block().to_string();
-    let beliefs_block = inputs.memory.cached_beliefs_block(config.memory.max_beliefs_in_prompt).to_string();
-    let memory = &*inputs.memory;
-    let follow_up_block = build_follow_up_block(inputs.pending_follow_ups, memory);
+    let follow_up_block =
+        build_follow_up_block(inputs.pending_follow_ups, inputs.user_name.as_deref());
     let context_block = build_context_block(inputs.context_items, &inputs.stats);
-    let relational_block = build_relational_block(memory);
+    let relational_block = inputs
+        .relational_block
+        .as_ref()
+        .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
+        .unwrap_or_default();
     let proactive_directive = proactive_directive(&relational_block);
-    let environment_block = build_environment_block(config, memory, inputs.recent_turns.len());
+    let environment_block =
+        build_environment_block(config, &inputs.stats, inputs.recent_turns.len());
     let conversation_block = build_conversation_block(inputs.recent_turns);
     // When external_thinking is active, suppress the prose tool-awareness and
     // autonomy directives — they conflict with the strict JSON-only instructions
@@ -94,14 +78,14 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
         relational_block = relational_block,
         follow_ups = follow_up_block,
         proactive_directive = proactive_directive,
-        identity = identity_block,
-        beliefs = beliefs_block,
+        identity = inputs.identity_block,
+        beliefs = inputs.beliefs_block,
         tools_section = tools_section,
         env = environment_block,
         conv = conversation_block,
         mem = context_block,
         ext_think = if config.agent.external_thinking {
-            build_external_thinking_block(inputs.tool_specs)
+            aigent_thinker::build_external_thinking_block(inputs.tool_specs)
         } else {
             String::new()
         },
@@ -111,65 +95,10 @@ pub fn build_chat_prompt(inputs: &mut PromptInputs<'_>) -> String {
 
     buf
 }
-/// Build the external thinking prompt appendix.
-///
-/// When active, this forces the model to output only short structured JSON
-/// steps.  The Rust agent loop becomes the thinker — parsing, executing
-/// tools, and feeding observations back.
-///
-/// The prompt is aggressively strict to work with local models (Qwen, Llama,
-/// Mistral, etc.) that tend to wrap JSON in markdown or add explanatory text.
-/// Ollama's `format: "json"` constraint is applied at the API level separately.
-///
-/// Includes the available tool names so the model knows exactly which tools
-/// it can invoke.
-fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> String {
-    let mut buf = String::with_capacity(2048);
-
-    // Inject current datetime so the model can answer date/time questions
-    // instantly without calling a tool.
-    let now = chrono::Local::now();
-    let datetime_str = now.format("%A, %B %-d, %Y %H:%M:%S %Z").to_string();
-    buf.push_str(&format!("\n\nCURRENT_DATETIME: {datetime_str}\n\n"));
-
-    // ── Concise mode header + schema ─────────────────────────────────────
-    buf.push_str(
-        "## JSON AGENT MODE\n\
-         Output ONLY a single JSON object. No prose, no markdown, no fences.\n\n\
-         TOOL CALL: {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
-         FINAL ANSWER: {\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<response>\"}\n\n\
-         Use a tool for anything that needs current/live data (files, web, system info).\n\
-         For date/time questions, use CURRENT_DATETIME above or call get_current_datetime.\n\n",
-    );
-
-    // ── Compact tool list + web workflow hint ─────────────────────────────
-    if !tool_specs.is_empty() {
-        buf.push_str("TOOLS: ");
-        let names: Vec<&str> = tool_specs.iter().map(|s| s.name.as_str()).collect();
-        buf.push_str(&names.join(", "));
-        buf.push_str("\nrun_shell can execute ANY shell command (ls, curl, etc.)\n");
-
-        // Teach the search->browse two-step pattern so the model doesn't
-        // hallucinate from search snippets alone.
-        let has_web_search = tool_specs.iter().any(|s| s.name == "web_search");
-        let has_browse = tool_specs.iter().any(|s| s.name == "browse_page");
-        if has_web_search && has_browse {
-            buf.push_str(
-                "WEB WORKFLOW: web_search returns only titles/snippets. \
-                 To get full content, follow up with browse_page on the best URL.\n",
-            );
-        }
-
-        buf.push('\n');
-    }
-
-    buf
-}
-
 
 // ─── block builders ──────────────────────────────────────────────────────────
 
-fn build_follow_up_block(follow_ups: &[(Uuid, String)], memory: &MemoryManager) -> String {
+fn build_follow_up_block(follow_ups: &[(Uuid, String)], user_name: Option<&str>) -> String {
     if follow_ups.is_empty() {
         return String::new();
     }
@@ -178,9 +107,7 @@ fn build_follow_up_block(follow_ups: &[(Uuid, String)], memory: &MemoryManager) 
         .map(|(_, text)| format!("- {text}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let user_name = memory
-        .user_name_from_core()
-        .unwrap_or_else(|| "the user".to_string());
+    let user_name = user_name.unwrap_or("the user");
     format!(
         "\n\nPENDING FOLLOW-UPS (things you wanted to raise with {user_name}):\n\
          {items}\n\
@@ -221,13 +148,6 @@ fn build_context_block(context: &[RankedMemoryContext], stats: &MemoryStats) -> 
     format!("{memory_header}\n{items}")
 }
 
-fn build_relational_block(memory: &MemoryManager) -> String {
-    memory
-        .relational_state_block()
-        .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
-        .unwrap_or_default()
-}
-
 fn proactive_directive(relational_block: &str) -> &'static str {
     if relational_block.is_empty() {
         ""
@@ -242,7 +162,7 @@ fn proactive_directive(relational_block: &str) -> &'static str {
 
 fn build_environment_block(
     config: &AppConfig,
-    memory: &MemoryManager,
+    stats: &MemoryStats,
     recent_turn_count: usize,
 ) -> String {
     let cwd = std::env::current_dir()
@@ -252,7 +172,6 @@ fn build_environment_block(
     let local_ts = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
     let timestamp = Utc::now().to_rfc3339();
     let git_present = std::path::Path::new(".git").exists();
-    let stats = memory.stats();
 
     format!(
         "- local_time: {local_ts}\n\
@@ -588,67 +507,11 @@ Step 5: Reload \u{2014} make the daemon pick up the new skill immediately:\n\
     )
 }
 
-// ─── utilities ───────────────────────────────────────────────────────────────
-
-/// Truncate `text` to at most `max_chars` characters, appending `…` when cut.
-pub fn truncate_for_prompt(text: &str, max_chars: usize) -> String {
-    let chars = text.chars().collect::<Vec<_>>();
-    if chars.len() <= max_chars {
-        return text.to_string();
-    }
-    let truncated: String = chars.into_iter().take(max_chars).collect();
-    format!("{truncated}…")
-}
-
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── truncate_for_prompt ────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_short_text_unchanged() {
-        assert_eq!(truncate_for_prompt("hello", 10), "hello");
-    }
-
-    #[test]
-    fn truncate_exact_length_unchanged() {
-        assert_eq!(truncate_for_prompt("12345", 5), "12345");
-    }
-
-    #[test]
-    fn truncate_long_text_adds_ellipsis() {
-        let result = truncate_for_prompt("hello world", 5);
-        assert_eq!(result, "hello…");
-    }
-
-    #[test]
-    fn truncate_empty_string() {
-        assert_eq!(truncate_for_prompt("", 10), "");
-    }
-
-    #[test]
-    fn truncate_zero_max() {
-        assert_eq!(truncate_for_prompt("hello", 0), "…");
-    }
-
-    #[test]
-    fn truncate_multibyte_characters() {
-        let text = "café résumé";
-        let result = truncate_for_prompt(text, 4);
-        assert_eq!(result, "café…");
-    }
-
-    #[test]
-    fn truncate_emoji() {
-        let text = "🦀🐍🐹🐿️";
-        let result = truncate_for_prompt(text, 2);
-        assert_eq!(result, "🦀🐍…");
-    }
-
-    // ── build_tools_and_grounding ──────────────────────────────────────────
 
     #[test]
     fn grounding_rules_present_when_no_tools() {
@@ -667,7 +530,7 @@ mod tests {
                 name: "input".to_string(),
                 description: "test input".to_string(),
                 required: true,
-                    ..Default::default()
+                ..Default::default()
             }],
             metadata: aigent_tools::ToolMetadata::default(),
         }];
@@ -675,44 +538,5 @@ mod tests {
         assert!(section.contains("AVAILABLE TOOLS"));
         assert!(section.contains("test_tool"));
         assert!(section.contains("GROUNDING RULES"));
-    }
-}
-
-#[cfg(test)]
-mod ext_think_tests {
-    use super::*;
-
-    #[test]
-    fn external_thinking_block_empty_tools() {
-        let block = build_external_thinking_block(&[]);
-        assert!(block.contains("JSON AGENT MODE"));
-        assert!(block.contains("tool_call"));
-        assert!(block.contains("final_answer"));
-        assert!(!block.contains("TOOLS:"));
-    }
-
-    #[test]
-    fn external_thinking_block_with_tools() {
-        let specs = vec![aigent_tools::ToolSpec {
-            name: "read_file".to_string(),
-            description: "Read a file from disk".to_string(),
-            params: vec![aigent_tools::ToolParam {
-                name: "path".to_string(),
-                description: "file path".to_string(),
-                required: true,
-                ..Default::default()
-            }],
-            metadata: aigent_tools::ToolMetadata::default(),
-        }];
-        let block = build_external_thinking_block(&specs);
-        assert!(block.contains("TOOLS:"));
-        assert!(block.contains("read_file"));
-    }
-
-    #[test]
-    fn external_thinking_block_has_json_examples() {
-        let block = build_external_thinking_block(&[]);
-        assert!(block.contains(r#""type":"tool_call""#));
-        assert!(block.contains(r#""type":"final_answer""#));
     }
 }

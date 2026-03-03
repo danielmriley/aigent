@@ -123,17 +123,26 @@ pub(super) async fn handle_connection(
                 let context = memory.context_for_prompt_ranked_with_embed(&user, 10, query_embedding);
                 let stats = memory.stats();
 
-                let mut prompt_inputs = crate::prompt_builder::PromptInputs {
+                // Pre-compute memory blocks for the prompt builder (pure function).
+                let identity_block = memory.cached_identity_block().to_string();
+                let beliefs_block = memory.cached_beliefs_block(rt_clone.config.memory.max_beliefs_in_prompt).to_string();
+                let user_name = memory.user_name_from_core();
+                let relational_block = memory.relational_state_block();
+
+                let prompt_inputs = aigent_prompt::PromptInputs {
                     config: &rt_clone.config,
-                    memory: &mut memory,
                     user_message: &user,
                     recent_turns: &recent,
                     tool_specs: &[],  // Don't inject tools into the text prompt — they go via API
                     pending_follow_ups: &[],
                     context_items: &context,
                     stats,
+                    identity_block,
+                    beliefs_block,
+                    user_name,
+                    relational_block,
                 };
-                let system_prompt = crate::prompt_builder::build_chat_prompt(&mut prompt_inputs);
+                let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
 
                 // Build the chat messages array.
                 // Include recent conversation turns as proper user/assistant
@@ -150,7 +159,7 @@ pub(super) async fn handle_connection(
                 let tools_json = if tool_specs.is_empty() {
                     None
                 } else {
-                    Some(crate::tool_loop::build_tools_json(&tool_specs))
+                    Some(aigent_thinker::build_tools_json(&tool_specs))
                 };
 
                 let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
@@ -164,8 +173,19 @@ pub(super) async fn handle_connection(
                 let step_timeout = std::time::Duration::from_secs(
                     rt_clone.config.agent.step_timeout_seconds,
                 );
+                // Bridge thinker events into the runtime BackendEvent system.
+                let event_tx_clone = event_tx.clone();
+                let event_sink = move |evt: aigent_thinker::ThinkerEvent| {
+                    use aigent_thinker::ThinkerEvent;
+                    let backend_evt = match evt {
+                        ThinkerEvent::ToolCallStart(info) => crate::BackendEvent::ToolCallStart(info),
+                        ThinkerEvent::ToolCallEnd(result) => crate::BackendEvent::ToolCallEnd(result),
+                    };
+                    let _ = event_tx_clone.send(backend_evt);
+                };
+
                 let loop_result = {
-                    crate::tool_loop::run_tool_loop(
+                    aigent_thinker::run_tool_loop(
                         &rt_clone.llm,
                         primary,
                         &rt_clone.config.llm.ollama_model,
@@ -175,7 +195,7 @@ pub(super) async fn handle_connection(
                         &registry,
                         &executor,
                         chunk_tx,
-                        Some(&event_tx),
+                        Some(&event_sink),
                         step_timeout,
                     ).await
                 };
@@ -199,7 +219,7 @@ pub(super) async fn handle_connection(
                         if !result.content.is_empty() {
                             let _: Result<_, _> = memory.record(
                                 aigent_memory::MemoryTier::Episodic,
-                                crate::prompt_builder::truncate_for_prompt(&result.content, 1024),
+                                aigent_prompt::truncate_for_prompt(&result.content, 1024),
                                 format!("assistant-reply:model={}", rt_clone.config.active_model()),
                             ).await;
                         }
@@ -576,7 +596,7 @@ pub(super) async fn handle_connection(
                         .iter()
                         .filter(|item| item.entry.tier == MemoryTier::Reflective)
                         .map(|item| {
-                            format!("- {}", crate::prompt_builder::truncate_for_prompt(&item.entry.content, 200))
+                            format!("- {}", aigent_prompt::truncate_for_prompt(&item.entry.content, 200))
                         })
                         .collect();
                     if reflections.is_empty() {

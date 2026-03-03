@@ -6,6 +6,8 @@ members = [
   "crates/llm",
   "crates/exec",
   "crates/tools",
+  "crates/thinker",
+  "crates/prompt",
   "crates/interfaces/tui",
   "crates/interfaces/telegram",
   "crates/runtime",

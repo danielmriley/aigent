@@ -143,6 +143,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aigent-prompt"
+version = "0.1.0"
+dependencies = [
+ "aigent-config",
+ "aigent-memory",
+ "aigent-thinker",
+ "aigent-tools",
+ "chrono",
+ "uuid",
+]
+
+[[package]]
 name = "aigent-runtime"
 version = "0.1.0"
 dependencies = [
@@ -150,6 +162,8 @@ dependencies = [
  "aigent-exec",
  "aigent-llm",
  "aigent-memory",
+ "aigent-prompt",
+ "aigent-thinker",
  "aigent-tools",
  "anyhow",
  "chrono",
@@ -178,6 +192,22 @@ dependencies = [
  "anyhow",
  "chrono",
  "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "aigent-thinker"
+version = "0.1.0"
+dependencies = [
+ "aigent-exec",
+ "aigent-llm",
+ "aigent-tools",
+ "anyhow",
+ "chrono",
+ "futures",
  "serde",
  "serde_json",
  "tokio",

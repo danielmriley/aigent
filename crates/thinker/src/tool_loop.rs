@@ -4,9 +4,6 @@
 //! `tool_calls` from the response, executes them (in parallel when
 //! multiple are requested), feeds results back as tool-role messages,
 //! and repeats until the model stops requesting tools.
-//!
-//! Falls back to the legacy text-based `maybe_tool_call` path when
-//! the model doesn't support native tool calling.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -21,8 +18,7 @@ use aigent_llm::{
 };
 use aigent_tools::{ToolRegistry, ToolSpec};
 
-use crate::events::{ToolCallInfo, ToolResult as ToolResultEvent};
-use crate::BackendEvent;
+use crate::events::{ThinkerEvent, ToolCallInfo, ToolResult as ToolResultEvent};
 
 /// Maximum number of tool-call → result → re-prompt iterations before we
 /// force the model to produce a final text answer (prevents infinite loops).
@@ -51,6 +47,12 @@ pub struct ToolExecution {
     pub duration_ms: u64,
 }
 
+/// Callback for thinker progress events (tool start/end).
+///
+/// Callers provide this to bridge thinker events into their own event
+/// system (e.g. `BackendEvent` in the runtime crate).
+pub type EventSink = dyn Fn(ThinkerEvent) + Send + Sync;
+
 /// Run the structured tool calling loop.
 ///
 /// 1. Sends `messages` + `tools` schema to the LLM.
@@ -59,7 +61,7 @@ pub struct ToolExecution {
 /// 4. Repeat until the model returns a normal text response or we hit `MAX_TOOL_ROUNDS`.
 ///
 /// Text tokens are streamed via `token_tx` as they arrive.
-/// Tool lifecycle events are sent via `event_tx` for UI display.
+/// Tool lifecycle events are sent via `event_sink` for UI display.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tool_loop(
     llm: &LlmRouter,
@@ -71,7 +73,7 @@ pub async fn run_tool_loop(
     tool_registry: &ToolRegistry,
     tool_executor: &ToolExecutor,
     token_tx: mpsc::Sender<String>,
-    event_tx: Option<&tokio::sync::broadcast::Sender<BackendEvent>>,
+    event_sink: Option<&EventSink>,
     step_timeout: Duration,
 ) -> Result<ToolLoopResult> {
     let mut all_executions: Vec<ToolExecution> = Vec::new();
@@ -134,7 +136,7 @@ pub async fn run_tool_loop(
             &response.tool_calls,
             tool_registry,
             tool_executor,
-            event_tx,
+            event_sink,
         )
         .await;
 
@@ -147,11 +149,6 @@ pub async fn run_tool_loop(
         }
 
         all_executions.extend(executions);
-
-        // If this was the last round and we forced no tools, the loop will
-        // exit via the break above on the next iteration.  But if the model
-        // somehow returned tool_calls on the final round (should be impossible
-        // since we passed None), we'll fall through and return what we have.
     }
 
     // If the loop exhausted without a final text response, build one from
@@ -176,7 +173,7 @@ async fn execute_tool_calls(
     calls: &[ToolCall],
     registry: &ToolRegistry,
     executor: &ToolExecutor,
-    event_tx: Option<&tokio::sync::broadcast::Sender<BackendEvent>>,
+    event_sink: Option<&EventSink>,
 ) -> Vec<ToolExecution> {
     if calls.is_empty() {
         return vec![];
@@ -188,8 +185,8 @@ async fn execute_tool_calls(
             name: call.function.name.clone(),
             args: call.function.arguments.to_string(),
         };
-        if let Some(tx) = event_tx {
-            let _ = tx.send(BackendEvent::ToolCallStart(info));
+        if let Some(sink) = event_sink {
+            sink(ThinkerEvent::ToolCallStart(info));
         }
     }
 
@@ -236,8 +233,8 @@ async fn execute_tool_calls(
             output: exec.output.clone(),
             duration_ms: exec.duration_ms,
         };
-        if let Some(tx) = event_tx {
-            let _ = tx.send(BackendEvent::ToolCallEnd(result_event));
+        if let Some(sink) = event_sink {
+            sink(ThinkerEvent::ToolCallEnd(result_event));
         }
     }
 
@@ -271,14 +268,14 @@ pub fn build_tools_json(specs: &[ToolSpec]) -> serde_json::Value {
     aigent_tools::specs_to_openai_tools(specs)
 }
 
-/// Public wrapper for `execute_tool_calls` used by the ReAct loop.
+/// Public wrapper for `execute_tool_calls` used by external callers.
 pub async fn execute_tool_calls_public(
     calls: &[ToolCall],
     registry: &ToolRegistry,
     executor: &ToolExecutor,
-    event_tx: Option<&tokio::sync::broadcast::Sender<BackendEvent>>,
+    event_sink: Option<&EventSink>,
 ) -> Vec<ToolExecution> {
-    execute_tool_calls(calls, registry, executor, event_tx).await
+    execute_tool_calls(calls, registry, executor, event_sink).await
 }
 
 #[cfg(test)]

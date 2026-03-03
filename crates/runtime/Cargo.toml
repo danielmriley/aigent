@@ -24,6 +24,8 @@ aigent-config = { path = "../config" }
 aigent-exec = { path = "../exec" }
 aigent-llm = { path = "../llm" }
 aigent-memory = { path = "../memory" }
+aigent-prompt = { path = "../prompt" }
+aigent-thinker = { path = "../thinker" }
 aigent-tools = { path = "../tools" }
 
 [features]
