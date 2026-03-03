@@ -215,12 +215,6 @@ pub struct ToolsConfig {
     /// be compiled without the `sandbox` feature for a permanent opt-out).
     #[serde(default = "default_sandbox_enabled")]
     pub sandbox_enabled: bool,
-    /// Use native structured tool calling (Ollama `/api/chat` + OpenRouter
-    /// `tools` parameter) instead of the legacy text-based `maybe_tool_call`
-    /// prompt.  Native calling is more reliable and supports parallel tool
-    /// execution.  Set to `false` to fall back to the text-based path.
-    #[serde(default = "default_use_native_calling")]
-    pub use_native_calling: bool,
     /// Maximum number of tool-call rounds before forcing a text response.
     /// Prevents infinite tool-calling loops.  Default: 5.
     #[serde(default = "default_max_tool_rounds")]
@@ -271,7 +265,6 @@ impl Default for ToolsConfig {
             search_providers: default_search_providers(),
             git_auto_commit: false,
             sandbox_enabled: true,
-            use_native_calling: true,
             max_tool_rounds: 5,
             skills: SkillsConfig::default(),
         }
@@ -290,10 +283,6 @@ fn default_search_providers() -> Vec<String> {
 }
 
 fn default_sandbox_enabled() -> bool {
-    true
-}
-
-fn default_use_native_calling() -> bool {
     true
 }
 
