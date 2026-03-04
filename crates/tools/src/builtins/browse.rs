@@ -859,11 +859,17 @@ fn extract_text_from_element(el: &scraper::ElementRef<'_>, max_chars: usize) -> 
         "script", "style", "nav", "header", "footer", "noscript", "svg",
         "aside", "form", "iframe", "button",
     ];
-    // Also skip elements by class name (cookie banners, ads, navigation chrome)
+    // Also skip elements by class name (cookie banners, ads, navigation chrome,
+    // breadcrumbs, toolbars, and other non-content boilerplate).
     let skip_classes: &[&str] = &[
         "cookie", "consent", "banner", "modal", "popup", "overlay",
         "ad-", "advert", "sidebar", "social-share", "newsletter",
         "privacy", "gdpr", "onetrust", "nav-", "menu",
+        "breadcrumb", "toolbar", "masthead", "top-bar", "topbar",
+        "site-header", "page-header", "global-header", "header-nav",
+        "footer-nav", "bottom-nav", "subnav", "mega-menu",
+        "related-content", "recommended", "taboola", "outbrain",
+        "share-bar", "social-bar", "follow-us", "signup",
     ];
     let block_tags: &[&str] = &[
         "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6",
