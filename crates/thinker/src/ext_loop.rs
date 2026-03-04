@@ -141,7 +141,14 @@ pub async fn run_external_thinking_loop(
             Some(Err(e)) => {
                 warn!(round, error = %e, "failed to parse agent step, treating as final answer");
                 // Fallback: strip obvious JSON wrapper and send as-is.
-                let fallback = strip_json_wrapper(&full_text);
+                // Guard against blank/whitespace-only results that would
+                // render as an empty response in the TUI.
+                let stripped = strip_json_wrapper(&full_text);
+                let fallback = if stripped.trim().is_empty() {
+                    "I encountered an internal formatting error while thinking.".to_string()
+                } else {
+                    stripped
+                };
                 let _ = user_token_tx.send(fallback.clone()).await;
                 return Ok(ToolLoopResult {
                     provider: final_provider,
@@ -153,10 +160,15 @@ pub async fn run_external_thinking_loop(
                 // No complete JSON object — the model produced plain text
                 // (sometimes happens on easy questions).  Send it directly.
                 warn!(round, "no complete JSON object in response, treating as plain text");
-                let _ = user_token_tx.send(full_text.clone()).await;
+                let fallback = if full_text.trim().is_empty() {
+                    "I wasn't able to produce a response. Please try again.".to_string()
+                } else {
+                    full_text.clone()
+                };
+                let _ = user_token_tx.send(fallback.clone()).await;
                 return Ok(ToolLoopResult {
                     provider: final_provider,
-                    content: full_text,
+                    content: fallback,
                     tool_executions: all_executions,
                 });
             }
@@ -310,15 +322,13 @@ pub async fn run_external_thinking_loop(
 
     warn!("external thinking loop exhausted {MAX_EXT_ROUNDS} rounds");
 
-    // Fallback: compose something from tool results.
+    // Fallback: always send a clean, human-readable message.
+    // Never dump raw tool output (HTML, JSON fragments, etc.) to the user —
+    // it often renders as blank or garbled in the TUI.
     let fallback = if all_executions.is_empty() {
         "I was unable to complete the request within the allowed number of steps.".to_string()
     } else {
-        all_executions
-            .iter()
-            .map(|e| format!("[{}]: {}", e.tool_name, &e.output[..e.output.len().min(500)]))
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        "I was unable to formulate a complete answer within the allowed steps,          but I have gathered some tool data in the background. Please try again          or rephrase your question.".to_string()
     };
     let _ = user_token_tx.send(fallback.clone()).await;
 
