@@ -44,6 +44,16 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          Only change the topic if the user explicitly requests a new topic.\n\n",
     );
 
+    // ── Temporal grounding rule ─────────────────────────────────────────
+    buf.push_str(
+        "TEMPORAL AWARENESS RULE:\n\
+         You have been provided with CURRENT_DATETIME at the top of this prompt. \
+         When answering questions about 'next', 'upcoming', or 'future' events, you MUST \
+         strictly compare dates found in tool results against CURRENT_DATETIME. \
+         NEVER present an event from the past as an upcoming event. \
+         Ignore outdated search results and tell the user if no future-dated information was found.\n\n",
+    );
+
     // ── Compact tool list + web workflow hint ─────────────────────────────
     if !tool_specs.is_empty() {
         buf.push_str("TOOLS: ");
@@ -170,6 +180,14 @@ mod tests {
         let block = build_external_thinking_block(&[]);
         assert!(block.contains("TOOL CALL RULE"));
         assert!(block.contains("NEVER invent tool names"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_temporal_rule() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("TEMPORAL AWARENESS RULE"));
+        assert!(block.contains("CURRENT_DATETIME"));
+        assert!(block.contains("NEVER present an event from the past"));
     }
 
     #[test]
