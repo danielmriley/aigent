@@ -7,7 +7,7 @@ use tracing::{debug, info, instrument, warn};
 use tokio::sync::mpsc;
 use std::time::Duration;
 use aigent_llm::{Provider};
-use aigent_memory::{MemoryEntry, MemoryManager, MemoryTier};
+use aigent_memory::{MemoryManager, MemoryTier};
 use aigent_prompt::truncate_for_prompt;
 
 use super::AgentRuntime;
@@ -231,7 +231,7 @@ these elements into your responses naturally without explicitly announcing them.
         // context-window bloat as beliefs accumulate over time.
         let beliefs_block = {
             let max_n = self.config.memory.max_beliefs_in_prompt;
-            let mut beliefs = memory.all_beliefs();
+            let beliefs = memory.all_beliefs();
             // Sort by composite score: confidence × 0.6 + recency × 0.25 + valence × 0.15
             // Recency factor decays as 1/(1+days) so today's beliefs score 1.0 and a
             // 30-day-old belief scores ~0.03.  The most relevant + recent beliefs always
