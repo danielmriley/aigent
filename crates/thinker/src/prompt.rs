@@ -56,6 +56,25 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
         buf.push('\n');
     }
 
+    // ── Post-tool-result reinforcement ───────────────────────────────────
+    //
+    // This block is the last thing the model sees in the system prompt.
+    // It hammers the JSON-only rule so the model never slips into prose
+    // after receiving a tool observation — the most common escape point
+    // for local models.
+    buf.push_str(
+        "CRITICAL RULE — AFTER EVERY TOOL RESULT:\n\
+         You now have new information from the tool.\n\
+         You MUST output EXACTLY ONE JSON object and NOTHING ELSE.\n\
+         - If you can answer the user's question, output:\n\
+           {\"type\":\"final_answer\",\"thought\":\"<1-sentence reasoning>\",\"final_answer\":\"<complete helpful answer>\"}\n\
+         - If you need another tool, output:\n\
+           {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
+         NEVER output prose, planning, or explanations outside JSON.\n\
+         NEVER say \"I need to\" or \"Let me check\" outside the JSON thought field.\n\
+         Your ENTIRE response must be a single valid JSON object.\n\n",
+    );
+
     buf
 }
 
@@ -101,5 +120,12 @@ mod tests {
     fn external_thinking_block_has_datetime() {
         let block = build_external_thinking_block(&[]);
         assert!(block.contains("CURRENT_DATETIME:"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_stop_protocol() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("CRITICAL RULE"));
+        assert!(block.contains("EXACTLY ONE JSON object"));
     }
 }
