@@ -14,6 +14,17 @@
 //!
 //! The token stream to the user (`user_token_tx`) receives **only** clean
 //! text — never raw JSON.
+//!
+//! ## Multi-round (ReAct) chaining
+//!
+//! The loop supports chained tool calls (e.g. `web_search` → `browse_page`
+//! → `final_answer`).  Each iteration:
+//!
+//! 1. Calls the LLM with a **drain channel** (tokens are absorbed, not shown).
+//! 2. Parses from `response.content` — the authoritative complete output
+//!    accumulated by the LLM client — avoiding any streaming race conditions.
+//! 3. Dispatches the parsed step (emit thought, execute tool, or return answer).
+//! 4. Appends the assistant reply + tool observation to `messages` and loops.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -58,9 +69,23 @@ pub async fn run_external_thinking_loop(
         debug!(round, "external thinking loop iteration");
 
         // ── Call the LLM (streaming, no native tools) ────────────────────
-        // We create a private channel to intercept the raw JSON tokens
-        // before they reach the user.
-        let (intercept_tx, mut intercept_rx) = mpsc::channel::<String>(256);
+        //
+        // We supply a *drain* channel that silently absorbs the raw streamed
+        // tokens.  We do NOT parse from the stream — instead we parse from
+        // `response.content`, which the LLM client accumulates internally
+        // and returns as one complete string.
+        //
+        // This avoids all race conditions between the spawned drain task and
+        // the LLM future: there is no early-break, no partial `raw_all`,
+        // and no risk of discarding buffered tokens.
+        let (drain_tx, mut drain_rx) = mpsc::channel::<String>(512);
+
+        // Spawn a lightweight task to consume tokens so `tx.send()` inside
+        // the LLM never blocks.  The task ends naturally once the sender is
+        // dropped (i.e. after llm_fut completes).
+        let drain_handle = tokio::spawn(async move {
+            while drain_rx.recv().await.is_some() {}
+        });
 
         let llm_fut = llm.chat_messages_stream(
             primary,
@@ -68,31 +93,12 @@ pub async fn run_external_thinking_loop(
             openrouter_model,
             messages,
             None,   // no native tool schemas — the JSON prompt handles dispatch
-            intercept_tx,
+            drain_tx,
             false,
             false,
         );
 
-        // Accumulate the raw JSON from the intercept channel.
-        let accumulator = tokio::spawn(async move {
-            let mut jsb = JsonStreamBuffer::new();
-            let mut raw_all = String::new();
-            while let Some(chunk) = intercept_rx.recv().await {
-                raw_all.push_str(&chunk);
-                jsb.feed(&chunk);
-                // As soon as we have a complete object, stop consuming.
-                // (The LLM may continue sending whitespace/newlines, but
-                // we already have what we need.)
-                if jsb.has_complete() {
-                    // Drain remaining tokens so the sender doesn't block.
-                    while intercept_rx.try_recv().is_ok() {}
-                    break;
-                }
-            }
-            (jsb, raw_all)
-        });
-
-        // Wait for LLM to finish (or timeout).
+        // Wait for the LLM to finish (or timeout).
         let response = match tokio::time::timeout(step_timeout, llm_fut).await {
             Ok(result) => result?,
             Err(_) => {
@@ -102,23 +108,40 @@ pub async fn run_external_thinking_loop(
             }
         };
 
-        // Wait for the accumulator task.
-        let (mut jsb, raw_all) = accumulator.await
-            .map_err(|e| anyhow::anyhow!("accumulator task panicked: {e}"))?;
+        // Ensure the drain task finishes (the sender was dropped when
+        // llm_fut completed, so this is nearly instantaneous).
+        let _ = drain_handle.await;
 
-        // Also feed the final `response.content` in case the LLM returned
-        // content outside the streaming path (some providers do this).
-        if !response.content.is_empty() && raw_all.is_empty() {
-            jsb.feed(&response.content);
+        // ── Parse from the authoritative response.content ────────────────
+        //
+        // `response.content` is the full text accumulated by the LLM client
+        // during streaming.  Parsing from this single complete string avoids
+        // every partial-data and race-condition bug that plagued the old
+        // approach of parsing from the intercepted stream.
+        let full_text = response.content.clone();
+        debug!(round, len = full_text.len(), "ext_loop: LLM returned content");
+
+        if full_text.is_empty() {
+            warn!(round, "ext_loop: empty response from LLM");
+            let fallback = "(no response from model)".to_string();
+            let _ = user_token_tx.send(fallback.clone()).await;
+            return Ok(ToolLoopResult {
+                provider: final_provider,
+                content: fallback,
+                tool_executions: all_executions,
+            });
         }
 
-        // ── Parse the accumulated JSON step ──────────────────────────────
+        // Feed the complete text into a fresh JsonStreamBuffer.
+        let mut jsb = JsonStreamBuffer::new();
+        jsb.feed(&full_text);
+
         let step = match jsb.take_parsed() {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
                 warn!(round, error = %e, "failed to parse agent step, treating as final answer");
-                // Fallback: send the raw content as-is so the user sees something.
-                let fallback = if raw_all.is_empty() { response.content.clone() } else { raw_all };
+                // Fallback: strip obvious JSON wrapper and send as-is.
+                let fallback = strip_json_wrapper(&full_text);
                 let _ = user_token_tx.send(fallback.clone()).await;
                 return Ok(ToolLoopResult {
                     provider: final_provider,
@@ -127,13 +150,13 @@ pub async fn run_external_thinking_loop(
                 });
             }
             None => {
-                // No complete JSON object — treat whatever we got as plain text.
+                // No complete JSON object — the model produced plain text
+                // (sometimes happens on easy questions).  Send it directly.
                 warn!(round, "no complete JSON object in response, treating as plain text");
-                let fallback = if raw_all.is_empty() { response.content.clone() } else { raw_all };
-                let _ = user_token_tx.send(fallback.clone()).await;
+                let _ = user_token_tx.send(full_text.clone()).await;
                 return Ok(ToolLoopResult {
                     provider: final_provider,
-                    content: fallback,
+                    content: full_text,
                     tool_executions: all_executions,
                 });
             }
@@ -142,18 +165,18 @@ pub async fn run_external_thinking_loop(
         // ── Dispatch based on step type ──────────────────────────────────
         match step {
             AgentStep::FinalAnswer { thought, answer } => {
-                // Emit thought for UI display.
+                // Emit the model's chain-of-thought for UI display.
                 if !thought.is_empty() {
                     if let Some(sink) = event_sink {
                         sink(ThinkerEvent::AgentThought(thought));
                     }
                 }
-                // Stream the clean answer to the user.
+
+                // Stream the clean answer to the user (no raw JSON).
                 let _ = user_token_tx.send(answer.clone()).await;
 
-                // Record the assistant's JSON reply so the conversation
-                // history stays consistent for the LLM.
-                messages.push(ChatMessage::assistant(&raw_all));
+                // Record the assistant's full reply for conversation history.
+                messages.push(ChatMessage::assistant(&full_text));
 
                 return Ok(ToolLoopResult {
                     provider: final_provider,
@@ -165,14 +188,14 @@ pub async fn run_external_thinking_loop(
             AgentStep::ToolCall { thought, tool_name, args } => {
                 info!(round, tool = %tool_name, "external thinking: tool call");
 
-                // Emit thought.
+                // Emit the model's chain-of-thought.
                 if !thought.is_empty() {
                     if let Some(sink) = event_sink {
                         sink(ThinkerEvent::AgentThought(thought));
                     }
                 }
 
-                // Emit ToolCallStart event.
+                // Emit ToolCallStart event for UI.
                 let call_info = ToolCallInfo {
                     name: tool_name.clone(),
                     args: serde_json::Value::Object(args.clone()).to_string(),
@@ -202,7 +225,7 @@ pub async fn run_external_thinking_loop(
                     Err(ref e) => (false, e.to_string()),
                 };
 
-                // Emit ToolCallEnd event.
+                // Emit ToolCallEnd event for UI.
                 let result_event = ToolResultEvent {
                     name: tool_name.clone(),
                     success,
@@ -213,18 +236,22 @@ pub async fn run_external_thinking_loop(
                     sink(ThinkerEvent::ToolCallEnd(result_event));
                 }
 
-                // Record execution.
+                // Record execution for the final result.
                 all_executions.push(ToolExecution {
                     tool_name: tool_name.clone(),
-                    args: args.into_iter().map(|(k, v)| (k, v)).collect(),
+                    args: args.into_iter().collect(),
                     success,
                     output: output.clone(),
                     duration_ms,
                 });
 
-                // Append the assistant JSON reply + tool observation to
-                // the conversation so the model can reason about the result.
-                messages.push(ChatMessage::assistant(&raw_all));
+                // ── Append to conversation history for the next round ────
+                //
+                // Use `full_text` (the complete LLM output) as the assistant
+                // message — never a partial/truncated string.  This ensures
+                // the model sees its own complete JSON on re-entry and can
+                // reason coherently across multiple tool-call rounds.
+                messages.push(ChatMessage::assistant(&full_text));
 
                 // Truncate very long tool outputs to avoid blowing the
                 // context window.
@@ -237,6 +264,10 @@ pub async fn run_external_thinking_loop(
                     "TOOL RESULT for {tool_name}:\n{obs}"
                 );
                 messages.push(ChatMessage::user(&observation_msg));
+
+                // Continue to the next round — the model will see the tool
+                // result and decide whether to use another tool or produce
+                // a final answer.
             }
         }
     }
@@ -260,4 +291,21 @@ pub async fn run_external_thinking_loop(
         content: fallback,
         tool_executions: all_executions,
     })
+}
+
+/// Best-effort extraction of readable text from a malformed JSON response.
+///
+/// If the model produced valid JSON with a `final_answer` or `thought`
+/// field but the step-type was unrecognised, pull those out.  Otherwise
+/// return the input unchanged.
+fn strip_json_wrapper(raw: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
+        if let Some(ans) = val.get("final_answer").and_then(|v| v.as_str()) {
+            return ans.to_string();
+        }
+        if let Some(thought) = val.get("thought").and_then(|v| v.as_str()) {
+            return thought.to_string();
+        }
+    }
+    raw.to_string()
 }
