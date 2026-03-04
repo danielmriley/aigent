@@ -147,7 +147,7 @@ fn build_context_block(context: &[RankedMemoryContext], stats: &MemoryStats) -> 
                 item.entry.tier,
                 item.score,
                 item.entry.source,
-                truncate_for_prompt(&item.entry.content, 280),
+                truncate_for_prompt(&item.entry.content, 4096),
             )
         })
         .collect::<Vec<_>>()
@@ -223,8 +223,8 @@ fn build_conversation_block(recent_turns: &[ConversationTurn]) -> String {
             format!(
                 "Turn {}\nUser: {}\nAssistant: {}",
                 index + 1,
-                truncate_for_prompt(&turn.user, 280),
-                truncate_for_prompt(&turn.assistant, 360),
+                truncate_for_prompt(&turn.user, 4096),
+                truncate_for_prompt(&turn.assistant, 4096),
             )
         })
         .collect::<Vec<_>>()

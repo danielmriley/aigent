@@ -5,6 +5,7 @@ use crate::AgentResult;
 use chrono::{DateTime, Utc};
 use tracing::{debug, info, instrument, warn};
 use tokio::sync::mpsc;
+use std::time::Duration;
 use aigent_llm::{Provider};
 use aigent_memory::{MemoryEntry, MemoryManager, MemoryTier};
 use aigent_prompt::truncate_for_prompt;
@@ -85,23 +86,39 @@ impl AgentRuntime {
 
         // Compute the query embedding asynchronously via the embedding backend.
         // This HTTP call runs concurrently with the profile extraction above.
-        let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
-            embed_fn(user_message.to_string()).await
-        } else {
-            None
+        let query_embedding: Option<Vec<f32>> = match memory.embed_fn_arc() {
+            Some(embed_fn) => match embed_fn(user_message.to_string()).await {
+                Some(v) => Some(v),
+                None => {
+                    warn!("embed_fn returned None for query embedding — proceeding without vector retrieval");
+                    None
+                }
+            },
+            None => None,
         };
 
         // Collect profile signals (the spawn_blocking should be done by now)
         // and persist them.  This happens after the embedding call so the two
         // ran in parallel, shaving the extraction latency off TTFT.
-        if let Ok(profile_signals) = profile_handle.await {
-            for (key, value, category) in &profile_signals {
-                if let Err(err) = memory.record_user_profile_keyed(key, value, category).await {
-                    warn!(?err, key, "micro-profile signal failed");
+        //
+        // Wrap in a 2-second timeout so a hung extraction cannot stall the
+        // entire response loop.
+        match tokio::time::timeout(Duration::from_secs(2), profile_handle).await {
+            Ok(Ok(profile_signals)) => {
+                for (key, value, category) in &profile_signals {
+                    if let Err(err) = memory.record_user_profile_keyed(key, value, category).await {
+                        warn!(?err, key, "micro-profile signal failed");
+                    }
+                }
+                if !profile_signals.is_empty() {
+                    debug!(count = profile_signals.len(), "micro-profile signals extracted");
                 }
             }
-            if !profile_signals.is_empty() {
-                debug!(count = profile_signals.len(), "micro-profile signals extracted");
+            Ok(Err(join_err)) => {
+                warn!(?join_err, "profile extraction task failed — skipping micro-profile signals");
+            }
+            Err(_elapsed) => {
+                warn!("profile extraction timed out after 2s — skipping micro-profile signals");
             }
         }
 
@@ -220,14 +237,19 @@ these elements into your responses naturally without explicitly announcing them.
             // 30-day-old belief scores ~0.03.  The most relevant + recent beliefs always
             // appear first regardless of raw confidence.
             let now = Utc::now();
-            beliefs.sort_by(|a, b| {
-                let belief_score = |e: &&MemoryEntry| {
+            let mut scored: Vec<_> = beliefs
+                .into_iter()
+                .map(|e| {
                     let days = (now - e.created_at).num_days().max(0) as f32;
                     let recency = 1.0_f32 / (1.0 + days);
-                    e.confidence * 0.6 + recency * 0.25 + e.valence.clamp(0.0, 1.0) * 0.15
-                };
-                belief_score(b).total_cmp(&belief_score(a))
-            });
+                    let score = e.confidence * 0.6
+                        + recency * 0.25
+                        + e.valence.clamp(0.0, 1.0) * 0.15;
+                    (score, e)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let beliefs: Vec<_> = scored.into_iter().map(|(_, e)| e).collect();
             let take_n = if max_n == 0 { beliefs.len() } else { max_n.min(beliefs.len()) };
             if take_n == 0 {
                 String::new()
