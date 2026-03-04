@@ -199,11 +199,30 @@ pub(super) async fn handle_connection(
                     let backend_evt = match evt {
                         ThinkerEvent::ToolCallStart(info) => crate::BackendEvent::ToolCallStart(info),
                         ThinkerEvent::ToolCallEnd(result) => crate::BackendEvent::ToolCallEnd(result),
+                        ThinkerEvent::AgentThought(thought) => crate::BackendEvent::AgentThought(thought),
                     };
                     let _ = event_tx_clone.send(backend_evt);
                 };
 
-                let loop_result = {
+                // When external_thinking is active, use the JSON-intercepting
+                // loop that parses the model's structured JSON output, emits
+                // clean AgentThought events, executes tool calls internally,
+                // and streams only the final_answer text to the user.
+                // Otherwise, use the native structured tool calling loop.
+                let loop_result = if rt_clone.config.agent.external_thinking {
+                    aigent_thinker::run_external_thinking_loop(
+                        &rt_clone.llm,
+                        primary,
+                        &rt_clone.config.llm.ollama_model,
+                        &rt_clone.config.llm.openrouter_model,
+                        &mut messages,
+                        &registry,
+                        &executor,
+                        chunk_tx,
+                        Some(&event_sink),
+                        step_timeout,
+                    ).await
+                } else {
                     aigent_thinker::run_tool_loop(
                         &rt_clone.llm,
                         primary,

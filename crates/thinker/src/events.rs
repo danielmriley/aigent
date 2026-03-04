@@ -29,4 +29,8 @@ pub struct ToolResult {
 pub enum ThinkerEvent {
     ToolCallStart(ToolCallInfo),
     ToolCallEnd(ToolResult),
+    /// The model's chain-of-thought from a JSON agent step.
+    /// Emitted by the external thinking loop so the UI can display
+    /// a "💭 thinking…" line without exposing raw JSON.
+    AgentThought(String),
 }
