@@ -195,6 +195,37 @@ pub async fn run_external_thinking_loop(
                     }
                 }
 
+                // ── Hallucinated tool guard ─────────────────────────────
+                //
+                // If the model invents a tool name that doesn't exist in the
+                // registry, we feed it an error message and let it self-correct
+                // on the next round (e.g. switch to web_search).  We do NOT
+                // force a final_answer — the model may recover productively.
+                if tool_registry.get(&tool_name).is_none() {
+                    warn!(round, tool = %tool_name, "model hallucinated non-existent tool");
+
+                    if let Some(sink) = event_sink {
+                        sink(ThinkerEvent::AgentThought(
+                            format!("I tried to use a tool that doesn't exist: {tool_name}"),
+                        ));
+                    }
+
+                    // Record the assistant's attempt in conversation history.
+                    messages.push(ChatMessage::assistant(&full_text));
+
+                    // Feed a clear error so the model knows to pick a real tool.
+                    let error_obs = format!(
+                        "ERROR: Tool '{tool_name}' does not exist. \
+                         Available tools are listed in the system prompt. \
+                         Use only those tools (e.g. web_search, browse_page, run_shell). \
+                         Respond with EXACTLY ONE JSON object."
+                    );
+                    messages.push(ChatMessage::user(&error_obs));
+
+                    // Continue to next round — let the model self-correct.
+                    continue;
+                }
+
                 // Emit ToolCallStart event for UI.
                 let call_info = ToolCallInfo {
                     name: tool_name.clone(),
