@@ -56,6 +56,16 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
         buf.push('\n');
     }
 
+    // ── Retry-limit / termination rule ────────────────────────────────
+    buf.push_str(
+        "RETRY LIMIT RULE:\n\
+         If a tool returns unhelpful, empty, or truncated data, you may retry ONCE \
+         with a different query or URL.  After 2 failed attempts on the same topic, \
+         STOP retrying and immediately output a final_answer with the best \
+         information you have gathered so far — even if incomplete.\n\
+         Do NOT keep calling the same tool hoping for a different result.\n\n",
+    );
+
     // ── Post-tool-result reinforcement ───────────────────────────────────
     //
     // This block is the last thing the model sees in the system prompt.
@@ -127,5 +137,12 @@ mod tests {
         let block = build_external_thinking_block(&[]);
         assert!(block.contains("CRITICAL RULE"));
         assert!(block.contains("EXACTLY ONE JSON object"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_retry_limit() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("RETRY LIMIT RULE"));
+        assert!(block.contains("2 failed attempts"));
     }
 }
