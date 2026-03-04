@@ -205,7 +205,7 @@ impl MemoryManager {
     }
 
     fn apply_replayed_entry(&mut self, entry: MemoryEntry) -> Result<()> {
-        match evaluate_core_update(&self.identity, &entry) {
+        match evaluate_core_update(&self.identity, &entry)? {
             ConsistencyDecision::Accept => {
                 let _ = self.store.insert(entry.clone());
                 if let Some(idx) = &mut self.index {
@@ -271,7 +271,7 @@ impl MemoryManager {
             embedding,
         };
 
-        match evaluate_core_update(&self.identity, &entry) {
+        match evaluate_core_update(&self.identity, &entry)? {
             ConsistencyDecision::Accept => {
                 let inserted = self.store.insert(entry.clone());
                 if inserted {

@@ -172,9 +172,11 @@ fn load_manifest(wasm_path: &Path) -> Option<ToolSpec> {
                 Ok(json_str) => {
                     match serde_json::from_str::<ToolManifest>(&json_str) {
                         Ok(manifest) => {
-                            // Validate manifest before accepting.
+                            // Validate manifest before accepting — fail hard
+                            // so invalid WASM tools are never loaded.
                             if let Err(err) = validate_manifest(&manifest, path) {
-                                warn!(%err, ?path, "wasm: tool manifest validation failed");
+                                warn!(%err, ?path, "wasm: tool manifest validation failed — skipping");
+                                return None;
                             }
                             debug!(?path, "wasm: loaded tool manifest");
                             let metadata = if let Some(m) = manifest.metadata {

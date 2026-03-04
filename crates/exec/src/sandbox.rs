@@ -296,7 +296,12 @@ unsafe fn install_seccomp_allowlist() -> std::io::Result<()> {
         435, // clone3 (modern glibc thread creation)
         273, // set_robust_list (glibc/pthread internal)
         63,  // uname (git version checks)
-        101, // ptrace (denied by no-new-privs but avoids ENOSYS confusion)
+        // NOTE: ioctl (16) and ptrace (101) are intentionally EXCLUDED from
+        // the allow-list.  Both are notoriously difficult to sandbox safely:
+        //   - ioctl: allows arbitrary device control, TTY hijacking, etc.
+        //   - ptrace: allows tracing/debugging other processes, memory
+        //     inspection, and can be used to escape sandbox restrictions.
+        // They will receive ENOSYS from the default-deny rule.
     ];
 
     let n = ALLOWED.len();
@@ -385,12 +390,18 @@ unsafe fn install_seccomp_allowlist() -> std::io::Result<()> {
 // ── macOS ────────────────────────────────────────────────────────────────────
 
 #[cfg(all(feature = "sandbox", target_os = "macos"))]
+// WARNING: `sandbox_init(3)` is a deprecated macOS API (since macOS 10.8 / iOS).
+// Apple has not provided a public replacement; the modern approach is App Sandbox
+// via entitlements, which requires code signing and is not applicable to
+// dynamically spawned child processes.  This call provides only minimal
+// isolation on modern macOS and should be considered a defence-in-depth layer,
+// not a strong security boundary.
 unsafe fn apply_macos(workspace_root: &str) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::io;
     use std::ptr;
 
-    // Apple private API — present in all macOS versions >= 10.5.
+    // Apple private API — present in all macOS versions >= 10.5 (deprecated since 10.8).
     extern "C" {
         fn sandbox_init(
             profile: *const libc::c_char,

@@ -154,6 +154,7 @@ dependencies = [
  "notify",
  "qdrant-client",
  "redb",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

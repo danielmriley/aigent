@@ -10,7 +10,9 @@
 //! [`VectorBackend`] trait.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use tokio::sync::RwLock;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -104,10 +106,7 @@ impl Clone for FlatVectorStore {
 
 impl VectorBackend for FlatVectorStore {
     async fn upsert(&self, id: Uuid, vector: Vec<f32>) -> Result<()> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| anyhow::anyhow!("vector store lock poisoned: {e}"))?;
+        let mut inner = self.inner.write().await;
 
         // Enforce consistent dimensionality.
         match inner.dimensions {
@@ -128,19 +127,13 @@ impl VectorBackend for FlatVectorStore {
     }
 
     async fn remove(&self, id: Uuid) -> Result<()> {
-        let mut inner = self
-            .inner
-            .write()
-            .map_err(|e| anyhow::anyhow!("vector store lock poisoned: {e}"))?;
+        let mut inner = self.inner.write().await;
         inner.vectors.remove(&id);
         Ok(())
     }
 
     async fn search(&self, query: &[f32], k: usize) -> Result<Vec<VectorMatch>> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|e| anyhow::anyhow!("vector store lock poisoned: {e}"))?;
+        let inner = self.inner.read().await;
 
         let mut scored: Vec<VectorMatch> = inner
             .vectors
@@ -158,10 +151,7 @@ impl VectorBackend for FlatVectorStore {
     }
 
     async fn len(&self) -> usize {
-        self.inner
-            .read()
-            .map(|inner| inner.vectors.len())
-            .unwrap_or(0)
+        self.inner.read().await.vectors.len()
     }
 }
 
@@ -183,11 +173,8 @@ pub struct VectorEntry {
 
 impl FlatVectorStore {
     /// Export the current state as a serializable snapshot.
-    pub fn snapshot(&self) -> Result<VectorStoreSnapshot> {
-        let inner = self
-            .inner
-            .read()
-            .map_err(|e| anyhow::anyhow!("vector store lock poisoned: {e}"))?;
+    pub async fn snapshot(&self) -> Result<VectorStoreSnapshot> {
+        let inner = self.inner.read().await;
 
         let entries = inner
             .vectors
@@ -205,17 +192,14 @@ impl FlatVectorStore {
     }
 
     /// Restore from a snapshot.
-    pub fn restore(snapshot: VectorStoreSnapshot) -> Result<Self> {
+    pub async fn restore(snapshot: VectorStoreSnapshot) -> Result<Self> {
         let store = match snapshot.dimensions {
             Some(d) => Self::with_dimensions(d),
             None => Self::new(),
         };
 
         {
-            let mut inner = store
-                .inner
-                .write()
-                .map_err(|e| anyhow::anyhow!("vector store lock poisoned: {e}"))?;
+            let mut inner = store.inner.write().await;
 
             for entry in snapshot.entries {
                 if let Some(d) = inner.dimensions {
@@ -237,8 +221,8 @@ impl FlatVectorStore {
     }
 
     /// Save the snapshot to a JSON file.
-    pub fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
-        let snapshot = self.snapshot()?;
+    pub async fn save_to_file(&self, path: &std::path::Path) -> Result<()> {
+        let snapshot = self.snapshot().await?;
         let json = serde_json::to_vec(&snapshot)
             .context("failed to serialize vector store")?;
         std::fs::write(path, json)
@@ -248,7 +232,7 @@ impl FlatVectorStore {
 
     /// Load from a JSON file, or create a new empty store if the file
     /// does not exist.
-    pub fn load_from_file(path: &std::path::Path) -> Result<Self> {
+    pub async fn load_from_file(path: &std::path::Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::new());
         }
@@ -256,7 +240,7 @@ impl FlatVectorStore {
             .context("failed to read vector store file")?;
         let snapshot: VectorStoreSnapshot = serde_json::from_slice(&data)
             .context("failed to deserialize vector store")?;
-        Self::restore(snapshot)
+        Self::restore(snapshot).await
     }
 }
 
@@ -596,10 +580,10 @@ mod tests {
         let id = Uuid::new_v4();
         store.upsert(id, vec![0.5, 0.5, 0.5]).await.unwrap();
 
-        let snap = store.snapshot().unwrap();
+        let snap = store.snapshot().await.unwrap();
         assert_eq!(snap.entries.len(), 1);
 
-        let restored = FlatVectorStore::restore(snap).unwrap();
+        let restored = FlatVectorStore::restore(snap).await.unwrap();
         assert_eq!(restored.len().await, 1);
 
         let results = restored.search(&[0.5, 0.5, 0.5], 1).await.unwrap();
@@ -615,9 +599,9 @@ mod tests {
         let store = FlatVectorStore::new();
         let id = Uuid::new_v4();
         store.upsert(id, vec![1.0, 0.0]).await.unwrap();
-        store.save_to_file(&path).unwrap();
+        store.save_to_file(&path).await.unwrap();
 
-        let loaded = FlatVectorStore::load_from_file(&path).unwrap();
+        let loaded = FlatVectorStore::load_from_file(&path).await.unwrap();
         assert_eq!(loaded.len().await, 1);
 
         let results = loaded.search(&[1.0, 0.0], 1).await.unwrap();
@@ -628,11 +612,10 @@ mod tests {
         let _ = std::fs::remove_dir(&dir);
     }
 
-    #[test]
-    fn load_nonexistent_returns_empty() {
-        let store = FlatVectorStore::load_from_file(std::path::Path::new("/tmp/nonexistent_aigent_test.json")).unwrap();
-        // Synchronous len check via snapshot
-        let snap = store.snapshot().unwrap();
+    #[tokio::test]
+    async fn load_nonexistent_returns_empty() {
+        let store = FlatVectorStore::load_from_file(std::path::Path::new("/tmp/nonexistent_aigent_test.json")).await.unwrap();
+        let snap = store.snapshot().await.unwrap();
         assert!(snap.entries.is_empty());
     }
 }

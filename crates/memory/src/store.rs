@@ -12,6 +12,9 @@ use crate::schema::{MemoryEntry, MemoryTier};
 /// the same normalised content hash.
 fn content_dedup_key(tier: MemoryTier, content: &str) -> String {
     let norm: String = content
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
