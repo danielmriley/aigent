@@ -118,7 +118,7 @@ impl App {
 
     pub fn input_text(&self) -> String {
         #[cfg(feature = "advanced")]
-        { return self.vim_input.text(); }
+        { self.vim_input.text() }
         #[cfg(not(feature = "advanced"))]
         { self.input.text() }
     }
@@ -441,14 +441,14 @@ impl App {
                     self.chat.auto_follow = true;
                     let _ = self.vim_input.submit_and_clear();
                     self.state.status = "thinking...".to_string();
-                    return Some(UiCommand::Submit(text));
+                    Some(UiCommand::Submit(text))
                 }
                 InputAction::Consumed => {
                     self.file_picker.refresh(&self.vim_input.text());
-                    return None;
+                    None
                 }
                 InputAction::Ignored => {
-                    return None;
+                    None
                 }
             }
         }
