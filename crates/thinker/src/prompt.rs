@@ -35,6 +35,15 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          For date/time questions, use CURRENT_DATETIME above or call get_current_datetime.\n\n",
     );
 
+    // ── Conversational recency / stay-on-topic rule ────────────────────
+    buf.push_str(
+        "STAY ON TOPIC RULE — HIGHEST PRIORITY:\n\
+         Always stay focused on the CURRENT user question and the most recent conversation turns. \
+         Recent messages take absolute priority over older background memories. \
+         If the user says 'try again' or continues a topic, DO NOT switch to unrelated background memories. \
+         Only change the topic if the user explicitly requests a new topic.\n\n",
+    );
+
     // ── Compact tool list + web workflow hint ─────────────────────────────
     if !tool_specs.is_empty() {
         buf.push_str("TOOLS: ");
@@ -55,6 +64,16 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
 
         buf.push('\n');
     }
+
+    // ── Tool hallucination guardrail ─────────────────────────────────
+    // The runtime also validates tool names and feeds an error back if the
+    // model hallucinates, so this prompt rule is a soft prevention layer.
+    buf.push_str(
+        "TOOL CALL RULE — CRITICAL:\n\
+         You can ONLY call tools listed in TOOLS above. NEVER invent tool names.\n\
+         If the tool you need does not exist, use the closest available tool \
+         (e.g. web_search, browse_page, run_shell) to accomplish the task instead.\n\n",
+    );
 
     // ── Retry-limit / termination rule ────────────────────────────────
     buf.push_str(
@@ -144,5 +163,20 @@ mod tests {
         let block = build_external_thinking_block(&[]);
         assert!(block.contains("RETRY LIMIT RULE"));
         assert!(block.contains("2 failed attempts"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_tool_call_rule() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("TOOL CALL RULE"));
+        assert!(block.contains("NEVER invent tool names"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_topic_rule() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("STAY ON TOPIC RULE"));
+        assert!(block.contains("HIGHEST PRIORITY"));
+        assert!(block.contains("Recent messages take absolute priority"));
     }
 }
