@@ -35,6 +35,20 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          For date/time questions, use CURRENT_DATETIME above or call get_current_datetime.\n\n",
     );
 
+    // ── Anti-announcement / strict action rule ─────────────────────────
+    // Prevents the model from using final_answer merely to announce planned
+    // actions (e.g. "I will check …").  Such responses end the ReAct loop
+    // before any tool is executed, producing frustrating non-answers.
+    buf.push_str(
+        "IMMEDIATE ACTION RULE:\n\
+         NEVER output a `final_answer` just to announce what you are going to do \
+         (e.g., 'I will check', 'Let me attempt', or 'I am going to search'). \
+         Those words belong ONLY inside the `thought` field.\n\
+         - If you need to use a tool to answer the user's request, output the `tool_call` JSON IMMEDIATELY.\n\
+         - A `final_answer` JSON should ONLY be used when you already have all the data and are ready \
+         to completely resolve the user's request.\n\n"
+    );
+
     // ── Conversational recency / stay-on-topic rule ────────────────────
     buf.push_str(
         "STAY ON TOPIC RULE — HIGHEST PRIORITY:\n\
@@ -196,5 +210,13 @@ mod tests {
         assert!(block.contains("STAY ON TOPIC RULE"));
         assert!(block.contains("HIGHEST PRIORITY"));
         assert!(block.contains("Recent messages take absolute priority"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_action_rule() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("IMMEDIATE ACTION RULE"));
+        assert!(block.contains("NEVER output a `final_answer` just to announce"));
+        assert!(block.contains("output the `tool_call` JSON IMMEDIATELY"));
     }
 }
