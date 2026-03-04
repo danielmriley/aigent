@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use aigent_exec::ToolExecutor;
 use aigent_llm::{
-    ChatMessage, ChatResponse, LlmRouter, Provider, ToolCall,
+    ChatMessage, ChatResponse, ChatRole, LlmRouter, Provider, ToolCall,
 };
 use aigent_tools::{ToolRegistry, ToolSpec};
 
@@ -79,6 +79,26 @@ pub async fn run_tool_loop(
     let mut all_executions: Vec<ToolExecution> = Vec::new();
     let mut final_content = String::new();
     let mut final_provider = primary;
+
+    // Save the full system prompt and replace with just the thinker block
+    // (CURRENT_DATETIME + JSON AGENT MODE + tool list) for every round.
+    // The identity/memory prose is not needed for tool reasoning and only
+    // bloats the KV-cache fill on the local model. Restored before returning.
+    let full_system_content: Option<String> = messages
+        .first()
+        .filter(|m| m.role == ChatRole::System)
+        .and_then(|m| m.content.clone());
+
+    if let Some(ref full) = full_system_content {
+        let thinker_only = full
+            .find("\n\nCURRENT_DATETIME:")
+            .map(|idx| full[idx..].to_string());
+        if let Some(slim) = thinker_only {
+            if let Some(first) = messages.first_mut() {
+                first.content = Some(slim);
+            }
+        }
+    }
 
     for round in 0..MAX_TOOL_ROUNDS {
         debug!(round, msg_count = messages.len(), "tool loop iteration");
@@ -159,6 +179,16 @@ pub async fn run_tool_loop(
             .map(|e| format!("[{}]: {}", e.tool_name, &e.output[..e.output.len().min(500)]))
             .collect::<Vec<_>>()
             .join("\n\n");
+    }
+
+    // Restore the full system prompt so callers see consistent message history.
+    if let Some(full) = full_system_content {
+        if let Some(first) = messages
+            .first_mut()
+            .filter(|m| m.role == ChatRole::System)
+        {
+            first.content = Some(full);
+        }
     }
 
     Ok(ToolLoopResult {

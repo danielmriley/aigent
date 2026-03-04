@@ -782,7 +782,8 @@ impl OllamaClient {
         let mut payload = json!({
             "model": model,
             "messages": ollama_messages,
-            "stream": false
+            "stream": false,
+            "keep_alive": "30m"
         });
         if json_mode {
             payload["format"] = json!("json");
@@ -835,7 +836,8 @@ impl OllamaClient {
         let mut payload = json!({
             "model": model,
             "messages": ollama_messages,
-            "stream": true
+            "stream": true,
+            "keep_alive": "30m"
         });
         if json_mode {
             payload["format"] = json!("json");
