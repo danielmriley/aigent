@@ -121,9 +121,9 @@ pub async fn run_external_thinking_loop(
         let full_text = response.content.clone();
         debug!(round, len = full_text.len(), "ext_loop: LLM returned content");
 
-        if full_text.is_empty() {
-            warn!(round, "ext_loop: empty response from LLM");
-            let fallback = "(no response from model)".to_string();
+        if full_text.trim().is_empty() {
+            warn!(round, "ext_loop: LLM returned empty/whitespace-only response");
+            let fallback = "I experienced a sudden processing failure and returned an empty response. Please try again.".to_string();
             let _ = user_token_tx.send(fallback.clone()).await;
             return Ok(ToolLoopResult {
                 provider: final_provider,
