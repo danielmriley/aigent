@@ -254,14 +254,19 @@ pub async fn run_external_thinking_loop(
                 messages.push(ChatMessage::assistant(&full_text));
 
                 // Truncate very long tool outputs to avoid blowing the
-                // context window.
-                let obs = if output.len() > 4000 {
-                    format!("{}... (truncated, {} total chars)", &output[..4000], output.len())
+                // context window.  Use a generous limit so the model can
+                // see past large navigation headers on heavy sites.
+                let obs = if output.len() > 12_000 {
+                    format!("{}... (truncated, {} total chars)", &output[..12_000], output.len())
                 } else {
                     output
                 };
                 let observation_msg = format!(
-                    "TOOL RESULT for {tool_name}:\n{obs}"
+                    "TOOL RESULT for {tool_name}:\n\
+                     {obs}\n\n\
+                     Respond with EXACTLY ONE JSON object. \
+                     Either {{\"type\":\"final_answer\",...}} or {{\"type\":\"tool_call\",...}}. \
+                     No prose outside JSON."
                 );
                 messages.push(ChatMessage::user(&observation_msg));
 
