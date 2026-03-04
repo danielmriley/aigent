@@ -187,7 +187,7 @@ unsafe fn install_seccomp_allowlist() -> std::io::Result<()> {
         13,  // rt_sigaction
         14,  // rt_sigprocmask
         15,  // rt_sigreturn
-        16,  // ioctl
+        // 16 — ioctl: REMOVED (see note at end of list)
         17,  // pread64
         18,  // pwrite64
         19,  // readv
