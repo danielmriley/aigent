@@ -130,11 +130,21 @@ pub(super) async fn handle_connection(
                 let user_name = memory.user_name_from_core();
                 let relational_block = memory.relational_state_block();
 
+                // When external_thinking is active, the text-based JSON thinker
+                // needs the full tool list in the prompt (it doesn't use native
+                // tool calling).  Otherwise, tools go via the native API schema.
+                let tool_specs_for_prompt: &[aigent_tools::ToolSpec] =
+                    if rt_clone.config.agent.external_thinking {
+                        &tool_specs
+                    } else {
+                        &[]
+                    };
+
                 let prompt_inputs = aigent_prompt::PromptInputs {
                     config: &rt_clone.config,
                     user_message: &user,
                     recent_turns: &recent,
-                    tool_specs: &[],  // Don't inject tools into the text prompt — they go via API
+                    tool_specs: tool_specs_for_prompt,
                     pending_follow_ups: &[],
                     context_items: &context,
                     stats,
@@ -145,6 +155,7 @@ pub(super) async fn handle_connection(
                     conversation_summary: conv_summary,
                 };
                 let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
+                println!("[PROMPT DEBUG] {} chars (~{} tokens)", system_prompt.len(), system_prompt.len() / 4);
 
                 // Build the chat messages array.
                 // Include recent conversation turns as proper user/assistant
@@ -157,8 +168,14 @@ pub(super) async fn handle_connection(
                 }
                 messages.push(aigent_llm::ChatMessage::user(&user));
 
-                // Build tools JSON from specs
-                let tools_json = if tool_specs.is_empty() {
+                // Build native tool schemas for the LLM API.
+                // When external_thinking is active, disable native tool schemas
+                // entirely — the JSON thinker handles tool dispatch via its own
+                // text protocol.  Sending both would give the model contradictory
+                // instructions and cause it to freeze.
+                let tools_json = if rt_clone.config.agent.external_thinking {
+                    None
+                } else if tool_specs.is_empty() {
                     None
                 } else {
                     Some(aigent_thinker::build_tools_json(&tool_specs))
