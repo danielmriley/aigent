@@ -431,6 +431,78 @@ pub async fn run_unified_daemon(
 
     // Spawn background tasks.
     sleep::spawn_vault_watcher_task(state.clone(), vault_path_for_watcher);
+
+    // ── Model warm-up ──────────────────────────────────────────────────────
+    // Pre-load model(s) into VRAM so the first request isn't penalised by
+    // cold model loading.  When the router uses a *different* model to the
+    // primary, we warm both concurrently — this requires
+    // OLLAMA_MAX_LOADED_MODELS≥2 so Ollama doesn't evict the first model
+    // while loading the second.
+    {
+        let (primary_model, router_model, provider_name, router_provider) = {
+            let st = state.lock().await;
+            let rcfg = &st.runtime.config.router;
+            let r_model = if rcfg.ollama_model.is_empty() {
+                st.runtime.config.active_model().to_string()
+            } else {
+                rcfg.ollama_model.clone()
+            };
+            (
+                st.runtime.config.active_model().to_string(),
+                r_model,
+                st.runtime.config.llm.provider.clone(),
+                rcfg.provider.clone(),
+            )
+        };
+        // Collect distinct Ollama models that need warming.
+        let mut models_to_warm: Vec<String> = Vec::new();
+        if provider_name.eq_ignore_ascii_case("ollama") && !primary_model.is_empty() {
+            models_to_warm.push(primary_model.clone());
+        }
+        if router_provider.eq_ignore_ascii_case("ollama")
+            && !router_model.is_empty()
+            && router_model != primary_model
+        {
+            models_to_warm.push(router_model.clone());
+        }
+        if !models_to_warm.is_empty() {
+            info!(
+                "warming {} model(s): {}",
+                models_to_warm.len(),
+                models_to_warm.join(", ")
+            );
+            tokio::spawn(async move {
+                let base_url = std::env::var("OLLAMA_BASE_URL")
+                    .unwrap_or_else(|_| "http://localhost:11434".to_string());
+                let endpoint = format!("{}/api/chat", base_url.trim_end_matches('/'));
+                let client = reqwest::Client::new();
+                // Fire warm-up requests concurrently.
+                let futures: Vec<_> = models_to_warm
+                    .iter()
+                    .map(|model| {
+                        let payload = serde_json::json!({
+                            "model": model,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": false,
+                            "keep_alive": "30m",
+                            "options": { "num_predict": 1 }
+                        });
+                        let c = client.clone();
+                        let ep = endpoint.clone();
+                        let m = model.clone();
+                        async move {
+                            match c.post(&ep).json(&payload).send().await {
+                                Ok(_) => info!("warm-up complete: {} loaded into VRAM", m),
+                                Err(e) => warn!("warm-up failed for {} (non-fatal): {}", m, e),
+                            }
+                        }
+                    })
+                    .collect();
+                futures::future::join_all(futures).await;
+            });
+        }
+    }
+
     sleep::spawn_compaction_task(state.clone(), &shutdown_tx);
     sleep::spawn_passive_distillation(
         state.clone(), &shutdown_tx, sleep_interval_hours,

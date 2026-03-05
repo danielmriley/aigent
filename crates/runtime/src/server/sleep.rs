@@ -417,7 +417,9 @@ pub(super) fn spawn_proactive_task(
             let identity_block = memory.cached_identity_block().to_string();
             let beliefs_block = memory.cached_beliefs_block(rt_clone.config.memory.max_beliefs_in_prompt).to_string();
             let user_name = memory.user_name_from_core();
-            let relational_block = memory.relational_state_block();
+            let relational_block = memory.relational_state_block(
+                rt_clone.config.memory.max_relational_in_prompt,
+            );
 
             let prompt_inputs = aigent_prompt::PromptInputs {
                 config: &rt_clone.config,
@@ -432,6 +434,7 @@ pub(super) fn spawn_proactive_task(
                 user_name,
                 relational_block,
                 conversation_summary: None,
+                chat_only: false,
             };
             let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
 

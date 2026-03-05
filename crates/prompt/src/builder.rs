@@ -3,6 +3,7 @@
 use std::fmt::Write as _;
 
 use chrono::{Local, Utc};
+use tracing::info;
 use uuid::Uuid;
 
 use aigent_config::AppConfig;
@@ -20,31 +21,59 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     let config = inputs.config;
 
     let thought_style = config.agent.thinking_level.to_lowercase();
-    let follow_up_block =
-        build_follow_up_block(inputs.pending_follow_ups, inputs.user_name.as_deref());
-    let context_block = build_context_block(inputs.context_items, &inputs.stats);
-    let relational_block = inputs
-        .relational_block
-        .as_ref()
-        .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
-        .unwrap_or_default();
+    // In chat_only mode, strip heavy context blocks — they contain historical
+    // dates and facts that can overwhelm the CURRENT DATETIME instruction and
+    // cause the model to give wrong answers to simple questions.
+    let follow_up_block = if inputs.chat_only {
+        String::new()
+    } else {
+        build_follow_up_block(inputs.pending_follow_ups, inputs.user_name.as_deref())
+    };
+    let context_block = if inputs.chat_only {
+        String::new()
+    } else {
+        build_context_block(inputs.context_items, &inputs.stats)
+    };
+    let mut relational_block = if inputs.chat_only {
+        String::new()
+    } else {
+        inputs
+            .relational_block
+            .as_ref()
+            .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
+            .unwrap_or_default()
+    };
     let proactive_directive = proactive_directive(&relational_block);
     let environment_block =
         build_environment_block(config, &inputs.stats, inputs.recent_turns.len());
-    let conversation_block = build_conversation_block(inputs.recent_turns);
-    let prior_summary = inputs.conversation_summary.as_deref()
-        .map(|s| format!("PRIOR CONVERSATION SUMMARY:\n{s}\n\n         "))
-        .unwrap_or_default();
+    let mut conversation_block = build_conversation_block(inputs.recent_turns);
+    let prior_summary = if inputs.chat_only {
+        String::new()
+    } else {
+        inputs.conversation_summary.as_deref()
+            .map(|s| format!("PRIOR CONVERSATION SUMMARY:\n{s}\n\n         "))
+            .unwrap_or_default()
+    };
     // When external_thinking is active, suppress the prose tool-awareness and
     // autonomy directives — they conflict with the strict JSON-only instructions
     // appended below by build_external_thinking_block, which lists tools in its
     // own compact format.
+    // BUT: when `chat_only` is set, always skip ext_think — the CHAT path
+    // needs plain-text output even when external_thinking is globally enabled.
+    let use_ext_think = config.agent.external_thinking && !inputs.chat_only;
+    // When `chat_only` is set, omit tool specs entirely — the CHAT path
+    // does not invoke tools, and including them wastes ~24 KB of prompt.
+    // Also skip the grounding rules (1.5 KB) which are all tool-centric.
     let prose_tool_specs: &[aigent_tools::ToolSpec] =
-        if config.agent.external_thinking { &[] } else { inputs.tool_specs };
-    let tools_section = build_tools_and_grounding(prose_tool_specs);
-    // When external_thinking is active, do NOT emit "ASSISTANT RESPONSE:" —
-    // the ext-think block dictates the output format (JSON object, not prose).
-    let response_tag = if config.agent.external_thinking {
+        if use_ext_think || inputs.chat_only { &[] } else { inputs.tool_specs };
+    let tools_section = if inputs.chat_only {
+        String::new()
+    } else {
+        build_tools_and_grounding(prose_tool_specs)
+    };
+    // When external_thinking is active (and not chat_only), do NOT emit
+    // "ASSISTANT RESPONSE:" — the ext-think block dictates the output format.
+    let response_tag = if use_ext_think {
         ""
     } else {
         "\n\n         ASSISTANT RESPONSE:"
@@ -54,6 +83,61 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     // hit rate across consecutive turns in the same minute.
     let now = Local::now();
     let current_datetime = now.format("%Y-%m-%d %H:%M %Z").to_string();
+
+    // ── Prompt budget enforcement ─────────────────────────────────────────
+    //
+    // Estimate total char count from all sections.  If over the configured
+    // `max_prompt_chars`, progressively truncate the largest *compressible*
+    // sections (relational → conversation → memory context) until under
+    // budget.  Identity, tools, ext_think, and user message are sacred —
+    // they must never be clipped.
+    let max_chars = config.memory.max_prompt_chars;
+    if max_chars > 0 {
+        // Rough overhead for the static prose template strings (~2 KB).
+        const TEMPLATE_OVERHEAD: usize = 2048;
+        let fixed_cost = TEMPLATE_OVERHEAD
+            + inputs.identity_block.len()
+            + inputs.beliefs_block.len()
+            + tools_section.len()
+            + follow_up_block.len()
+            + environment_block.len()
+            + prior_summary.len()
+            + inputs.user_message.len();
+
+        let available = max_chars.saturating_sub(fixed_cost);
+        let variable_total = relational_block.len() + conversation_block.len() + context_block.len();
+
+        if variable_total > available {
+            info!(
+                "[PROMPT] budget exceeded: variable={}ch available={}ch — truncating",
+                variable_total, available,
+            );
+            // Distribute the available budget proportionally but prioritise
+            // conversation (recent context) over relational (background).
+            // Ratios: conversation 50%, memory 30%, relational 20%.
+            let conv_budget = available * 50 / 100;
+            let mem_budget  = available * 30 / 100;
+            let rel_budget  = available - conv_budget - mem_budget;
+
+            if relational_block.len() > rel_budget {
+                relational_block.truncate(rel_budget);
+                // Avoid splitting mid-character.
+                while !relational_block.is_char_boundary(relational_block.len()) {
+                    relational_block.pop();
+                }
+                relational_block.push_str("\n[…relational truncated]");
+            }
+            if conversation_block.len() > conv_budget {
+                conversation_block.truncate(conv_budget);
+                while !conversation_block.is_char_boundary(conversation_block.len()) {
+                    conversation_block.pop();
+                }
+                conversation_block.push_str("\n[…conversation truncated]");
+            }
+            // context_block is immutable (and already capped at 10 items × 4 KB),
+            // so we only warn rather than truncate.
+        }
+    }
 
     // ── Prompt layout (KV-cache optimised) ────────────────────────────────
     //
@@ -75,6 +159,12 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     //   │ • CURRENT DATETIME (HH:MM — stale once per minute at most)   │
     //   │ • Follow-ups, environment, conversation, memory, user msg    │
     //   └──────────────────────────────────────────────────────────────┘
+    let ext_think_block = if use_ext_think {
+        aigent_thinker::build_external_thinking_block(inputs.tool_specs)
+    } else {
+        String::new()
+    };
+
     let mut buf = String::with_capacity(8192);
     let _ = write!(
         buf,
@@ -118,13 +208,29 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
         conv = conversation_block,
         prior_summary = prior_summary,
         mem = context_block,
-        ext_think = if config.agent.external_thinking {
-            aigent_thinker::build_external_thinking_block(inputs.tool_specs)
-        } else {
-            String::new()
-        },
+        ext_think = ext_think_block,
         msg = inputs.user_message,
         response_tag = response_tag,
+    );
+
+    // ── Per-section size diagnostics ─────────────────────────────────────
+    info!(
+        "[PROMPT] sections: identity={}ch beliefs={}ch relational={}ch tools={}ch \
+         ext_think={}ch follow_ups={}ch env={}ch conv={}ch prior_summ={}ch \
+         memory={}ch user_msg={}ch | total={}ch (~{} tokens)",
+        inputs.identity_block.len(),
+        inputs.beliefs_block.len(),
+        relational_block.len(),
+        tools_section.len(),
+        ext_think_block.len(),
+        follow_up_block.len(),
+        environment_block.len(),
+        conversation_block.len(),
+        prior_summary.len(),
+        context_block.len(),
+        inputs.user_message.len(),
+        buf.len(),
+        buf.len() / 4,
     );
 
     buf
@@ -606,6 +712,7 @@ mod summary_tests {
             user_name: None,
             relational_block: None,
             conversation_summary: summary,
+            chat_only: false,
         };
         build_chat_prompt(&inputs)
     }

@@ -56,11 +56,17 @@ pub struct PromptInputs<'a> {
     pub beliefs_block: String,
     /// Output of `MemoryManager::user_name_from_core()`.
     pub user_name: Option<String>,
-    /// Output of `MemoryManager::relational_state_block()`.
+    /// Output of `MemoryManager::relational_state_block(max_per_bucket)`.
     pub relational_block: Option<String>,
 
     /// Condensed summary of earlier conversation turns that were evicted from
     /// `recent_turns`.  When present, this is rendered as a "PRIOR CONVERSATION
     /// SUMMARY" block so the agent retains context across long sessions.
     pub conversation_summary: Option<String>,
+
+    /// When `true`, skip the external-thinking JSON instructions and emit
+    /// the plain-text "ASSISTANT RESPONSE:" tag instead.  Used by the
+    /// router's CHAT fast-path when the primary model is reused for a
+    /// direct conversational response.
+    pub chat_only: bool,
 }

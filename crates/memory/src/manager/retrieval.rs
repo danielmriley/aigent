@@ -90,11 +90,19 @@ impl MemoryManager {
     ///   3. **Content-based fallback** — legacy entries without tags are
     ///      scanned for keywords (preserved for backward compatibility).
     ///
+    /// `max_per_bucket` caps each bucket independently.  When `0`, all items
+    /// are retained (not recommended for production — can produce 300 K+ char
+    /// prompts).  Items are deduplicated by content and sorted most-recent-first
+    /// before the cap is applied so fresh facts survive pruning.
+    ///
     /// Returns `None` when all buckets are empty.
-    pub fn relational_state_block(&self) -> Option<String> {
-        let mut user_facts: Vec<String> = Vec::new();
-        let mut agent_beliefs: Vec<String> = Vec::new();
-        let mut relationship_dynamics: Vec<String> = Vec::new();
+    pub fn relational_state_block(&self, max_per_bucket: usize) -> Option<String> {
+        use std::collections::HashSet;
+
+        // Collect (content, created_at) tuples so we can dedup + sort later.
+        let mut user_facts: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        let mut agent_beliefs: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
+        let mut relationship_dynamics: Vec<(String, chrono::DateTime<chrono::Utc>)> = Vec::new();
 
         // Single pass — no intermediate Vec allocations from entries_by_tier.
         for entry in self.store.all().iter()
@@ -112,21 +120,21 @@ impl MemoryManager {
             });
 
             if has_belief_tag {
-                agent_beliefs.push(strip_tag_prefix_lower(
+                agent_beliefs.push((strip_tag_prefix_lower(
                     &entry.content,
                     &["belief:", "my_belief:", "opinion:"],
-                ));
+                ), entry.created_at));
                 continue;
             }
             if has_dynamic_tag {
-                relationship_dynamics.push(strip_tag_prefix_lower(
+                relationship_dynamics.push((strip_tag_prefix_lower(
                     &entry.content,
                     &["dynamic:", "our_dynamic:", "relationship:"],
-                ));
+                ), entry.created_at));
                 continue;
             }
             if has_user_fact_tag {
-                user_facts.push(entry.content.clone());
+                user_facts.push((entry.content.clone(), entry.created_at));
                 continue;
             }
 
@@ -136,15 +144,15 @@ impl MemoryManager {
             let is_dynamic_src = src.contains("psychologist") || src == "sleep:relationship";
 
             if is_belief_src {
-                agent_beliefs.push(strip_tag_prefix_lower(
+                agent_beliefs.push((strip_tag_prefix_lower(
                     &entry.content,
                     &["belief:", "my_belief:", "opinion:"],
-                ));
+                ), entry.created_at));
             } else if is_dynamic_src {
-                relationship_dynamics.push(strip_tag_prefix_lower(
+                relationship_dynamics.push((strip_tag_prefix_lower(
                     &entry.content,
                     &["dynamic:", "our_dynamic:", "relationship:"],
-                ));
+                ), entry.created_at));
             } else {
                 // ── Priority 3: Content keyword fallback (legacy) ──────
                 // "think" and "shared" are intentionally excluded: both are
@@ -155,22 +163,22 @@ impl MemoryManager {
                     || contains_icase(&entry.content, "feel about")
                     || contains_icase(&entry.content, "my_belief")
                 {
-                    agent_beliefs.push(strip_tag_prefix_lower(
+                    agent_beliefs.push((strip_tag_prefix_lower(
                         &entry.content,
                         &["belief:", "my_belief:", "opinion:"],
-                    ));
+                    ), entry.created_at));
                 } else if contains_icase(&entry.content, "dynamic")
                     || contains_icase(&entry.content, "relationship")
                     || contains_icase(&entry.content, "joke")
                     || contains_icase(&entry.content, "rapport")
                     || contains_icase(&entry.content, "our_dynamic")
                 {
-                    relationship_dynamics.push(strip_tag_prefix_lower(
+                    relationship_dynamics.push((strip_tag_prefix_lower(
                         &entry.content,
                         &["dynamic:", "our_dynamic:", "relationship:"],
-                    ));
+                    ), entry.created_at));
                 } else {
-                    user_facts.push(entry.content.clone());
+                    user_facts.push((entry.content.clone(), entry.created_at));
                 }
             }
         }
@@ -178,6 +186,22 @@ impl MemoryManager {
         if user_facts.is_empty() && agent_beliefs.is_empty() && relationship_dynamics.is_empty() {
             return None;
         }
+
+        // ── Dedup + sort + cap each bucket ─────────────────────────────
+        let dedup_sort_cap = |bucket: &mut Vec<(String, chrono::DateTime<chrono::Utc>)>| -> Vec<String> {
+            // Dedup by content: keep the most recent occurrence of each
+            // unique string.
+            let mut seen = HashSet::new();
+            bucket.retain(|(content, _)| seen.insert(content.clone()));
+            // Most recent first.
+            bucket.sort_by(|a, b| b.1.cmp(&a.1));
+            let take_n = if max_per_bucket == 0 { bucket.len() } else { max_per_bucket.min(bucket.len()) };
+            bucket[..take_n].iter().map(|(c, _)| c.clone()).collect()
+        };
+
+        let user_facts_final = dedup_sort_cap(&mut user_facts);
+        let beliefs_final = dedup_sort_cap(&mut agent_beliefs);
+        let dynamics_final = dedup_sort_cap(&mut relationship_dynamics);
 
         let fmt = |label: &str, items: &[String]| -> String {
             if items.is_empty() {
@@ -187,9 +211,9 @@ impl MemoryManager {
         };
 
         let parts: Vec<String> = [
-            fmt("USER",        &user_facts),
-            fmt("MY_BELIEFS",  &agent_beliefs),
-            fmt("OUR_DYNAMIC", &relationship_dynamics),
+            fmt("USER",        &user_facts_final),
+            fmt("MY_BELIEFS",  &beliefs_final),
+            fmt("OUR_DYNAMIC", &dynamics_final),
         ]
         .into_iter()
         .filter(|s| !s.is_empty())

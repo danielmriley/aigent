@@ -58,6 +58,7 @@ pub(super) async fn handle_connection(
         }
         ClientCommand::SubmitTurn { user, source } => {
             let is_external = source != "tui";
+            let turn_start = std::time::Instant::now();
             // Broadcast the user message so TUI subscribers can show the bubble.
             if is_external {
                 let _ = event_tx.send(BackendEvent::ExternalTurn {
@@ -115,6 +116,10 @@ pub(super) async fn handle_connection(
                 // Persist the user turn and do memory work before calling the LLM.
                 let _: Result<_, _> = memory.record(aigent_memory::MemoryTier::Episodic, user.clone(), "user-input").await;
 
+                let timing = rt_clone.config.debug.timing;
+                let verbose_routing = rt_clone.config.debug.verbose_routing;
+                let phase_start = std::time::Instant::now();
+
                 // Build the system prompt using the existing prompt builder.
                 let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
                     embed_fn(user.to_string()).await
@@ -128,7 +133,10 @@ pub(super) async fn handle_connection(
                 let identity_block = memory.cached_identity_block().to_string();
                 let beliefs_block = memory.cached_beliefs_block(rt_clone.config.memory.max_beliefs_in_prompt).to_string();
                 let user_name = memory.user_name_from_core();
-                let relational_block = memory.relational_state_block();
+                let relational_block = memory.relational_state_block(
+                    rt_clone.config.memory.max_relational_in_prompt,
+                );
+                let memory_prep_elapsed = phase_start.elapsed();
 
                 // When external_thinking is active, the text-based JSON thinker
                 // needs the full tool list in the prompt (it doesn't use native
@@ -140,7 +148,7 @@ pub(super) async fn handle_connection(
                         &[]
                     };
 
-                let prompt_inputs = aigent_prompt::PromptInputs {
+                let mut prompt_inputs = aigent_prompt::PromptInputs {
                     config: &rt_clone.config,
                     user_message: &user,
                     recent_turns: &recent,
@@ -153,9 +161,80 @@ pub(super) async fn handle_connection(
                     user_name,
                     relational_block,
                     conversation_summary: conv_summary,
+                    chat_only: false,
                 };
+
+                let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
+                    aigent_llm::Provider::OpenRouter
+                } else {
+                    aigent_llm::Provider::Ollama
+                };
+
+                // ── Small-model router ───────────────────────────────────────
+                // When enabled, classify the message as CHAT (simple
+                // conversation) or TOOLS (needs the full thinker loop).
+                //
+                // Resolve the effective router model once: when the config
+                // field is empty, fall back to the primary model to avoid
+                // VRAM model-swap overhead on single-GPU setups.
+                let (router_provider, router_model): (aigent_llm::Provider, String) = {
+                    let rcfg = &rt_clone.config.router;
+                    if rcfg.provider.eq_ignore_ascii_case("openrouter") {
+                        let m = if rcfg.openrouter_model.is_empty() {
+                            rt_clone.config.llm.openrouter_model.clone()
+                        } else {
+                            rcfg.openrouter_model.clone()
+                        };
+                        (aigent_llm::Provider::OpenRouter, m)
+                    } else {
+                        let m = if rcfg.ollama_model.is_empty() {
+                            rt_clone.config.llm.ollama_model.clone()
+                        } else {
+                            rcfg.ollama_model.clone()
+                        };
+                        (aigent_llm::Provider::Ollama, m)
+                    }
+                };
+
+                let router_start = std::time::Instant::now();
+                let router_decision = if rt_clone.config.router.enabled {
+                    aigent_thinker::route_query(
+                        &rt_clone.llm,
+                        router_provider,
+                        &router_model,
+                        &rt_clone.config.router.classify_system_prompt,
+                        std::time::Duration::from_secs(
+                            rt_clone.config.router.classify_timeout_seconds,
+                        ),
+                        &user,
+                        verbose_routing,
+                    )
+                    .await
+                } else {
+                    aigent_llm::RouterDecision::Tools // disabled → always full agent
+                };
+
+                // ── Dispatch based on router decision ────────────────────────
+                let router_elapsed = router_start.elapsed();
+                info!("[ROUTER] decision={:?} model={} provider={:?}",
+                    router_decision, router_model, router_provider);
+
+                // Defer prompt build until after routing so we build exactly
+                // once with the correct mode (chat_only vs full agent).
+                if router_decision == aigent_llm::RouterDecision::Chat {
+                    prompt_inputs.chat_only = true;
+                }
+                let build_start = std::time::Instant::now();
                 let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
-                println!("[PROMPT DEBUG] {} chars (~{} tokens)", system_prompt.len(), system_prompt.len() / 4);
+                let build_elapsed = build_start.elapsed();
+                if timing {
+                    info!("[TIMING] memory_prep={}ms router={}ms prompt_build={}ms chars={} (~{} tokens)",
+                        memory_prep_elapsed.as_millis(),
+                        router_elapsed.as_millis(),
+                        build_elapsed.as_millis(),
+                        system_prompt.len(),
+                        system_prompt.len() / 4);
+                }
 
                 // Build the chat messages array.
                 // Include recent conversation turns as proper user/assistant
@@ -168,74 +247,18 @@ pub(super) async fn handle_connection(
                 }
                 messages.push(aigent_llm::ChatMessage::user(&user));
 
-                // Build native tool schemas for the LLM API.
-                // When external_thinking is active, disable native tool schemas
-                // entirely — the JSON thinker handles tool dispatch via its own
-                // text protocol.  Sending both would give the model contradictory
-                // instructions and cause it to freeze.
-                let tools_json = if rt_clone.config.agent.external_thinking {
-                    None
-                } else if tool_specs.is_empty() {
-                    None
-                } else {
-                    Some(aigent_thinker::build_tools_json(&tool_specs))
-                };
-
-                let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
-                    aigent_llm::Provider::OpenRouter
-                } else {
-                    aigent_llm::Provider::Ollama
-                };
-
-                // ── Small-model router ───────────────────────────────────────
-                // When enabled, ask a tiny model to classify the message as
-                // CHAT (simple conversation) or TOOLS (needs the full thinker).
-                let router_decision = if rt_clone.config.router.enabled {
-                    let rp = if rt_clone.config.router.provider.to_lowercase() == "openrouter" {
-                        aigent_llm::Provider::OpenRouter
-                    } else {
-                        aigent_llm::Provider::Ollama
-                    };
-                    let rm = if rp == aigent_llm::Provider::OpenRouter {
-                        rt_clone.config.router.openrouter_model.as_str()
-                    } else {
-                        rt_clone.config.router.ollama_model.as_str()
-                    };
-                    aigent_thinker::route_query(
-                        &rt_clone.llm,
-                        rp,
-                        rm,
-                        &rt_clone.config.router.classify_system_prompt,
-                        std::time::Duration::from_secs(
-                            rt_clone.config.router.classify_timeout_seconds,
-                        ),
-                        &user,
-                    )
-                    .await
-                } else {
-                    aigent_llm::RouterDecision::Tools // disabled → always full agent
-                };
-
-                // ── Dispatch based on router decision ────────────────────────
+                let llm_start = std::time::Instant::now();
                 let loop_result = if router_decision == aigent_llm::RouterDecision::Chat {
-                    // Fast path: small model handles this turn directly.
-                    let rp = if rt_clone.config.router.provider.to_lowercase() == "openrouter" {
-                        aigent_llm::Provider::OpenRouter
-                    } else {
-                        aigent_llm::Provider::Ollama
-                    };
-                    let rm = if rp == aigent_llm::Provider::OpenRouter {
-                        &rt_clone.config.router.openrouter_model
-                    } else {
-                        &rt_clone.config.router.ollama_model
-                    };
+                    // Fast path: skip tool loop, external thinking, and
+                    // reflection.  Stream a direct answer using the already-
+                    // built chat-only prompt.
                     let chat_timeout = std::time::Duration::from_secs(
                         rt_clone.config.router.chat_timeout_seconds,
                     );
                     match aigent_thinker::run_simple_chat(
                         &rt_clone.llm,
-                        rp,
-                        rm,
+                        router_provider,
+                        &router_model,
                         &messages,
                         chunk_tx,
                         chat_timeout,
@@ -243,7 +266,7 @@ pub(super) async fn handle_connection(
                     .await
                     {
                         Ok(content) => Ok(aigent_thinker::ToolLoopResult {
-                            provider: rp,
+                            provider: router_provider,
                             content,
                             tool_executions: vec![],
                         }),
@@ -251,6 +274,20 @@ pub(super) async fn handle_connection(
                     }
                 } else {
                     // Full thinker path: tool loop with primary model.
+
+                    // Build native tool schemas for the LLM API.
+                    // When external_thinking is active, disable native tool schemas
+                    // entirely — the JSON thinker handles tool dispatch via its own
+                    // text protocol.  Sending both would give the model contradictory
+                    // instructions and cause it to freeze.
+                    let tools_json = if rt_clone.config.agent.external_thinking {
+                        None
+                    } else if tool_specs.is_empty() {
+                        None
+                    } else {
+                        Some(aigent_thinker::build_tools_json(&tool_specs))
+                    };
+
                     let step_timeout = std::time::Duration::from_secs(
                         rt_clone.config.agent.step_timeout_seconds,
                     );
@@ -301,6 +338,17 @@ pub(super) async fn handle_connection(
                     }
                 };
 
+                let llm_elapsed = llm_start.elapsed();
+                if timing {
+                    let path = if router_decision == aigent_llm::RouterDecision::Chat {
+                        "CHAT"
+                    } else {
+                        "TOOLS"
+                    };
+                    info!("[TIMING] llm_path={} llm_response={}ms", path, llm_elapsed.as_millis());
+                }
+
+                let memory_start = std::time::Instant::now();
                 let reply_result: Result<String, anyhow::Error> = match loop_result {
                     Ok(ref result) => {
                         // Record tool results to procedural memory
@@ -319,11 +367,7 @@ pub(super) async fn handle_connection(
                         // Record assistant reply
                         if !result.content.is_empty() {
                             let model_tag = if router_decision == aigent_llm::RouterDecision::Chat {
-                                format!("router:{}", if rt_clone.config.router.provider.to_lowercase() == "openrouter" {
-                                    &rt_clone.config.router.openrouter_model
-                                } else {
-                                    &rt_clone.config.router.ollama_model
-                                })
+                                format!("router:{}", router_model)
                             } else {
                                 rt_clone.config.active_model().to_string()
                             };
@@ -355,6 +399,22 @@ pub(super) async fn handle_connection(
                         Err(_) => vec![],
                     }
                 };
+
+                let memory_elapsed = memory_start.elapsed();
+                if timing {
+                    let total = turn_start.elapsed();
+                    info!(
+                        "[TIMING] turn_total={}ms mem_prep={}ms router={}ms build={}ms llm={}ms memory+reflect={}ms path={} model={}",
+                        total.as_millis(),
+                        memory_prep_elapsed.as_millis(),
+                        router_elapsed.as_millis(),
+                        build_elapsed.as_millis(),
+                        llm_elapsed.as_millis(),
+                        memory_elapsed.as_millis(),
+                        if router_decision == aigent_llm::RouterDecision::Chat { "CHAT" } else { "TOOLS" },
+                        if router_decision == aigent_llm::RouterDecision::Chat { &router_model } else { rt_clone.config.active_model() },
+                    );
+                }
 
                 let _ = streamer.await;
 
