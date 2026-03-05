@@ -49,16 +49,37 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     } else {
         "\n\n         ASSISTANT RESPONSE:"
     };
+    // Format without seconds so the dynamic section only changes once per
+    // minute instead of once per second — dramatically improves KV cache
+    // hit rate across consecutive turns in the same minute.
     let now = Local::now();
-    let current_datetime = now.format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    let current_datetime = now.format("%Y-%m-%d %H:%M %Z").to_string();
 
+    // ── Prompt layout (KV-cache optimised) ────────────────────────────────
+    //
+    // KV caching in local inference engines (Ollama, llama.cpp, vLLM) works
+    // by matching a *prefix* of tokens.  Any change at token N invalidates
+    // everything from N onward.  The old layout put CURRENT DATETIME at
+    // token ~15, busting the cache every second and causing 60–120 s prefill
+    // on large models.
+    //
+    // New layout:
+    //   ┌─ STATIC PREFIX ──────────────────────────────────────────────┐
+    //   │ • Agent identity / core directives (never changes)           │
+    //   │ • Relational / proactive blocks (changes at sleep cycles)    │
+    //   │ • Identity + beliefs (changes at sleep cycles)               │
+    //   │ • Tools section (changes on tool reload)                     │
+    //   │ • External thinking rules — fully static, no datetime        │
+    //   └──────────────────────────────────────────────────────────────┘
+    //   ┌─ DYNAMIC TAIL (not cached, updated every turn) ──────────────┐
+    //   │ • CURRENT DATETIME (HH:MM — stale once per minute at most)   │
+    //   │ • Follow-ups, environment, conversation, memory, user msg    │
+    //   └──────────────────────────────────────────────────────────────┘
     let mut buf = String::with_capacity(8192);
     let _ = write!(
         buf,
+        // ── Static prefix ────────────────────────────────────────────
         "You are {name}. Thinking depth: {thought_style}.\n\n\
-         CURRENT DATETIME: {current_datetime}\n\
-         For ANY question about \"today\", \"what day\", \"current date/time\", or similar \u{2014} \
-         answer using the CURRENT DATETIME above. NEVER guess or use training data dates.\n\n\
          CRITICAL DIRECTIVE ON MEMORY AND IDENTITY:\n\
          You are an advanced AI agent equipped with a permanent, continuous memory system \
          managed by your host environment. This system provides you with long-term memory, \
@@ -69,22 +90,27 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
          lack a persistent memory, or that each session starts fresh. \
          You are a continuously operating entity; the memory blocks provided in this prompt \
          constitute your actual mind and historical record.\n\n\
-         Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \n\
+         Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \
          continuity, and MEMORY CONTEXT for durable background facts.\n\
          Never repeat previous answers unless asked.\n\
          Respond directly and specifically to the LATEST user message.\
-         {relational_block}{follow_ups}{proactive_directive}\n\n\
+         {relational_block}{proactive_directive}\n\n\
          {identity}{beliefs}{tools_section}\n\n\
+         {ext_think}\
+         CURRENT CONTEXT:\n\
+         CURRENT DATETIME: {current_datetime}\n\
+         For ANY question about \"today\", \"what day\", \"current date/time\", or similar \u{2014} \
+         answer using CURRENT DATETIME above. NEVER guess or use training data dates.\n\
+         {follow_ups}\
          ENVIRONMENT CONTEXT:\n{env}\n\n\
          {prior_summary}RECENT CONVERSATION:\n{conv}\n\n\
          MEMORY CONTEXT:\n{mem}\n\n\
-         {ext_think}\
          LATEST USER MESSAGE:\n{msg}{response_tag}",
         name = config.agent.name,
         current_datetime = current_datetime,
         relational_block = relational_block,
-        follow_ups = follow_up_block,
         proactive_directive = proactive_directive,
+        follow_ups = follow_up_block,
         identity = inputs.identity_block,
         beliefs = inputs.beliefs_block,
         tools_section = tools_section,
@@ -177,13 +203,14 @@ fn build_environment_block(
         .ok()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let local_ts = Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string();
-    let timestamp = Utc::now().to_rfc3339();
+    // No seconds — keeps this block stable for a full minute per KV-cache entry.
+    let local_ts = Local::now().format("%Y-%m-%d %H:%M %Z").to_string();
+    let utc_ts = Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
     let git_present = std::path::Path::new(".git").exists();
 
     format!(
         "- local_time: {local_ts}\n\
-         - utc_time: {timestamp}\n\
+         - utc_time: {utc_ts}\n\
          - os: {}\n\
          - arch: {}\n\
          - cwd: {cwd}\n\
