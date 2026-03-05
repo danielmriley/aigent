@@ -66,6 +66,19 @@ pub async fn run_external_thinking_loop(
     let final_provider = primary;
 
     for round in 0..MAX_EXT_ROUNDS {
+        // Log prompt size on the first step so we can spot bloated prompts
+        // that cause prefill timeouts on large local models.
+        if round == 0 {
+            let msg_chars: usize = messages.iter()
+                .map(|m| m.content.as_ref().map_or(0, |s| s.len()))
+                .sum();
+            debug!(
+                round,
+                msg_chars,
+                msg_count = messages.len(),
+                "ext_loop: first step prompt size"
+            );
+        }
         debug!(round, "external thinking loop iteration");
 
         // ── Call the LLM (streaming, no native tools) ────────────────────
