@@ -19,11 +19,10 @@
 pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> String {
     let mut buf = String::with_capacity(2048);
 
-    // Inject current datetime so the model can answer date/time questions
-    // instantly without calling a tool.
-    let now = chrono::Local::now();
-    let datetime_str = now.format("%A, %B %-d, %Y %H:%M:%S %Z").to_string();
-    buf.push_str(&format!("\n\nCURRENT_DATETIME: {datetime_str}\n\n"));
+    // NOTE: CURRENT_DATETIME is intentionally NOT injected here.
+    // It lives in the dynamic CURRENT CONTEXT section at the bottom of the
+    // system prompt (builder.rs) so that this entire block is static and
+    // can be held in the LLM engine's KV cache across consecutive turns.
 
     // ── Concise mode header + schema ─────────────────────────────────────
     buf.push_str(
@@ -32,7 +31,8 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          TOOL CALL: {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
          FINAL ANSWER: {\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<response>\"}\n\n\
          Use a tool for anything that needs current/live data (files, web, system info).\n\
-         For date/time questions, use CURRENT_DATETIME above or call get_current_datetime.\n\n",
+         For date/time questions, use CURRENT_DATETIME from the CURRENT CONTEXT section, \
+         or call get_current_datetime.\n\n",
     );
 
     // ── Anti-announcement / strict action rule ─────────────────────────
@@ -66,7 +66,7 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
     // ── Temporal grounding rule ─────────────────────────────────────────
     buf.push_str(
         "TEMPORAL AWARENESS RULE:\n\
-         You have been provided with CURRENT_DATETIME at the top of this prompt. \
+         CURRENT_DATETIME is provided in the CURRENT CONTEXT section of this prompt. \
          When answering questions about 'next', 'upcoming', or 'future' events, you MUST \
          strictly compare dates found in tool results against CURRENT_DATETIME. \
          NEVER present an event from the past as an upcoming event. \
@@ -194,9 +194,20 @@ mod tests {
     }
 
     #[test]
-    fn external_thinking_block_has_datetime() {
+    fn external_thinking_block_references_datetime() {
+        // CURRENT_DATETIME is no longer injected by this block — it lives in
+        // the CURRENT CONTEXT section of builder.rs so the ext-think block
+        // can be a stable KV-cache entry.  We verify the block still REFERENCES
+        // the value (so the model knows to use it) and does NOT self-inject it.
         let block = build_external_thinking_block(&[]);
-        assert!(block.contains("CURRENT_DATETIME:"));
+        assert!(block.contains("CURRENT_DATETIME"),
+            "block must reference CURRENT_DATETIME for temporal grounding");
+        assert!(block.contains("CURRENT CONTEXT"),
+            "block must direct the model to the CURRENT CONTEXT section");
+        // No self-injection: the colon+space pattern `CURRENT_DATETIME: 2` would
+        // mean the datetime value itself was baked in, busting the KV cache.
+        assert!(!block.contains("CURRENT_DATETIME: 2"),
+            "block must NOT inject the datetime value itself");
     }
 
     #[test]
