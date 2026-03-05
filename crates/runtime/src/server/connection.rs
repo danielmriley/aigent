@@ -187,55 +187,118 @@ pub(super) async fn handle_connection(
                     aigent_llm::Provider::Ollama
                 };
 
-                // Run the structured tool loop — registry/executor are Arc-cloned
-                // so we do NOT hold the DaemonState lock during LLM calls.
-                let step_timeout = std::time::Duration::from_secs(
-                    rt_clone.config.agent.step_timeout_seconds,
-                );
-                // Bridge thinker events into the runtime BackendEvent system.
-                let event_tx_clone = event_tx.clone();
-                let event_sink = move |evt: aigent_thinker::ThinkerEvent| {
-                    use aigent_thinker::ThinkerEvent;
-                    let backend_evt = match evt {
-                        ThinkerEvent::ToolCallStart(info) => crate::BackendEvent::ToolCallStart(info),
-                        ThinkerEvent::ToolCallEnd(result) => crate::BackendEvent::ToolCallEnd(result),
-                        ThinkerEvent::AgentThought(thought) => crate::BackendEvent::AgentThought(thought),
+                // ── Small-model router ───────────────────────────────────────
+                // When enabled, ask a tiny model to classify the message as
+                // CHAT (simple conversation) or TOOLS (needs the full thinker).
+                let router_decision = if rt_clone.config.router.enabled {
+                    let rp = if rt_clone.config.router.provider.to_lowercase() == "openrouter" {
+                        aigent_llm::Provider::OpenRouter
+                    } else {
+                        aigent_llm::Provider::Ollama
                     };
-                    let _ = event_tx_clone.send(backend_evt);
+                    let rm = if rp == aigent_llm::Provider::OpenRouter {
+                        rt_clone.config.router.openrouter_model.as_str()
+                    } else {
+                        rt_clone.config.router.ollama_model.as_str()
+                    };
+                    aigent_thinker::route_query(
+                        &rt_clone.llm,
+                        rp,
+                        rm,
+                        &rt_clone.config.router.classify_system_prompt,
+                        std::time::Duration::from_secs(
+                            rt_clone.config.router.classify_timeout_seconds,
+                        ),
+                        &user,
+                    )
+                    .await
+                } else {
+                    aigent_llm::RouterDecision::Tools // disabled → always full agent
                 };
 
-                // When external_thinking is active, use the JSON-intercepting
-                // loop that parses the model's structured JSON output, emits
-                // clean AgentThought events, executes tool calls internally,
-                // and streams only the final_answer text to the user.
-                // Otherwise, use the native structured tool calling loop.
-                let loop_result = if rt_clone.config.agent.external_thinking {
-                    aigent_thinker::run_external_thinking_loop(
+                // ── Dispatch based on router decision ────────────────────────
+                let loop_result = if router_decision == aigent_llm::RouterDecision::Chat {
+                    // Fast path: small model handles this turn directly.
+                    let rp = if rt_clone.config.router.provider.to_lowercase() == "openrouter" {
+                        aigent_llm::Provider::OpenRouter
+                    } else {
+                        aigent_llm::Provider::Ollama
+                    };
+                    let rm = if rp == aigent_llm::Provider::OpenRouter {
+                        &rt_clone.config.router.openrouter_model
+                    } else {
+                        &rt_clone.config.router.ollama_model
+                    };
+                    let chat_timeout = std::time::Duration::from_secs(
+                        rt_clone.config.router.chat_timeout_seconds,
+                    );
+                    match aigent_thinker::run_simple_chat(
                         &rt_clone.llm,
-                        primary,
-                        &rt_clone.config.llm.ollama_model,
-                        &rt_clone.config.llm.openrouter_model,
-                        &mut messages,
-                        &registry,
-                        &executor,
+                        rp,
+                        rm,
+                        &messages,
                         chunk_tx,
-                        Some(&event_sink),
-                        step_timeout,
-                    ).await
+                        chat_timeout,
+                    )
+                    .await
+                    {
+                        Ok(content) => Ok(aigent_thinker::ToolLoopResult {
+                            provider: rp,
+                            content,
+                            tool_executions: vec![],
+                        }),
+                        Err(e) => Err(e),
+                    }
                 } else {
-                    aigent_thinker::run_tool_loop(
-                        &rt_clone.llm,
-                        primary,
-                        &rt_clone.config.llm.ollama_model,
-                        &rt_clone.config.llm.openrouter_model,
-                        &mut messages,
-                        tools_json.as_ref(),
-                        &registry,
-                        &executor,
-                        chunk_tx,
-                        Some(&event_sink),
-                        step_timeout,
-                    ).await
+                    // Full thinker path: tool loop with primary model.
+                    let step_timeout = std::time::Duration::from_secs(
+                        rt_clone.config.agent.step_timeout_seconds,
+                    );
+                    // Bridge thinker events into the runtime BackendEvent system.
+                    let event_tx_clone = event_tx.clone();
+                    let event_sink = move |evt: aigent_thinker::ThinkerEvent| {
+                        use aigent_thinker::ThinkerEvent;
+                        let backend_evt = match evt {
+                            ThinkerEvent::ToolCallStart(info) => crate::BackendEvent::ToolCallStart(info),
+                            ThinkerEvent::ToolCallEnd(result) => crate::BackendEvent::ToolCallEnd(result),
+                            ThinkerEvent::AgentThought(thought) => crate::BackendEvent::AgentThought(thought),
+                        };
+                        let _ = event_tx_clone.send(backend_evt);
+                    };
+
+                    // When external_thinking is active, use the JSON-intercepting
+                    // loop that parses the model's structured JSON output, emits
+                    // clean AgentThought events, executes tool calls internally,
+                    // and streams only the final_answer text to the user.
+                    // Otherwise, use the native structured tool calling loop.
+                    if rt_clone.config.agent.external_thinking {
+                        aigent_thinker::run_external_thinking_loop(
+                            &rt_clone.llm,
+                            primary,
+                            &rt_clone.config.llm.ollama_model,
+                            &rt_clone.config.llm.openrouter_model,
+                            &mut messages,
+                            &registry,
+                            &executor,
+                            chunk_tx,
+                            Some(&event_sink),
+                            step_timeout,
+                        ).await
+                    } else {
+                        aigent_thinker::run_tool_loop(
+                            &rt_clone.llm,
+                            primary,
+                            &rt_clone.config.llm.ollama_model,
+                            &rt_clone.config.llm.openrouter_model,
+                            &mut messages,
+                            tools_json.as_ref(),
+                            &registry,
+                            &executor,
+                            chunk_tx,
+                            Some(&event_sink),
+                            step_timeout,
+                        ).await
+                    }
                 };
 
                 let reply_result: Result<String, anyhow::Error> = match loop_result {
@@ -255,10 +318,19 @@ pub(super) async fn handle_connection(
                         }
                         // Record assistant reply
                         if !result.content.is_empty() {
+                            let model_tag = if router_decision == aigent_llm::RouterDecision::Chat {
+                                format!("router:{}", if rt_clone.config.router.provider.to_lowercase() == "openrouter" {
+                                    &rt_clone.config.router.openrouter_model
+                                } else {
+                                    &rt_clone.config.router.ollama_model
+                                })
+                            } else {
+                                rt_clone.config.active_model().to_string()
+                            };
                             let _: Result<_, _> = memory.record(
                                 aigent_memory::MemoryTier::Episodic,
                                 aigent_prompt::truncate_for_prompt(&result.content, 1024),
-                                format!("assistant-reply:model={}", rt_clone.config.active_model()),
+                                format!("assistant-reply:model={}", model_tag),
                             ).await;
                         }
                         Ok(result.content.clone())
@@ -267,10 +339,12 @@ pub(super) async fn handle_connection(
                 };
 
                 // Reflect on the exchange — skip when using external thinking
-                // mode because the extra LLM call adds 30-60s of latency on
-                // large local models, causing the spinner to hang long after
-                // the answer is displayed.
-                let reflect_events: Vec<BackendEvent> = if rt_clone.config.agent.external_thinking {
+                // mode or the router CHAT fast-path because the extra LLM call
+                // adds 30-60s of latency on large local models, causing the
+                // spinner to hang long after the answer is displayed.
+                let skip_reflection = rt_clone.config.agent.external_thinking
+                    || router_decision == aigent_llm::RouterDecision::Chat;
+                let reflect_events: Vec<BackendEvent> = if skip_reflection {
                     vec![]
                 } else {
                     match reply_result {

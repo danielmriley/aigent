@@ -22,12 +22,14 @@ pub mod events;
 pub mod ext_loop;
 pub mod json_stream;
 pub mod prompt;
+pub mod router;
 pub mod tool_loop;
 
 pub use events::{ThinkerEvent, ToolCallInfo, ToolResult};
 pub use ext_loop::run_external_thinking_loop;
 pub use json_stream::{AgentStep, JsonStreamBuffer};
 pub use prompt::build_external_thinking_block;
+pub use router::{route_query, run_simple_chat};
 pub use tool_loop::{
     EventSink, ToolExecution, ToolLoopResult, build_tools_json,
     execute_tool_calls_public, run_tool_loop,
