@@ -58,6 +58,18 @@ proactive_cooldown_minutes = 5
 # Beliefs are sorted by composite score (confidence × recency × valence) before truncation.
 # 0 = unlimited (use with care on long-running agents).
 max_beliefs_in_prompt = 5
+# Maximum relational matrix entries per bucket (USER, MY_BELIEFS, OUR_DYNAMIC).
+# Entries are deduplicated by content and sorted most-recent-first.
+# Without this cap, long-running agents can accumulate thousands of
+# UserProfile/Reflective entries, inflating the prompt to 300K+ chars.
+# 0 = unlimited (NOT recommended in production).
+max_relational_in_prompt = 20
+# Hard ceiling on the total system prompt in characters.
+# When exceeded, the builder truncates the largest expandable sections
+# (relational → conversation → memory context) until the prompt fits.
+# ~48K chars ≈ 12K tokens, leaving room for the model’s response in a
+# 32K context window.  Set to 0 to disable the guard.
+max_prompt_chars = 48000
 
 [safety]
 approval_required = true
@@ -214,6 +226,17 @@ candle_device = "cpu"
 # TOOLS before dispatching.  CHAT messages are answered directly by the
 # router model, bypassing the full thinker loop for lightning-fast replies.
 # Disable (the default) to always use the primary model.
+#
+# VRAM NOTE: By default the router reuses the primary model for both
+# classification and chat responses.  This avoids VRAM model-swapping on
+# single-GPU setups (each swap costs ~10-15 s).  The speed benefit comes
+# from skipping the tool loop, external-thinking JSON parsing, and the
+# reflection step — not from using a smaller model.
+#
+# If you have a multi-GPU rig or enough VRAM to keep two models loaded
+# concurrently (set OLLAMA_MAX_LOADED_MODELS=2), you can set ollama_model
+# to a small model like "qwen3.5:0.8b" for even faster classification and
+# responses.
 [router]
 enabled = false
 
@@ -221,9 +244,11 @@ enabled = false
 provider = "ollama"
 
 # Model to use for classification and fast-path chat.
-# Pick something very small and fast (0.5B–3B) for best results.
-ollama_model = "qwen3.5:0.8b"
-openrouter_model = "meta-llama/llama-3.2-1b-instruct"
+# When empty (the default), the router reuses the primary model from [llm]
+# — zero VRAM overhead.  Set to a specific model only if your GPU can
+# keep both loaded simultaneously.
+ollama_model = ""
+openrouter_model = ""
 
 # Timeout for the classification call (seconds).  Falls back to TOOLS on timeout.
 classify_timeout_seconds = 8
@@ -232,3 +257,25 @@ chat_timeout_seconds = 45
 
 # Classification system prompt.  Uncomment to override the built-in default.
 # classify_system_prompt = "..."
+
+# ── Debug and observability ──────────────────────────────────────────────────
+# Runtime debugging settings.  All options default to production-safe values.
+# Change them here or at runtime via hot-reload without recompiling.
+[debug]
+# Master log level for the tracing subscriber.
+# Accepted values: "error", "warn", "info", "debug", "trace".
+# RUST_LOG env var always takes precedence if set.
+log_level = "info"
+
+# Write a copy of log output to .aigent/runtime/debug.log.
+# The file is truncated on each daemon restart.
+log_to_file = true
+
+# Log full details for each router classify call: the system prompt sent,
+# the raw model response, and per-phase timing.  Useful when diagnosing
+# why the router picks TOOLS vs CHAT.
+verbose_routing = false
+
+# Log per-turn timing breakdowns: prompt build, router classify, LLM
+# response, memory writes, reflection, and total wall-clock time.
+timing = true

@@ -134,6 +134,18 @@ pub struct MemoryConfig {
     /// Beliefs are sorted by composite score (confidence × recency × valence) before truncation.
     /// `0` means unlimited (not recommended for long-running agents).
     pub max_beliefs_in_prompt: usize,
+    /// Maximum number of entries **per bucket** (USER, MY_BELIEFS, OUR_DYNAMIC)
+    /// in the relational matrix injected into the prompt.
+    /// Items are deduplicated by content and sorted most-recent-first before
+    /// the cap is applied.  `0` means unlimited (dangerous for production).
+    /// Default: `20`.
+    pub max_relational_in_prompt: usize,
+    /// Hard ceiling on the total system prompt size in characters.
+    /// When the assembled prompt exceeds this limit, the builder truncates the
+    /// longest expandable section (relational → conversation → memory context)
+    /// until the prompt fits.  `0` disables the guard.
+    /// Default: `48000` (~12K tokens — leaves room for the model's response).
+    pub max_prompt_chars: usize,
     /// Minimum gap in minutes between proactive messages actually sent.
     /// Prevents rapid-fire messages when the agent becomes very active.
     /// Only checked after a message has been sent; a first message is never blocked.
@@ -159,6 +171,8 @@ impl Default for MemoryConfig {
             proactive_dnd_start_hour: 22,
             proactive_dnd_end_hour: 8,
             max_beliefs_in_prompt: 5,
+            max_relational_in_prompt: 20,
+            max_prompt_chars: 48_000,
             proactive_cooldown_minutes: 5,
         }
     }
@@ -511,9 +525,20 @@ impl Default for InferenceConfig {
 
 // ── Small-model router ───────────────────────────────────────────────────────
 
-/// Optional small-model router that classifies incoming messages as either
-/// simple conversation (handled by a fast, tiny model) or tool-requiring
+/// Optional router that classifies incoming messages as either
+/// simple conversation (handled directly, no tool loop) or tool-requiring
 /// queries (dispatched to the full thinker loop with the primary model).
+///
+/// By default the router uses the **primary model** for both classification
+/// and chat responses.  This avoids VRAM model-swapping on single-GPU
+/// setups (which can add 10-15 s of latency per swap).  The speed benefit
+/// comes from skipping the tool loop, external-thinking JSON parsing, and
+/// the reflection step — not from using a smaller model.
+///
+/// If you have a multi-GPU rig or enough VRAM to keep two models loaded
+/// concurrently (set `OLLAMA_MAX_LOADED_MODELS=2`), you can set
+/// `ollama_model` to a small model like `"qwen3.5:0.8b"` for even faster
+/// classification and responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RouterConfig {
@@ -522,13 +547,18 @@ pub struct RouterConfig {
     pub enabled: bool,
 
     /// Which provider the router model lives on: `"ollama"` or `"openrouter"`.
+    /// Only used when `ollama_model` or `openrouter_model` is non-empty.
     pub provider: String,
 
     /// Model name when provider = `"ollama"`.
-    /// Should be a very small, fast model (0.5B–3B).
+    /// When empty (the default), the router reuses the primary model from
+    /// `[llm]` — no VRAM model-swap overhead.
+    /// Set to a specific model (e.g. `"qwen3.5:0.8b"`) only if your GPU
+    /// can keep both models loaded simultaneously.
     pub ollama_model: String,
 
     /// Model name when provider = `"openrouter"`.
+    /// When empty, the primary OpenRouter model is used.
     pub openrouter_model: String,
 
     /// Timeout in seconds for the classification call.
@@ -551,8 +581,8 @@ impl Default for RouterConfig {
         Self {
             enabled: false,
             provider: "ollama".to_string(),
-            ollama_model: "qwen3.5:0.8b".to_string(),
-            openrouter_model: "meta-llama/llama-3.2-1b-instruct".to_string(),
+            ollama_model: String::new(),       // empty → use primary model
+            openrouter_model: String::new(),   // empty → use primary model
             classify_timeout_seconds: 8,
             chat_timeout_seconds: 45,
             classify_system_prompt: default_classify_system_prompt(),
@@ -569,18 +599,67 @@ fn default_classify_system_prompt() -> String {
      - Searching the web or fetching URLs\n\
      - Calendar events, reminders, or scheduling\n\
      - Email drafting or sending\n\
-     - Memory recall of specific past facts or events\n\
+     - Recalling or searching memories of past conversations\n\
      - Multi-step reasoning requiring more than one operation\n\
      - Any other tool use\n\
      \n\
-     Reply with ONLY the word \"CHAT\" if the message is a conversational exchange, \
-     greeting, opinion question, request for advice, creative writing, or anything \
-     that can be answered from general knowledge without tool use.\n\
+     Reply with ONLY the word \"CHAT\" if the message is:\n\
+     - A conversational exchange or greeting\n\
+     - A question about the current date, time, day of the week, or similar\n\
+     - An opinion question, request for advice, or creative writing\n\
+     - Anything that can be answered from general knowledge or existing context \
+       without tool use\n\
      \n\
      If unsure, reply TOOLS. Better to use the full thinker than miss something important.\n\
      \n\
      Reply with ONLY one word: TOOLS or CHAT."
         .to_string()
+}
+
+// ── Debug / observability ────────────────────────────────────────────────────
+
+/// Runtime debug and observability settings exposed in `[debug]`.
+///
+/// All options default to sensible production values (minimal overhead).
+/// Change them in `config/default.toml` or at runtime without recompiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebugConfig {
+    /// Master log level for the tracing subscriber.
+    /// Accepted values: `"error"`, `"warn"`, `"info"`, `"debug"`, `"trace"`.
+    /// This takes effect **after** config is loaded — overriding the
+    /// bootstrap `RUST_LOG` if one was set.
+    /// Default: `"info"`.
+    pub log_level: String,
+
+    /// Write a copy of log output to `.aigent/runtime/debug.log` (rotated
+    /// per daemon restart).  Useful for post-hoc inspection without needing
+    /// `RUST_LOG` or a terminal attached.
+    /// Default: `true`.
+    pub log_to_file: bool,
+
+    /// When `true`, emit detailed `info!` logs for the router's
+    /// classification call: the full classify prompt, the raw model
+    /// response, and per-phase timing (load / prompt-eval / generation).
+    /// Default: `false`.
+    pub verbose_routing: bool,
+
+    /// When `true`, emit per-turn timing breakdowns as `info!` logs:
+    /// prompt build time, router classify time, LLM response time,
+    /// memory write time, and total wall-clock time.
+    /// Default: `true`.
+    pub timing: bool,
+}
+
+impl Default for DebugConfig {
+    fn default() -> Self {
+        Self {
+            log_level: "info".to_string(),
+            log_to_file: true,
+            verbose_routing: false,
+            timing: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -599,6 +678,7 @@ pub struct AppConfig {
     pub git: GitConfig,
     pub inference: InferenceConfig,
     pub router: RouterConfig,
+    pub debug: DebugConfig,
 }
 
 /// Default config file path, overridable via `AIGENT_CONFIG` env var.
@@ -988,6 +1068,7 @@ allow_system_read = false
         assert_eq!(mem.forget_episodic_after_days, 0); // disabled
         assert!((mem.forget_min_confidence - 0.3).abs() < f32::EPSILON);
         assert_eq!(mem.max_beliefs_in_prompt, 5);
+        assert_eq!(mem.max_relational_in_prompt, 20);
         assert_eq!(mem.proactive_cooldown_minutes, 5);
     }
 

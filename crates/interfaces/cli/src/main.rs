@@ -13,8 +13,10 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
-use aigent_config::AppConfig;
+use aigent_config::{AppConfig, DebugConfig};
 use aigent_exec::sandbox;
 use aigent_runtime::DaemonClient;
 use aigent_runtime::history as chat_history;
@@ -176,14 +178,54 @@ async fn fetch_available_models() -> aigent_ui::onboard::AvailableModels {
     aigent_ui::onboard::AvailableModels { ollama, openrouter }
 }
 
+/// Initialise the tracing subscriber using the `[debug]` config section.
+///
+/// - `RUST_LOG` env var, if set, **always** takes precedence.
+/// - Otherwise, `debug.log_level` from config is used.
+/// - When `debug.log_to_file` is `true`, an additional file layer writes to
+///   `.aigent/runtime/debug.log` (truncated on each startup).
+fn init_tracing(debug: &DebugConfig) {
+    // Honour RUST_LOG if explicitly set; otherwise use config level.
+    let filter = if std::env::var("RUST_LOG").is_ok() {
+        EnvFilter::from_default_env()
+    } else {
+        EnvFilter::new(&debug.log_level)
+    };
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_thread_ids(false);
+
+    if debug.log_to_file {
+        let log_dir = Path::new(".aigent").join("runtime");
+        let _ = fs::create_dir_all(&log_dir);
+        let log_file = fs::File::create(log_dir.join("debug.log"))
+            .expect("failed to create debug.log");
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(log_file));
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .with(file_layer)
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt_layer)
+            .init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
 
     let mut config = AppConfig::load_from(AppConfig::config_path())?;
+    init_tracing(&config.debug);
+
     let config_exists = Path::new(&AppConfig::config_path()).exists();
     let memory_log_path = Path::new(".aigent").join("memory").join("events.jsonl");
 

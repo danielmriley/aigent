@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 
 aigent-config = { path = "../config" }

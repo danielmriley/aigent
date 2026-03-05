@@ -154,7 +154,7 @@ impl AgentRuntime {
 
         // Build the high-density relational matrix block when available.
         let relational_block = memory
-            .relational_state_block()
+            .relational_state_block(self.config.memory.max_relational_in_prompt)
             .map(|block| format!("\n\nRELATIONAL MATRIX:\n{block}"))
             .unwrap_or_default();
 
