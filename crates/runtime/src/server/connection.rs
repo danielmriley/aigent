@@ -16,6 +16,40 @@ use crate::{BackendEvent, ClientCommand, ConversationTurn, ServerEvent};
 
 use super::{DaemonState, is_in_window, safe_truncate};
 
+// ── Trivial query classifier ─────────────────────────────────────────────────
+//
+// Returns `true` for short social greetings / pleasantries that need no tool
+// calling, no structured reasoning, and no heavy JSON thinker prompt.  When
+// `external_thinking` is enabled these messages would otherwise go through the
+// full ReAct loop (pronoun resolution, capabilities rule, error-recovery rules)
+// causing long prefill times and potential timeouts on large local models.
+//
+// The heuristic is conservative: the message must be short (≤ 12 words) AND
+// match a known social pattern.  Anything longer or more specific falls through
+// to the full thinker.
+
+fn is_trivial_query(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    let word_count = lower.split_whitespace().count();
+    if word_count > 12 {
+        return false;
+    }
+    const TRIVIAL_PATTERNS: &[&str] = &[
+        "hello", "hi ", "hi!", "hey ", "good morning", "good evening",
+        "good afternoon", "good night", "how are you", "what's up",
+        "howdy", "greetings", "thanks", "thank you", "bye", "goodbye",
+        "see you", "take care", "cheers",
+    ];
+    // Very short tokens ("hi", "yo", "sup", "hey") are only matched as
+    // the entire trimmed message to avoid false positives inside longer
+    // words (e.g. "tryout" contains "yo", "support" contains "sup").
+    let trimmed = lower.trim();
+    if matches!(trimmed, "hi" | "yo" | "sup" | "hey") {
+        return true;
+    }
+    TRIVIAL_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 pub(super) async fn handle_connection(
     stream: UnixStream,
     state: Arc<Mutex<DaemonState>>,
@@ -130,18 +164,43 @@ pub(super) async fn handle_connection(
                 let user_name = memory.user_name_from_core();
                 let relational_block = memory.relational_state_block();
 
-                // When external_thinking is active, the text-based JSON thinker
-                // needs the full tool list in the prompt (it doesn't use native
-                // tool calling).  Otherwise, tools go via the native API schema.
+                // ── Fast-path decision ───────────────────────────────────
+                //
+                // Determine early whether this is a trivial social query so
+                // we can build a lighter prompt (no JSON agent block, no tool
+                // specs) and later skip the thinker entirely.
+                let use_fast_path =
+                    rt_clone.config.agent.external_thinking && is_trivial_query(&user);
+
+                // When external_thinking is active AND the query is non-trivial,
+                // the text-based JSON thinker needs the full tool list in the
+                // prompt.  For the fast-path (trivial query) or non-external mode,
+                // tools go via the native API schema or are omitted entirely.
                 let tool_specs_for_prompt: &[aigent_tools::ToolSpec] =
-                    if rt_clone.config.agent.external_thinking {
+                    if rt_clone.config.agent.external_thinking && !use_fast_path {
                         &tool_specs
                     } else {
                         &[]
                     };
 
+                // For the fast-path, build the prompt as if external_thinking is
+                // off — this drops the heavy JSON Agent Mode block (pronoun
+                // resolution, capabilities rule, error recovery, etc.) and lets
+                // the model respond naturally with its personality prompt.
+                let prompt_config;
+                let config_ref: &AppConfig = if use_fast_path {
+                    prompt_config = {
+                        let mut c = rt_clone.config.clone();
+                        c.agent.external_thinking = false;
+                        c
+                    };
+                    &prompt_config
+                } else {
+                    &rt_clone.config
+                };
+
                 let prompt_inputs = aigent_prompt::PromptInputs {
-                    config: &rt_clone.config,
+                    config: config_ref,
                     user_message: &user,
                     recent_turns: &recent,
                     tool_specs: tool_specs_for_prompt,
@@ -204,12 +263,37 @@ pub(super) async fn handle_connection(
                     let _ = event_tx_clone.send(backend_evt);
                 };
 
-                // When external_thinking is active, use the JSON-intercepting
-                // loop that parses the model's structured JSON output, emits
-                // clean AgentThought events, executes tool calls internally,
-                // and streams only the final_answer text to the user.
-                // Otherwise, use the native structured tool calling loop.
-                let loop_result = if rt_clone.config.agent.external_thinking {
+                // ── Fast-path for trivial social queries ─────────────────
+                //
+                // When external_thinking is active, trivial greetings would
+                // go through the full ReAct JSON thinker, which includes a
+                // heavy system prompt (pronoun resolution, capabilities rule,
+                // error recovery, etc.) that can cause 60s+ prefill timeouts
+                // on large local models.  For short social messages, bypass
+                // the thinker entirely and call the LLM directly with the
+                // personality-rich system prompt but no JSON-mode constraints.
+                // The result feeds into the same reply_result handling below.
+                let loop_result = if use_fast_path {
+                    tracing::debug!(
+                        user = %user,
+                        "fast-path: trivial query detected, skipping external thinker"
+                    );
+                    let response = rt_clone.llm.chat_messages_stream(
+                        primary,
+                        &rt_clone.config.llm.ollama_model,
+                        &rt_clone.config.llm.openrouter_model,
+                        &messages,
+                        None,   // no tool schemas — direct response
+                        chunk_tx,
+                        false,  // no json_mode
+                        false,  // no disable_native_thinking
+                    ).await?;
+                    Ok(aigent_thinker::ToolLoopResult {
+                        provider: response.provider,
+                        content: response.content,
+                        tool_executions: vec![],
+                    })
+                } else if rt_clone.config.agent.external_thinking {
                     aigent_thinker::run_external_thinking_loop(
                         &rt_clone.llm,
                         primary,
@@ -845,4 +929,54 @@ fn reload_dynamic_skills(
     );
     info!("{}", msg);
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trivial_greetings_detected() {
+        assert!(is_trivial_query("Hello!"));
+        assert!(is_trivial_query("Hi!"));
+        assert!(is_trivial_query("hi"));
+        assert!(is_trivial_query("Hey there"));
+        assert!(is_trivial_query("Good morning!"));
+        assert!(is_trivial_query("Good evening, how are you?"));
+        assert!(is_trivial_query("How are you today?"));
+        assert!(is_trivial_query("Thanks!"));
+        assert!(is_trivial_query("Thank you so much"));
+        assert!(is_trivial_query("Bye!"));
+        assert!(is_trivial_query("Hello! How are you this evening?"));
+    }
+
+    #[test]
+    fn complex_queries_not_trivial() {
+        assert!(!is_trivial_query("What is the weather in Berlin?"));
+        assert!(!is_trivial_query("Read the file tryout.md and summarize it"));
+        assert!(!is_trivial_query("Search the web for Rust async patterns"));
+        assert!(!is_trivial_query(
+            "Hello can you help me write a long essay about the history of computing and its impact on modern society"
+        ));
+        // >12 words even though it contains "hello"
+        assert!(!is_trivial_query(
+            "Hello I need you to search the web for information about recent developments in quantum computing research"
+        ));
+    }
+
+    #[test]
+    fn edge_cases() {
+        assert!(!is_trivial_query(""));
+        assert!(!is_trivial_query("   "));
+        assert!(is_trivial_query("  hi  "));
+        assert!(is_trivial_query("HELLO"));
+        assert!(is_trivial_query("How Are You?"));
+        // Bare short tokens must match
+        assert!(is_trivial_query("yo"));
+        assert!(is_trivial_query("sup"));
+        assert!(is_trivial_query("hey"));
+        // But NOT inside longer words
+        assert!(!is_trivial_query("tryout something"));
+        assert!(!is_trivial_query("support ticket please"));
+    }
 }
