@@ -208,3 +208,27 @@ candle_repeat_penalty = 1.1
 
 # Compute device:  "cpu", "cuda" (NVIDIA), or "metal" (Apple Silicon).
 candle_device = "cpu"
+
+# ── Small-model router ──────────────────────────────────────────────────────
+# When enabled, a tiny model (0.5B–3B) classifies each message as CHAT or
+# TOOLS before dispatching.  CHAT messages are answered directly by the
+# router model, bypassing the full thinker loop for lightning-fast replies.
+# Disable (the default) to always use the primary model.
+[router]
+enabled = false
+
+# Which provider the router model lives on: "ollama" or "openrouter".
+provider = "ollama"
+
+# Model to use for classification and fast-path chat.
+# Pick something very small and fast (0.5B–3B) for best results.
+ollama_model = "qwen3.5:0.8b"
+openrouter_model = "meta-llama/llama-3.2-1b-instruct"
+
+# Timeout for the classification call (seconds).  Falls back to TOOLS on timeout.
+classify_timeout_seconds = 8
+# Timeout for the router model's chat response (seconds).
+chat_timeout_seconds = 45
+
+# Classification system prompt.  Uncomment to override the built-in default.
+# classify_system_prompt = "..."

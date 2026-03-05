@@ -152,22 +152,28 @@ pub async fn run_external_thinking_loop(
         let step = match jsb.take_parsed() {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
-                warn!(round, error = %e, "failed to parse agent step, treating as final answer");
-                // Fallback: strip obvious JSON wrapper and send as-is.
-                // Guard against blank/whitespace-only results that would
-                // render as an empty response in the TUI.
-                let stripped = strip_json_wrapper(&full_text);
-                let fallback = if stripped.trim().is_empty() {
-                    "I encountered an internal formatting error while thinking.".to_string()
-                } else {
-                    stripped
-                };
-                let _ = user_token_tx.send(fallback.clone()).await;
-                return Ok(ToolLoopResult {
-                    provider: final_provider,
-                    content: fallback,
-                    tool_executions: all_executions,
-                });
+                warn!(round, error = %e, "failed to parse agent step, will retry");
+
+                if let Some(sink) = event_sink {
+                    sink(ThinkerEvent::AgentThought(format!(
+                        "I produced malformed JSON and will retry: {e}"
+                    )));
+                }
+
+                // Feed the malformed output back as the assistant message
+                // so the model sees what it produced, then give it a clear
+                // correction prompt — same pattern as the hallucinated-tool
+                // and missing-params guards.
+                messages.push(ChatMessage::assistant(&full_text));
+                messages.push(ChatMessage::user(&format!(
+                    "ERROR: Your response was not valid structured JSON. Parse error: {e}\n\n\
+                     You MUST respond with EXACTLY ONE JSON object in one of these forms:\n\
+                     {{\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<text>\"}}\n\
+                     {{\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{{\"name\":\"<TOOL>\",\"args\":{{...}}}}}}\n\n\
+                     No prose outside JSON."
+                )));
+
+                continue;
             }
             None => {
                 // No complete JSON object — the model produced plain text
@@ -398,21 +404,4 @@ pub async fn run_external_thinking_loop(
         content: fallback,
         tool_executions: all_executions,
     })
-}
-
-/// Best-effort extraction of readable text from a malformed JSON response.
-///
-/// If the model produced valid JSON with a `final_answer` or `thought`
-/// field but the step-type was unrecognised, pull those out.  Otherwise
-/// return the input unchanged.
-fn strip_json_wrapper(raw: &str) -> String {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw.trim()) {
-        if let Some(ans) = val.get("final_answer").and_then(|v| v.as_str()) {
-            return ans.to_string();
-        }
-        if let Some(thought) = val.get("thought").and_then(|v| v.as_str()) {
-            return thought.to_string();
-        }
-    }
-    raw.to_string()
 }

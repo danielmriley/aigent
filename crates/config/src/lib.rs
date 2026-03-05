@@ -509,6 +509,80 @@ impl Default for InferenceConfig {
     }
 }
 
+// ── Small-model router ───────────────────────────────────────────────────────
+
+/// Optional small-model router that classifies incoming messages as either
+/// simple conversation (handled by a fast, tiny model) or tool-requiring
+/// queries (dispatched to the full thinker loop with the primary model).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RouterConfig {
+    /// When `false`, the router is disabled and the primary model handles
+    /// every turn.  Default: `false`.
+    pub enabled: bool,
+
+    /// Which provider the router model lives on: `"ollama"` or `"openrouter"`.
+    pub provider: String,
+
+    /// Model name when provider = `"ollama"`.
+    /// Should be a very small, fast model (0.5B–3B).
+    pub ollama_model: String,
+
+    /// Model name when provider = `"openrouter"`.
+    pub openrouter_model: String,
+
+    /// Timeout in seconds for the classification call.
+    /// If the router call exceeds this, falls back to `TOOLS` (safe default).
+    pub classify_timeout_seconds: u64,
+
+    /// Timeout in seconds for the router model's chat response when the
+    /// decision is `CHAT`.  Should be shorter than the primary model's
+    /// `step_timeout_seconds`.
+    pub chat_timeout_seconds: u64,
+
+    /// The system prompt shown to the router model when classifying.
+    /// Fully user-customisable.  When empty, the built-in default is used.
+    #[serde(default = "default_classify_system_prompt")]
+    pub classify_system_prompt: String,
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: "ollama".to_string(),
+            ollama_model: "qwen3.5:0.8b".to_string(),
+            openrouter_model: "meta-llama/llama-3.2-1b-instruct".to_string(),
+            classify_timeout_seconds: 8,
+            chat_timeout_seconds: 45,
+            classify_system_prompt: default_classify_system_prompt(),
+        }
+    }
+}
+
+fn default_classify_system_prompt() -> String {
+    "You are a routing assistant. Classify the user's message into exactly one category.\n\
+     \n\
+     Reply with ONLY the word \"TOOLS\" if the message requires any of:\n\
+     - Accessing files, directories, or the filesystem\n\
+     - Running code, shell commands, or scripts\n\
+     - Searching the web or fetching URLs\n\
+     - Calendar events, reminders, or scheduling\n\
+     - Email drafting or sending\n\
+     - Memory recall of specific past facts or events\n\
+     - Multi-step reasoning requiring more than one operation\n\
+     - Any other tool use\n\
+     \n\
+     Reply with ONLY the word \"CHAT\" if the message is a conversational exchange, \
+     greeting, opinion question, request for advice, creative writing, or anything \
+     that can be answered from general knowledge without tool use.\n\
+     \n\
+     If unsure, reply TOOLS. Better to use the full thinker than miss something important.\n\
+     \n\
+     Reply with ONLY one word: TOOLS or CHAT."
+        .to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
@@ -524,6 +598,7 @@ pub struct AppConfig {
     pub ui: UiConfig,
     pub git: GitConfig,
     pub inference: InferenceConfig,
+    pub router: RouterConfig,
 }
 
 /// Default config file path, overridable via `AIGENT_CONFIG` env var.

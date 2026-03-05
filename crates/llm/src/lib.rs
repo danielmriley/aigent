@@ -155,6 +155,17 @@ pub enum Provider {
     OpenRouter,
 }
 
+// ── Router decision ──────────────────────────────────────────────────────────
+
+/// Classification result from the small-model router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterDecision {
+    /// Simple conversational reply — use router model directly.
+    Chat,
+    /// Requires tools, files, or multi-step reasoning — use full thinker.
+    Tools,
+}
+
 // ── LlmClient trait & ModelProvider ──────────────────────────────────────────
 
 /// Which backend actually executes an inference request.

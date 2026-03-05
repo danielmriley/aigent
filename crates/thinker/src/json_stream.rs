@@ -154,6 +154,21 @@ impl JsonStreamBuffer {
 }
 
 /// Parse a complete JSON string into an [`AgentStep`].
+///
+/// The canonical schema is:
+/// ```json
+/// {"type":"tool_call","thought":"...","tool_call":{"name":"...","args":{...}}}
+/// {"type":"final_answer","thought":"...","final_answer":"..."}
+/// ```
+///
+/// However, models frequently produce off-schema variants.  This parser
+/// handles the following common deviations:
+///
+/// 1. Missing `"type"` field — inferred from which keys are present.
+/// 2. Flat tool call: `{"tool_call":"read_file","path":"x"}` — `"tool_call"`
+///    value is the tool name, remaining keys (minus `"thought"`) are args.
+/// 3. `"tool_call"` is a string with a separate `"args"` object.
+/// 4. `"name"` at top level instead of nested under `"tool_call"`.
 fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
     let val: Value = serde_json::from_str(raw)
         .map_err(|e| format!("invalid JSON: {e}"))?;
@@ -172,6 +187,7 @@ fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
         .unwrap_or("")
         .to_string();
 
+    // ── Canonical "type" field present ────────────────────────────────────
     match step_type {
         "final_answer" => {
             let answer = obj
@@ -179,15 +195,48 @@ fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Ok(AgentStep::FinalAnswer { thought, answer })
+            return Ok(AgentStep::FinalAnswer { thought, answer });
         }
         "tool_call" => {
-            let tc = obj
-                .get("tool_call")
-                .ok_or_else(|| "tool_call field missing".to_string())?;
-            let tc_obj = tc
-                .as_object()
-                .ok_or_else(|| "tool_call is not an object".to_string())?;
+            if let Some(tc) = obj.get("tool_call") {
+                if let Some(tc_obj) = tc.as_object() {
+                    // Canonical nested object form.
+                    let tool_name = tc_obj
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let args = tc_obj
+                        .get("args")
+                        .and_then(|v| v.as_object())
+                        .cloned()
+                        .unwrap_or_default();
+                    return Ok(AgentStep::ToolCall { thought, tool_name, args });
+                }
+            }
+            // "type":"tool_call" present but "tool_call" key is missing or
+            // not an object — fall through to heuristic recovery below.
+        }
+        "" => {
+            // No "type" field — fall through to heuristic.
+        }
+        _ => {
+            // Unknown "type" value — fall through to heuristic.
+        }
+    }
+
+    // ── Heuristic recovery for off-schema responses ──────────────────────
+
+    // Case A: "final_answer" key present (regardless of "type").
+    if let Some(answer_val) = obj.get("final_answer") {
+        let answer = answer_val.as_str().unwrap_or("").to_string();
+        return Ok(AgentStep::FinalAnswer { thought, answer });
+    }
+
+    // Case B: "tool_call" key is a nested object (canonical structure, just
+    // missing "type").
+    if let Some(tc) = obj.get("tool_call") {
+        if let Some(tc_obj) = tc.as_object() {
             let tool_name = tc_obj
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -198,14 +247,50 @@ fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
                 .and_then(|v| v.as_object())
                 .cloned()
                 .unwrap_or_default();
-            Ok(AgentStep::ToolCall {
-                thought,
-                tool_name,
-                args,
-            })
+            return Ok(AgentStep::ToolCall { thought, tool_name, args });
         }
-        other => Err(format!("unknown step type: {other:?}")),
+
+        // Case C: "tool_call" is a string (the tool name).
+        // Args are either in a separate "args" key or flattened at the top level.
+        if let Some(name) = tc.as_str() {
+            let args = if let Some(args_obj) = obj.get("args").and_then(|v| v.as_object()) {
+                // Separate "args" object.
+                args_obj.clone()
+            } else {
+                // Flat form: every key except "tool_call", "thought", "type", "name"
+                // is treated as an arg.
+                let skip = ["tool_call", "thought", "type", "name"];
+                obj.iter()
+                    .filter(|(k, _)| !skip.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
+            return Ok(AgentStep::ToolCall {
+                thought,
+                tool_name: name.to_string(),
+                args,
+            });
+        }
     }
+
+    // Case D: Top-level "name" key (no "tool_call" wrapper at all).
+    //         e.g. {"name":"read_file","args":{"path":"x"}}
+    if let Some(name_val) = obj.get("name") {
+        if let Some(name) = name_val.as_str() {
+            let args = obj
+                .get("args")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            return Ok(AgentStep::ToolCall {
+                thought,
+                tool_name: name.to_string(),
+                args,
+            });
+        }
+    }
+
+    Err(format!("unrecognised agent step structure: {raw}"))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -321,6 +406,84 @@ mod tests {
         match step {
             AgentStep::FinalAnswer { answer, .. } => assert_eq!(answer, "ok"),
             _ => panic!("expected FinalAnswer"),
+        }
+    }
+
+    // ── Off-schema recovery tests ────────────────────────────────────────
+
+    #[test]
+    fn flat_tool_call_string_with_flat_args() {
+        // Model outputs: {"tool_call": "read_file", "path": "tryout.md"}
+        let mut buf = JsonStreamBuffer::new();
+        buf.feed(r#"{"tool_call": "read_file", "path": "tryout.md"}"#);
+        let step = buf.take_parsed().expect("should parse").unwrap();
+        match step {
+            AgentStep::ToolCall { tool_name, args, .. } => {
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(args["path"], "tryout.md");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn tool_call_string_with_separate_args() {
+        // Model outputs: {"tool_call": "web_search", "args": {"query": "rust"}}
+        let mut buf = JsonStreamBuffer::new();
+        buf.feed(r#"{"tool_call": "web_search", "args": {"query": "rust"}}"#);
+        let step = buf.take_parsed().expect("should parse").unwrap();
+        match step {
+            AgentStep::ToolCall { tool_name, args, .. } => {
+                assert_eq!(tool_name, "web_search");
+                assert_eq!(args["query"], "rust");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn missing_type_with_final_answer_key() {
+        // No "type" field, but "final_answer" present.
+        let mut buf = JsonStreamBuffer::new();
+        buf.feed(r#"{"thought": "easy", "final_answer": "Hello there!"}"#);
+        let step = buf.take_parsed().expect("should parse").unwrap();
+        match step {
+            AgentStep::FinalAnswer { thought, answer } => {
+                assert_eq!(thought, "easy");
+                assert_eq!(answer, "Hello there!");
+            }
+            _ => panic!("expected FinalAnswer"),
+        }
+    }
+
+    #[test]
+    fn missing_type_with_tool_call_object() {
+        // No "type" field, but canonical "tool_call" object present.
+        let mut buf = JsonStreamBuffer::new();
+        buf.feed(r#"{"thought": "need to read", "tool_call": {"name": "read_file", "args": {"path": "/tmp/x"}}}"#);
+        let step = buf.take_parsed().expect("should parse").unwrap();
+        match step {
+            AgentStep::ToolCall { thought, tool_name, args } => {
+                assert_eq!(thought, "need to read");
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(args["path"], "/tmp/x");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn top_level_name_and_args() {
+        // Model outputs: {"name": "run_shell", "args": {"command": "ls"}}
+        let mut buf = JsonStreamBuffer::new();
+        buf.feed(r#"{"name": "run_shell", "args": {"command": "ls"}}"#);
+        let step = buf.take_parsed().expect("should parse").unwrap();
+        match step {
+            AgentStep::ToolCall { tool_name, args, .. } => {
+                assert_eq!(tool_name, "run_shell");
+                assert_eq!(args["command"], "ls");
+            }
+            _ => panic!("expected ToolCall"),
         }
     }
 }
