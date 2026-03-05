@@ -216,15 +216,20 @@ fn build_environment_block(
 
 fn build_conversation_block(recent_turns: &[ConversationTurn]) -> String {
     let start = recent_turns.len().saturating_sub(6);
-    let formatted = recent_turns[start..]
+    let window = &recent_turns[start..];
+    let window_len = window.len();
+    let formatted = window
         .iter()
         .enumerate()
         .map(|(index, turn)| {
+            // Give the most recent 2 turns a larger truncation limit so
+            // the model has full context for follow-up / pronoun resolution.
+            let limit = if index >= window_len.saturating_sub(2) { 8192 } else { 4096 };
             format!(
                 "Turn {}\nUser: {}\nAssistant: {}",
                 index + 1,
-                truncate_for_prompt(&turn.user, 4096),
-                truncate_for_prompt(&turn.assistant, 4096),
+                truncate_for_prompt(&turn.user, limit),
+                truncate_for_prompt(&turn.assistant, limit),
             )
         })
         .collect::<Vec<_>>()
@@ -233,7 +238,11 @@ fn build_conversation_block(recent_turns: &[ConversationTurn]) -> String {
     if formatted.is_empty() {
         "(none yet)".to_string()
     } else {
-        formatted
+        format!(
+            "[The last 2-3 turns are your PRIMARY context for understanding the user's current intent. \
+             Resolve all pronouns and implicit references from these turns.]\n\n\
+             {formatted}"
+        )
     }
 }
 

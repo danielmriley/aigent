@@ -213,29 +213,77 @@ pub async fn run_external_thinking_loop(
                 // registry, we feed it an error message and let it self-correct
                 // on the next round (e.g. switch to web_search).  We do NOT
                 // force a final_answer — the model may recover productively.
-                if tool_registry.get(&tool_name).is_none() {
-                    warn!(round, tool = %tool_name, "model hallucinated non-existent tool");
+                let tool_handle = match tool_registry.get(&tool_name) {
+                    Some(t) => t,
+                    None => {
+                        warn!(round, tool = %tool_name, "model hallucinated non-existent tool");
 
-                    if let Some(sink) = event_sink {
-                        sink(ThinkerEvent::AgentThought(
-                            format!("I tried to use a tool that doesn't exist: {tool_name}"),
-                        ));
+                        if let Some(sink) = event_sink {
+                            sink(ThinkerEvent::AgentThought(
+                                format!("I tried to use a tool that doesn't exist: {tool_name}"),
+                            ));
+                        }
+
+                        // Record the assistant's attempt in conversation history.
+                        messages.push(ChatMessage::assistant(&full_text));
+
+                        // Feed a clear error so the model knows to pick a real tool.
+                        let error_obs = format!(
+                            "ERROR: Tool '{tool_name}' does not exist. \
+                             Available tools are listed in the system prompt. \
+                             Use only those tools (e.g. web_search, browse_page, run_shell). \
+                             Respond with EXACTLY ONE JSON object."
+                        );
+                        messages.push(ChatMessage::user(&error_obs));
+
+                        // Continue to next round — let the model self-correct.
+                        continue;
                     }
+                };
 
-                    // Record the assistant's attempt in conversation history.
-                    messages.push(ChatMessage::assistant(&full_text));
+                // ── Required-parameter validation ───────────────────────
+                //
+                // Check that all required params are present in the args map.
+                // Missing required args cause runtime failures that the model
+                // often cannot recover from (the tool executor errors out with
+                // a cryptic message).  By catching this early, we feed a clear
+                // error that lets the model self-correct on the next round.
+                {
+                    let spec = tool_handle.spec();
+                    let missing: Vec<&str> = spec.params.iter()
+                        .filter(|p| p.required && !args.contains_key(&p.name))
+                        .map(|p| p.name.as_str())
+                        .collect();
 
-                    // Feed a clear error so the model knows to pick a real tool.
-                    let error_obs = format!(
-                        "ERROR: Tool '{tool_name}' does not exist. \
-                         Available tools are listed in the system prompt. \
-                         Use only those tools (e.g. web_search, browse_page, run_shell). \
-                         Respond with EXACTLY ONE JSON object."
-                    );
-                    messages.push(ChatMessage::user(&error_obs));
+                    if !missing.is_empty() {
+                        warn!(round, tool = %tool_name, ?missing,
+                              "model omitted required tool parameters");
 
-                    // Continue to next round — let the model self-correct.
-                    continue;
+                        if let Some(sink) = event_sink {
+                            sink(ThinkerEvent::AgentThought(format!(
+                                "Tool '{tool_name}' called without required args: {}",
+                                missing.join(", "),
+                            )));
+                        }
+
+                        messages.push(ChatMessage::assistant(&full_text));
+
+                        let params_help: Vec<String> = spec.params.iter()
+                            .filter(|p| p.required)
+                            .map(|p| format!("\"{}\" ({})", p.name, p.description))
+                            .collect();
+                        let error_obs = format!(
+                            "ERROR: Tool '{tool_name}' is missing required parameter(s): {missing}. \
+                             Required params for {tool_name}: {params_help}. \
+                             Re-call the tool with ALL required parameters populated. \
+                             Respond with EXACTLY ONE JSON object.",
+                            missing = missing.join(", "),
+                            params_help = params_help.join(", "),
+                        );
+                        messages.push(ChatMessage::user(&error_obs));
+
+                        continue;
+                    }
                 }
 
                 // Emit ToolCallStart event for UI.

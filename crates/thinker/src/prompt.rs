@@ -55,7 +55,12 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          Always stay focused on the CURRENT user question and the most recent conversation turns. \
          Recent messages take absolute priority over older background memories. \
          If the user says 'try again' or continues a topic, DO NOT switch to unrelated background memories. \
-         Only change the topic if the user explicitly requests a new topic.\n\n",
+         Only change the topic if the user explicitly requests a new topic.\n\
+         PRONOUN RESOLUTION: When the user says 'it', 'that', 'this', 'the file', or refers \
+         to something implicitly, resolve the reference from the most recent 2-3 conversation \
+         turns. For example, if the previous turns discussed a file called 'tryout.md', and the \
+         user asks 'What does it say?', 'it' refers to 'tryout.md'. NEVER answer with generic \
+         information when a specific referent can be found in recent context.\n\n",
     );
 
     // ── Temporal grounding rule ─────────────────────────────────────────
@@ -99,6 +104,21 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          (e.g. web_search, browse_page, run_shell) to accomplish the task instead.\n\n",
     );
 
+    // ── Capabilities awareness / list_skills directive ───────────────
+    //
+    // When the model has access to list_skills, it should call it rather
+    // than guessing or giving a vague answer about its capabilities.
+    if tool_specs.iter().any(|s| s.name == "list_skills") {
+        buf.push_str(
+            "CAPABILITIES RULE:\n\
+             When the user asks about your capabilities, what you can do, your tools, \
+             or your skills, you MUST call the `list_skills` tool to get an accurate, \
+             up-to-date list. NEVER guess or give a vague summary from memory — the \
+             skill registry is dynamic and may have changed. Call list_skills first, \
+             then summarize the results in your final_answer.\n\n",
+        );
+    }
+
     // ── Retry-limit / termination rule ────────────────────────────────
     buf.push_str(
         "RETRY LIMIT RULE:\n\
@@ -123,6 +143,10 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
            {\"type\":\"final_answer\",\"thought\":\"<1-sentence reasoning>\",\"final_answer\":\"<complete helpful answer>\"}\n\
          - If you need another tool, output:\n\
            {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
+         This applies ESPECIALLY after tool ERRORS or failures. If a tool call fails, \
+         you MUST still respond with JSON — either retry with corrected args (tool_call) \
+         or give a final_answer explaining the failure. NEVER output prose, apologies, \
+         or planning text outside JSON after an error.\n\
          NEVER output prose, planning, or explanations outside JSON.\n\
          NEVER say \"I need to\" or \"Let me check\" outside the JSON thought field.\n\
          Your ENTIRE response must be a single valid JSON object.\n\n",
@@ -218,5 +242,44 @@ mod tests {
         assert!(block.contains("IMMEDIATE ACTION RULE"));
         assert!(block.contains("NEVER output a `final_answer` just to announce"));
         assert!(block.contains("output the `tool_call` JSON IMMEDIATELY"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_pronoun_resolution() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("PRONOUN RESOLUTION"));
+        assert!(block.contains("'it', 'that', 'this'"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_error_recovery_reinforcement() {
+        let block = build_external_thinking_block(&[]);
+        assert!(block.contains("ESPECIALLY after tool ERRORS"));
+        assert!(block.contains("NEVER output prose, apologies"));
+    }
+
+    #[test]
+    fn external_thinking_block_has_list_skills_rule_when_present() {
+        let specs = vec![aigent_tools::ToolSpec {
+            name: "list_skills".to_string(),
+            description: "List available skills".to_string(),
+            params: vec![],
+            metadata: aigent_tools::ToolMetadata::default(),
+        }];
+        let block = build_external_thinking_block(&specs);
+        assert!(block.contains("CAPABILITIES RULE"));
+        assert!(block.contains("list_skills"));
+    }
+
+    #[test]
+    fn external_thinking_block_no_list_skills_rule_when_absent() {
+        let specs = vec![aigent_tools::ToolSpec {
+            name: "web_search".to_string(),
+            description: "Search the web".to_string(),
+            params: vec![],
+            metadata: aigent_tools::ToolMetadata::default(),
+        }];
+        let block = build_external_thinking_block(&specs);
+        assert!(!block.contains("CAPABILITIES RULE"));
     }
 }
