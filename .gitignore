@@ -37,3 +37,4 @@ restore_*.py
 test_tui
 test_tui.rs
 test_ui.rs
+prompts/
