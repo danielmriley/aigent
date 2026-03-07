@@ -258,15 +258,26 @@ impl MemoryManager {
             Some(f) => f(content.clone()).await,
             None => None,
         };
+        let valence = crate::sentiment::infer_valence(&content);
+        let created_at = Utc::now();
+        let provenance_hash = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(content.as_bytes());
+            h.update(tier.slug().as_bytes());
+            h.update(source.as_bytes());
+            h.update(created_at.to_rfc3339().as_bytes());
+            format!("{:x}", h.finalize())
+        };
         let entry = MemoryEntry {
             id: Uuid::new_v4(),
             tier,
             content,
             source,
             confidence: confidence_override.map(|c| c.clamp(0.0, 1.0)).unwrap_or(0.7),
-            valence: 0.0,
-            created_at: Utc::now(),
-            provenance_hash: "local-dev-placeholder".to_string(),
+            valence,
+            created_at,
+            provenance_hash,
             tags,
             embedding,
         };
@@ -432,6 +443,26 @@ impl MemoryManager {
         self.sync_vault_projection()
     }
 
+    /// Remove a set of entry IDs from the secondary index (if attached).
+    fn index_remove_ids(&mut self, ids: &HashSet<Uuid>) {
+        if let Some(idx) = &mut self.index {
+            for id in ids {
+                if let Err(e) = idx.remove(id) {
+                    warn!(error = ?e, %id, "index remove failed — index may be stale");
+                }
+            }
+        }
+    }
+
+    /// Clear the secondary index entirely (e.g. after wipe_all).
+    fn index_clear(&mut self) {
+        if let Some(idx) = &mut self.index {
+            if let Err(e) = idx.clear() {
+                warn!(error = ?e, "index clear failed — index may be stale");
+            }
+        }
+    }
+
     // ── Embedding ──────────────────────────────────────────────────────────
 
     /// Return a clone of the embedding function Arc so callers can invoke it
@@ -453,7 +484,15 @@ impl MemoryManager {
         category: &str,
     ) -> Result<MemoryEntry> {
         let source = format!("userprofile:{category}:{key}");
-        self.store.retain(|e| e.source != source);
+        // Collect IDs being removed so we can purge the index.
+        let remove_ids: HashSet<Uuid> = self
+            .store
+            .all()
+            .iter()
+            .filter(|e| e.source == source)
+            .map(|e| e.id)
+            .collect();
+        // Persist to disk first.
         if let Some(event_log) = &self.event_log {
             let events = event_log.load().await?;
             let kept = events
@@ -462,6 +501,8 @@ impl MemoryManager {
                 .collect::<Vec<_>>();
             event_log.overwrite(&kept).await?;
         }
+        self.store.retain(|e| e.source != source);
+        self.index_remove_ids(&remove_ids);
         self.record_inner(MemoryTier::UserProfile, value.to_string(), source).await
     }
 
@@ -484,7 +525,7 @@ impl MemoryManager {
             return Ok(());
         }
         let id_set: HashSet<Uuid> = ids.iter().copied().collect();
-        self.store.retain(|e| !id_set.contains(&e.id));
+        // Persist to disk first.
         if let Some(event_log) = &self.event_log {
             let events = event_log.load().await?;
             let kept = events
@@ -493,6 +534,8 @@ impl MemoryManager {
                 .collect::<Vec<_>>();
             event_log.overwrite(&kept).await?;
         }
+        self.store.retain(|e| !id_set.contains(&e.id));
+        self.index_remove_ids(&id_set);
         Ok(())
     }
 
@@ -562,6 +605,7 @@ fn strip_tag_prefix_lower(s: &str, prefixes: &[&str]) -> String {
 async fn retire_core_by_prefix(
     store: &mut MemoryStore,
     event_log: &Option<MemoryEventLog>,
+    index: &mut Option<MemoryIndex>,
     prefixes: &[&str],
 ) -> Result<()> {
     let ids: Vec<Uuid> = store
@@ -577,7 +621,7 @@ async fn retire_core_by_prefix(
         return Ok(());
     }
     let id_set: HashSet<Uuid> = ids.iter().copied().collect();
-    store.retain(|e| !id_set.contains(&e.id));
+    // Persist to disk first.
     if let Some(log) = event_log {
         let kept = log
             .load().await?
@@ -585,6 +629,14 @@ async fn retire_core_by_prefix(
             .filter(|ev| !id_set.contains(&ev.entry.id))
             .collect::<Vec<_>>();
         log.overwrite(&kept).await?;
+    }
+    store.retain(|e| !id_set.contains(&e.id));
+    if let Some(idx) = index {
+        for id in &id_set {
+            if let Err(e) = idx.remove(id) {
+                warn!(error = ?e, %id, "index remove failed — index may be stale");
+            }
+        }
     }
     Ok(())
 }

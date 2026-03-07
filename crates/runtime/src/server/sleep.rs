@@ -396,30 +396,32 @@ pub(super) fn spawn_proactive_task(
    concise message. If your work was routine maintenance with nothing \n\
    urgent, respond with an empty string to return to sleep silently.";
 
-            // ── Snapshot: clone runtime + memory + tools (lock released fast) ──
-            let (rt_clone, mut memory, recent, tool_specs, registry, executor) = {
+            // ── Snapshot-merge: extract prompt data under lock, release lock ──
+            // The canonical MemoryManager stays in DaemonState so background
+            // tasks never see an empty shell.
+            let (rt_clone, recent, tool_specs, registry, executor,
+                 context, stats, identity_block, beliefs_block, user_name, relational_block) = {
                 let mut s = state.lock().await;
                 let rt = s.runtime.clone();
                 let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
-                let mem = std::mem::take(&mut s.memory);
                 let specs = s.tool_registry.list_specs();
                 let reg = Arc::clone(&s.tool_registry);
                 let exe = Arc::clone(&s.tool_executor);
-                (rt, mem, recent, specs, reg, exe)
+
+                // Build prompt data from live memory under the lock.
+                let context = s.memory.context_for_prompt_ranked_with_embed("proactive background check", 8, None);
+                let stats = s.memory.stats();
+                let identity_block = s.memory.cached_identity_block().to_string();
+                let beliefs_block = s.memory.cached_beliefs_block(rt.config.memory.max_beliefs_in_prompt).to_string();
+                let user_name = s.memory.user_name_from_core();
+                let relational_block = s.memory.relational_state_block(
+                    rt.config.memory.max_relational_in_prompt,
+                );
+
+                (rt, recent, specs, reg, exe,
+                 context, stats, identity_block, beliefs_block, user_name, relational_block)
             };
             // Lock released — user turns proceed normally.
-
-            // Build system prompt with full context (identity, beliefs, tools, memories).
-            let context = memory.context_for_prompt_ranked_with_embed("proactive background check", 8, None);
-            let stats = memory.stats();
-
-            // Pre-compute memory blocks for the prompt builder (pure function).
-            let identity_block = memory.cached_identity_block().to_string();
-            let beliefs_block = memory.cached_beliefs_block(rt_clone.config.memory.max_beliefs_in_prompt).to_string();
-            let user_name = memory.user_name_from_core();
-            let relational_block = memory.relational_state_block(
-                rt_clone.config.memory.max_relational_in_prompt,
-            );
 
             let prompt_inputs = aigent_prompt::PromptInputs {
                 config: &rt_clone.config,
@@ -477,7 +479,6 @@ pub(super) fn spawn_proactive_task(
             // ── Apply phase: re-acquire lock, record results ──
             {
                 let mut s = state.lock().await;
-                s.memory = memory;
                 let _ = s.memory.flush_all();
 
                 match loop_result {

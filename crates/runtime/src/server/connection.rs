@@ -100,43 +100,55 @@ pub(super) async fn handle_connection(
                 // ═══════════════════════════════════════════════════════════════
                 // NEW PATH: Native structured tool calling via chat messages API
                 // ═══════════════════════════════════════════════════════════════
-                let (rt_clone, mut memory, recent, _last_turn_at, tool_specs, registry, executor, conv_summary) = {
+                //
+                // Snapshot-merge pattern: do all memory prep under the state
+                // lock, extract owned values, release the lock, then run the
+                // LLM call without holding any lock.  The canonical
+                // MemoryManager stays in DaemonState the entire time so
+                // background tasks never see an empty shell.
+                let (rt_clone, recent, tool_specs, registry, executor, conv_summary,
+                     timing, verbose_routing,
+                     context, stats, identity_block, beliefs_block, user_name, relational_block,
+                     memory_prep_elapsed) = {
                     let mut s = state.lock().await;
                     let rt = s.runtime.clone();
+
+                    // Record user input while we hold the lock.
+                    let _: Result<_, _> = s.memory.record(aigent_memory::MemoryTier::Episodic, user.clone(), "user-input").await;
+
+                    let t = rt.config.debug.timing;
+                    let vr = rt.config.debug.verbose_routing;
+                    let phase_start = std::time::Instant::now();
+
+                    // Build the system prompt using the existing prompt builder.
+                    let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = s.memory.embed_fn_arc() {
+                        embed_fn(user.to_string()).await
+                    } else {
+                        None
+                    };
+                    let context = s.memory.context_for_prompt_ranked_with_embed(&user, 10, query_embedding);
+                    let stats = s.memory.stats();
+
+                    // Pre-compute memory blocks for the prompt builder (pure function).
+                    let identity_block = s.memory.cached_identity_block().to_string();
+                    let beliefs_block = s.memory.cached_beliefs_block(rt.config.memory.max_beliefs_in_prompt).to_string();
+                    let user_name = s.memory.user_name_from_core();
+                    let relational_block = s.memory.relational_state_block(
+                        rt.config.memory.max_relational_in_prompt,
+                    );
+                    let mpe = phase_start.elapsed();
+
                     let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
-                    let lta = s.last_turn_at;
-                    let mem = std::mem::take(&mut s.memory);
                     let specs = s.tool_registry.list_specs();
                     let reg = Arc::clone(&s.tool_registry);
                     let exe = Arc::clone(&s.tool_executor);
                     let csumm = s.conversation_summary.clone();
-                    (rt, mem, recent, lta, specs, reg, exe, csumm)
+                    (rt, recent, specs, reg, exe, csumm,
+                     t, vr,
+                     context, stats, identity_block, beliefs_block, user_name, relational_block,
+                     mpe)
                 };
-
-                // Persist the user turn and do memory work before calling the LLM.
-                let _: Result<_, _> = memory.record(aigent_memory::MemoryTier::Episodic, user.clone(), "user-input").await;
-
-                let timing = rt_clone.config.debug.timing;
-                let verbose_routing = rt_clone.config.debug.verbose_routing;
-                let phase_start = std::time::Instant::now();
-
-                // Build the system prompt using the existing prompt builder.
-                let query_embedding: Option<Vec<f32>> = if let Some(embed_fn) = memory.embed_fn_arc() {
-                    embed_fn(user.to_string()).await
-                } else {
-                    None
-                };
-                let context = memory.context_for_prompt_ranked_with_embed(&user, 10, query_embedding);
-                let stats = memory.stats();
-
-                // Pre-compute memory blocks for the prompt builder (pure function).
-                let identity_block = memory.cached_identity_block().to_string();
-                let beliefs_block = memory.cached_beliefs_block(rt_clone.config.memory.max_beliefs_in_prompt).to_string();
-                let user_name = memory.user_name_from_core();
-                let relational_block = memory.relational_state_block(
-                    rt_clone.config.memory.max_relational_in_prompt,
-                );
-                let memory_prep_elapsed = phase_start.elapsed();
+                // Lock released — memory stays in DaemonState, accessible to background tasks.
 
                 // When external_thinking is active, the text-based JSON thinker
                 // needs the full tool list in the prompt (it doesn't use native
@@ -247,6 +259,59 @@ pub(super) async fn handle_connection(
                 }
                 messages.push(aigent_llm::ChatMessage::user(&user));
 
+                // ── Parallel subagent reasoning ──────────────────────────────
+                // When enabled and the router chose the full TOOLS path, run
+                // specialist subagents (Researcher, Planner, Critic) in
+                // parallel.  Their debate is injected as a system-level
+                // context block so the Captain (main agent) can leverage
+                // multi-perspective reasoning.
+                if rt_clone.config.subagents.enabled
+                    && router_decision != aigent_llm::RouterDecision::Chat
+                {
+                    let subagent_start = std::time::Instant::now();
+                    let manager = aigent_agent::subagents::SubagentManager::new(
+                        &rt_clone.llm,
+                        &rt_clone.config.subagents,
+                        &rt_clone.config.llm.ollama_model,
+                        &rt_clone.config.llm.openrouter_model,
+                    );
+                    let team_results = manager
+                        .run_parallel_team(primary, &user, &system_prompt)
+                        .await;
+
+                    let debate_block =
+                        aigent_agent::subagents::SubagentManager::format_debate_block(
+                            &team_results,
+                        );
+
+                    if !debate_block.is_empty() {
+                        // Insert after the system prompt but before the user
+                        // message so the Captain sees the debate as context.
+                        let insert_pos = messages.len().saturating_sub(1);
+                        messages.insert(
+                            insert_pos,
+                            aigent_llm::ChatMessage::system(&format!(
+                                "SUBAGENT ANALYSIS (use these specialist perspectives to inform your response):\n{debate_block}"
+                            )),
+                        );
+                        info!(
+                            specialists = team_results.len(),
+                            elapsed_ms = subagent_start.elapsed().as_millis() as u64,
+                            "subagents: debate block injected into context"
+                        );
+                    } else {
+                        warn!("subagents: all specialists failed — proceeding without debate");
+                    }
+
+                    if timing {
+                        info!(
+                            "[TIMING] subagents={}ms specialists={}",
+                            subagent_start.elapsed().as_millis(),
+                            team_results.len()
+                        );
+                    }
+                }
+
                 let llm_start = std::time::Instant::now();
                 let loop_result = if router_decision == aigent_llm::RouterDecision::Chat {
                     // Fast path: skip tool loop, external thinking, and
@@ -348,80 +413,65 @@ pub(super) async fn handle_connection(
                     info!("[TIMING] llm_path={} llm_response={}ms", path, llm_elapsed.as_millis());
                 }
 
-                let memory_start = std::time::Instant::now();
-                let reply_result: Result<String, anyhow::Error> = match loop_result {
-                    Ok(ref result) => {
-                        // Record tool results to procedural memory
-                        for exec in &result.tool_executions {
-                            let outcome = format!(
-                                "Tool '{}' executed. Output (first 400 chars): {}",
-                                exec.tool_name,
-                                safe_truncate(&exec.output, 400),
-                            );
-                            let _: Result<_, _> = memory.record(
-                                MemoryTier::Procedural,
-                                outcome,
-                                format!("tool-use:{}", exec.tool_name),
-                            ).await;
-                        }
-                        // Record assistant reply
-                        if !result.content.is_empty() {
-                            let model_tag = if router_decision == aigent_llm::RouterDecision::Chat {
-                                format!("router:{}", router_model)
-                            } else {
-                                rt_clone.config.active_model().to_string()
-                            };
-                            let _: Result<_, _> = memory.record(
-                                aigent_memory::MemoryTier::Episodic,
-                                aigent_prompt::truncate_for_prompt(&result.content, 1024),
-                                format!("assistant-reply:model={}", model_tag),
-                            ).await;
-                        }
-                        Ok(result.content.clone())
-                    }
-                    Err(e) => Err(e),
-                };
-
-                // Reflect on the exchange — skip when using external thinking
-                // mode or the router CHAT fast-path because the extra LLM call
-                // adds 30-60s of latency on large local models, causing the
-                // spinner to hang long after the answer is displayed.
-                let skip_reflection = rt_clone.config.agent.external_thinking
-                    || router_decision == aigent_llm::RouterDecision::Chat;
-                let reflect_events: Vec<BackendEvent> = if skip_reflection {
-                    vec![]
-                } else {
-                    match reply_result {
-                        Ok(ref reply) => rt_clone
-                            .inline_reflect(&mut memory, &user, reply)
-                            .await
-                            .unwrap_or_default(),
-                        Err(_) => vec![],
-                    }
-                };
-
-                let memory_elapsed = memory_start.elapsed();
-                if timing {
-                    let total = turn_start.elapsed();
-                    info!(
-                        "[TIMING] turn_total={}ms mem_prep={}ms router={}ms build={}ms llm={}ms memory+reflect={}ms path={} model={}",
-                        total.as_millis(),
-                        memory_prep_elapsed.as_millis(),
-                        router_elapsed.as_millis(),
-                        build_elapsed.as_millis(),
-                        llm_elapsed.as_millis(),
-                        memory_elapsed.as_millis(),
-                        if router_decision == aigent_llm::RouterDecision::Chat { "CHAT" } else { "TOOLS" },
-                        if router_decision == aigent_llm::RouterDecision::Chat { &router_model } else { rt_clone.config.active_model() },
-                    );
-                }
-
                 let _ = streamer.await;
 
-                // Re-acquire lock to restore state
+                // ── Post-LLM phase: re-acquire lock for memory recording ─────
+                // The canonical MemoryManager was never displaced from state,
+                // so any concurrent writes during the LLM call are preserved.
+                let memory_start = std::time::Instant::now();
+                let skip_reflection = rt_clone.config.agent.external_thinking
+                    || router_decision == aigent_llm::RouterDecision::Chat;
+
                 let outcome: Result<Vec<BackendEvent>, anyhow::Error> = {
                     let mut s = state.lock().await;
-                    s.memory = memory;
+
+                    let reply_result: Result<String, anyhow::Error> = match loop_result {
+                        Ok(ref result) => {
+                            // Record tool results to procedural memory
+                            for exec in &result.tool_executions {
+                                let outcome = format!(
+                                    "Tool '{}' executed. Output (first 400 chars): {}",
+                                    exec.tool_name,
+                                    safe_truncate(&exec.output, 400),
+                                );
+                                let _: Result<_, _> = s.memory.record(
+                                    MemoryTier::Procedural,
+                                    outcome,
+                                    format!("tool-use:{}", exec.tool_name),
+                                ).await;
+                            }
+                            // Record assistant reply
+                            if !result.content.is_empty() {
+                                let model_tag = if router_decision == aigent_llm::RouterDecision::Chat {
+                                    format!("router:{}", router_model)
+                                } else {
+                                    rt_clone.config.active_model().to_string()
+                                };
+                                let _: Result<_, _> = s.memory.record(
+                                    aigent_memory::MemoryTier::Episodic,
+                                    aigent_prompt::truncate_for_prompt(&result.content, 1024),
+                                    format!("assistant-reply:model={}", model_tag),
+                                ).await;
+                            }
+                            Ok(result.content.clone())
+                        }
+                        Err(e) => Err(e),
+                    };
+
+                    // Reflect on the exchange — skip when using external thinking
+                    // mode or the router CHAT fast-path.
+                    let reflect_events: Vec<BackendEvent> = if skip_reflection {
+                        vec![]
+                    } else {
+                        match reply_result {
+                            Ok(ref reply) => rt_clone
+                                .inline_reflect(&mut s.memory, &user, reply)
+                                .await
+                                .unwrap_or_default(),
+                            Err(_) => vec![],
+                        }
+                    };
+
                     let _ = s.memory.flush_all();
 
                     match reply_result {
@@ -508,6 +558,22 @@ pub(super) async fn handle_connection(
                         Err(err) => Err(err),
                     }
                 };
+
+                let memory_elapsed = memory_start.elapsed();
+                if timing {
+                    let total = turn_start.elapsed();
+                    info!(
+                        "[TIMING] turn_total={}ms mem_prep={}ms router={}ms build={}ms llm={}ms memory+reflect={}ms path={} model={}",
+                        total.as_millis(),
+                        memory_prep_elapsed.as_millis(),
+                        router_elapsed.as_millis(),
+                        build_elapsed.as_millis(),
+                        llm_elapsed.as_millis(),
+                        memory_elapsed.as_millis(),
+                        if router_decision == aigent_llm::RouterDecision::Chat { "CHAT" } else { "TOOLS" },
+                        if router_decision == aigent_llm::RouterDecision::Chat { &router_model } else { rt_clone.config.active_model() },
+                    );
+                }
 
                 let mut writer = writer.lock().await;
                 match outcome {
