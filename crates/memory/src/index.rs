@@ -173,7 +173,8 @@ impl MemoryIndex {
     }
 
     /// Insert (or upsert) a single entry into the index and update the LRU
-    /// cache.
+    /// cache.  Deduplicates by ID: if the entry already exists in a tier
+    /// list, the old reference is removed before inserting the new one.
     pub fn insert(&mut self, entry: &MemoryEntry) -> Result<()> {
         let id_str = entry.id.to_string();
         let indexed = IndexedEntry::from_entry(entry);
@@ -184,24 +185,92 @@ impl MemoryIndex {
             let mut tbl = tx.open_table(ENTRIES_TABLE)?;
             tbl.insert(id_str.as_str(), bytes.as_slice())?;
 
-            // Update tier index: append id to the tier's newline-separated list.
+            // Update tier index: append id to the tier's newline-separated list,
+            // but first strip any existing occurrence to avoid duplicates.
             let slug = entry.tier.slug();
             let mut tier_tbl = tx.open_table(TIER_TABLE)?;
             let existing = tier_tbl
                 .get(slug)?
                 .map(|v| v.value().to_string())
                 .unwrap_or_default();
-            let updated = if existing.is_empty() {
-                id_str.clone()
+            let deduped: Vec<&str> = existing
+                .lines()
+                .filter(|line| !line.is_empty() && *line != id_str)
+                .collect();
+            let mut updated = deduped.join("\n");
+            if updated.is_empty() {
+                updated = id_str.clone();
             } else {
-                format!("{existing}\n{id_str}")
-            };
+                updated = format!("{updated}\n{id_str}");
+            }
             tier_tbl.insert(slug, updated.as_str())?;
         }
         tx.commit()?;
 
         // Warm the LRU cache (embedding excluded — stays in RAM)
         self.cache.put(id_str, entry.clone());
+        Ok(())
+    }
+
+    /// Remove a single entry by UUID from the entries table, all tier lists,
+    /// and the LRU cache.
+    pub fn remove(&mut self, id: &Uuid) -> Result<()> {
+        let id_str = id.to_string();
+        let tx = self.db.begin_write()?;
+        {
+            let mut tbl = tx.open_table(ENTRIES_TABLE)?;
+            tbl.remove(id_str.as_str())?;
+
+            // Remove from all tier lists (we don't know which tier it belonged
+            // to after deletion, so scan all slugs).
+            let mut tier_tbl = tx.open_table(TIER_TABLE)?;
+            let slugs: Vec<String> = tier_tbl
+                .iter()?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for slug in &slugs {
+                let list_opt = tier_tbl
+                    .get(slug.as_str())?
+                    .map(|g| g.value().to_string());
+                if let Some(list) = list_opt {
+                    let filtered: Vec<&str> = list
+                        .lines()
+                        .filter(|line| !line.is_empty() && *line != id_str)
+                        .collect();
+                    tier_tbl.insert(slug.as_str(), filtered.join("\n").as_str())?;
+                }
+            }
+        }
+        tx.commit()?;
+        self.cache.pop(&id_str);
+        Ok(())
+    }
+
+    /// Remove all entries from the index, clearing both tables and the cache.
+    pub fn clear(&mut self) -> Result<()> {
+        let tx = self.db.begin_write()?;
+        {
+            let mut entries_tbl = tx.open_table(ENTRIES_TABLE)?;
+            let keys: Vec<String> = entries_tbl
+                .iter()?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for k in &keys {
+                entries_tbl.remove(k.as_str())?;
+            }
+        }
+        {
+            let mut tier_tbl = tx.open_table(TIER_TABLE)?;
+            let keys: Vec<String> = tier_tbl
+                .iter()?
+                .filter_map(|r| r.ok().map(|(k, _)| k.value().to_string()))
+                .collect();
+            for k in &keys {
+                tier_tbl.remove(k.as_str())?;
+            }
+        }
+        tx.commit()?;
+        self.cache.clear();
         Ok(())
     }
 

@@ -10,6 +10,7 @@ mod error;
 mod events;
 pub mod micro_profile;
 mod runtime;
+pub mod subagents;
 
 // ── Error types ───────────────────────────────────────────────────────────────
 

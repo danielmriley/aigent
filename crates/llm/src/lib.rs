@@ -454,6 +454,38 @@ impl LlmRouter {
         }
     }
 
+    /// Like [`chat_with_fallback`] but caps the response length.
+    ///
+    /// On Ollama this sets `num_predict`; on OpenRouter this is a no-op
+    /// (the prompt itself should constrain output length).
+    pub async fn chat_with_fallback_limited(
+        &self,
+        primary: Provider,
+        ollama_model: &str,
+        openrouter_model: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<(Provider, String)> {
+        let should_force_fallback = prompt.to_lowercase().contains("/fallback");
+
+        match primary {
+            Provider::Ollama if !should_force_fallback => Ok((
+                Provider::Ollama,
+                self.ollama
+                    .chat_model_limited(ollama_model, prompt, max_tokens)
+                    .await?,
+            )),
+            Provider::Ollama => Ok((
+                Provider::OpenRouter,
+                self.openrouter.chat_model(openrouter_model, prompt).await?,
+            )),
+            Provider::OpenRouter => Ok((
+                Provider::OpenRouter,
+                self.openrouter.chat_model(openrouter_model, prompt).await?,
+            )),
+        }
+    }
+
     pub async fn chat_stream_with_fallback(
         &self,
         primary: Provider,
@@ -696,15 +728,43 @@ impl LlmClient for LlmRouter {
 
 impl OllamaClient {
     async fn chat_model(&self, model: &str, prompt: &str) -> Result<String> {
+        self.chat_model_inner(model, prompt, None, false).await
+    }
+
+    /// Like [`chat_model`] but caps the response at `max_tokens` tokens
+    /// via Ollama's `num_predict` option and suppresses native thinking
+    /// so the output lands in the `response` field.
+    async fn chat_model_limited(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        self.chat_model_inner(model, prompt, Some(max_tokens), true).await
+    }
+
+    async fn chat_model_inner(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: Option<u32>,
+        suppress_thinking: bool,
+    ) -> Result<String> {
         let base_url = std::env::var("OLLAMA_BASE_URL")
             .unwrap_or_else(|_| "http://localhost:11434".to_string());
         let endpoint = format!("{}/api/generate", base_url.trim_end_matches('/'));
 
-        let payload = json!({
+        let mut payload = json!({
             "model": model,
             "prompt": prompt,
             "stream": false
         });
+        if let Some(n) = max_tokens {
+            payload["options"] = json!({ "num_predict": n });
+        }
+        if suppress_thinking || self.suppress_thinking {
+            payload["think"] = json!(false);
+        }
 
         let client = self.client.clone();
         let response = client.post(endpoint).json(&payload).send().await;
@@ -718,7 +778,24 @@ impl OllamaClient {
                 }
 
                 if let Some(content) = body.get("response").and_then(|value| value.as_str()) {
-                    return Ok(content.to_string());
+                    if !content.is_empty() {
+                        return Ok(content.to_string());
+                    }
+                }
+
+                // Thinking-capable models (e.g. qwen3) put reasoning in a
+                // `thinking` field and may leave `response` empty.  This is
+                // a safety-net fallback — normally `think: false` keeps the
+                // output in `response`.
+                if let Some(thinking) = body.get("thinking").and_then(|v| v.as_str()) {
+                    if !thinking.is_empty() {
+                        tracing::warn!(
+                            model,
+                            "Ollama: response empty, falling back to thinking field — \
+                             consider setting think=false for this model"
+                        );
+                        return Ok(thinking.to_string());
+                    }
                 }
 
                 Ok(format!("Ollama response missing text: {body}"))

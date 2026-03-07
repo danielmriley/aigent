@@ -618,6 +618,39 @@ fn default_classify_system_prompt() -> String {
 
 // ── Debug / observability ────────────────────────────────────────────────────
 
+// ── Subagents ─────────────────────────────────────────────────────────────────
+
+/// Configuration for the parallel subagent reasoning system.
+///
+/// When enabled, complex queries are evaluated by multiple specialist agents
+/// (Researcher, Planner, Critic) in parallel via `tokio::join!`, and their
+/// outputs are synthesised by the main "Captain" agent before tool execution.
+///
+/// Requires `OLLAMA_NUM_PARALLEL >= 3` on the Ollama server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubagentsConfig {
+    /// Master switch.  When `false`, the subagent pipeline is skipped entirely.
+    pub enabled: bool,
+    /// Researcher role system prompt.
+    pub researcher_prompt: String,
+    /// Planner role system prompt.
+    pub planner_prompt: String,
+    /// Critic role system prompt.
+    pub critic_prompt: String,
+}
+
+impl Default for SubagentsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            researcher_prompt: "You are a meticulous researcher. Examine the conversation history and memory context deeply. Identify key facts, missing information, and relevant background knowledge that could help answer the user's request. Output your findings as structured analysis.".to_string(),
+            planner_prompt: "You are a strategic planner. Given the conversation and context, devise a clear step-by-step plan for how to best respond to or accomplish the user's request. Consider which tools might be needed and in what order. Output your plan as structured analysis.".to_string(),
+            critic_prompt: "You are a rigorous critic. Examine the conversation for potential pitfalls: hallucination risks, incorrect assumptions, edge cases, security concerns, and logical gaps. Challenge the obvious approach. Output your critique as structured analysis.".to_string(),
+        }
+    }
+}
+
 /// Runtime debug and observability settings exposed in `[debug]`.
 ///
 /// All options default to sensible production values (minimal overhead).
@@ -678,6 +711,7 @@ pub struct AppConfig {
     pub git: GitConfig,
     pub inference: InferenceConfig,
     pub router: RouterConfig,
+    pub subagents: SubagentsConfig,
     pub debug: DebugConfig,
 }
 

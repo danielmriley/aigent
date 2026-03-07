@@ -13,11 +13,15 @@ use super::MemoryManager;
 impl MemoryManager {
     pub async fn wipe_all(&mut self) -> Result<usize> {
         let removed = self.store.len();
-        self.store.clear();
 
+        // Persist to disk first — if this fails, in-memory state is untouched.
         if let Some(event_log) = &self.event_log {
             event_log.overwrite(&[]).await?;
         }
+
+        // Disk write succeeded — now mutate in-memory state.
+        self.store.clear();
+        self.index_clear();
 
         self.sync_vault_projection()?;
 
@@ -29,8 +33,16 @@ impl MemoryManager {
             return Ok(0);
         }
 
-        let removed = self.store.retain(|entry| !tiers.contains(&entry.tier));
+        // Collect IDs to remove before any mutation.
+        let remove_ids: HashSet<Uuid> = self
+            .store
+            .all()
+            .iter()
+            .filter(|entry| tiers.contains(&entry.tier))
+            .map(|e| e.id)
+            .collect();
 
+        // Persist to disk first — if this fails, in-memory state is untouched.
         if let Some(event_log) = &self.event_log {
             let events = event_log.load().await?;
             let kept = events
@@ -39,6 +51,10 @@ impl MemoryManager {
                 .collect::<Vec<_>>();
             event_log.overwrite(&kept).await?;
         }
+
+        // Disk write succeeded — now mutate in-memory state.
+        let removed = self.store.retain(|entry| !tiers.contains(&entry.tier));
+        self.index_remove_ids(&remove_ids);
 
         self.sync_vault_projection()?;
 
@@ -75,9 +91,8 @@ impl MemoryManager {
         }
 
         let id_set: std::collections::HashSet<uuid::Uuid> = forget_ids.iter().copied().collect();
-        self.store.retain(|e| !id_set.contains(&e.id));
 
-        // Purge from event log so forgotten entries don't reappear on restart.
+        // Purge from event log first so forgotten entries don't reappear on restart.
         if let Some(event_log) = &self.event_log {
             let events = event_log.load().await?;
             let kept = events
@@ -86,6 +101,10 @@ impl MemoryManager {
                 .collect::<Vec<_>>();
             event_log.overwrite(&kept).await?;
         }
+
+        // Disk write succeeded — now mutate in-memory state.
+        self.store.retain(|e| !id_set.contains(&e.id));
+        self.index_remove_ids(&id_set);
 
         let removed = forget_ids.len();
         if removed > 0 {
@@ -117,10 +136,9 @@ impl MemoryManager {
         }
 
         let id_set: HashSet<Uuid> = dupe_ids.iter().copied().collect();
-        let removed = self.store.retain(|e| !id_set.contains(&e.id));
 
-        // Purge corresponding event-log entries so duplicates don't reappear
-        // on the next daemon restart.
+        // Purge corresponding event-log entries first so duplicates don't
+        // reappear on the next daemon restart.
         if let Some(event_log) = &self.event_log {
             let events = event_log.load().await?;
             let kept = events
@@ -129,6 +147,10 @@ impl MemoryManager {
                 .collect::<Vec<_>>();
             event_log.overwrite(&kept).await?;
         }
+
+        // Disk write succeeded — now mutate in-memory state.
+        let removed = self.store.retain(|e| !id_set.contains(&e.id));
+        self.index_remove_ids(&id_set);
 
         if removed > 0 {
             info!(removed, "content deduplication: purged duplicate entries");
@@ -154,7 +176,8 @@ impl MemoryManager {
             return Ok(0);
         }
         let id_set: HashSet<Uuid> = to_remove.iter().copied().collect();
-        self.store.retain(|e| !id_set.contains(&e.id));
+
+        // Persist to disk first — if this fails, in-memory state is untouched.
         if let Some(event_log) = &self.event_log {
             let kept = event_log
                 .load().await?
@@ -163,6 +186,10 @@ impl MemoryManager {
                 .collect::<Vec<_>>();
             event_log.overwrite(&kept).await?;
         }
+
+        // Disk write succeeded — now mutate in-memory state.
+        self.store.retain(|e| !id_set.contains(&e.id));
+        self.index_remove_ids(&id_set);
         Ok(to_remove.len())
     }
 

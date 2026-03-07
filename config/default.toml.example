@@ -259,6 +259,20 @@ chat_timeout_seconds = 45
 # classify_system_prompt = "..."
 
 # ── Debug and observability ──────────────────────────────────────────────────
+
+# ── Parallel subagent reasoning ─────────────────────────────────────────────
+# When enabled, complex queries are evaluated by multiple specialist agents
+# (Researcher, Planner, Critic) running in parallel before the main agent
+# responds.  Requires OLLAMA_NUM_PARALLEL >= 3 on the Ollama server.
+[subagents]
+enabled = false
+
+# Specialist system prompts (uncomment to override the built-in defaults).
+# researcher_prompt = "You are a meticulous researcher..."
+# planner_prompt = "You are a strategic planner..."
+# critic_prompt = "You are a rigorous critic..."
+
+# ── Debug and observability ──────────────────────────────────────────────────
 # Runtime debugging settings.  All options default to production-safe values.
 # Change them here or at runtime via hot-reload without recompiling.
 [debug]

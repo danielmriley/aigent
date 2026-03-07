@@ -214,6 +214,7 @@ impl MemoryManager {
             retire_core_by_prefix(
                 &mut self.store,
                 &self.event_log,
+                &mut self.index,
                 &[id_prefix.as_str()],
             ).await?;
         }
@@ -238,7 +239,7 @@ impl MemoryManager {
             if !retire_ids.is_empty() {
                 let id_set: std::collections::HashSet<uuid::Uuid> =
                     retire_ids.iter().copied().collect();
-                let removed = self.store.retain(|e| !id_set.contains(&e.id));
+                // Persist to disk first.
                 if let Some(log) = &self.event_log {
                     let kept = log
                         .load()
@@ -248,6 +249,8 @@ impl MemoryManager {
                         .collect::<Vec<_>>();
                     log.overwrite(&kept).await?;
                 }
+                let removed = self.store.retain(|e| !id_set.contains(&e.id));
+                self.index_remove_ids(&id_set);
                 info!(
                     requested = insights.retire_memory_ids.len(),
                     removed,
@@ -261,6 +264,7 @@ impl MemoryManager {
             retire_core_by_prefix(
                 &mut self.store,
                 &self.event_log,
+                &mut self.index,
                 &[id_prefix.as_str()],
             ).await?;
             let e = self.record_inner_tagged(
@@ -279,6 +283,7 @@ impl MemoryManager {
             retire_core_by_prefix(
                 &mut self.store,
                 &self.event_log,
+                &mut self.index,
                 &prefixes,
             ).await?;
             let e = self.record_inner_tagged(
