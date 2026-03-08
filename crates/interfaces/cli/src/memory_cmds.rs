@@ -216,7 +216,7 @@ pub(crate) async fn run_phase_review_gate(
     let has_sleep_marker = memory
         .all()
         .iter()
-        .any(|entry| entry.source.starts_with("sleep:"));
+        .any(|entry| entry.source_kind().is_sleep());
     if !has_sleep_marker && !memory.all().is_empty() {
         let _ = memory.run_sleep_cycle().await?;
     }
@@ -226,7 +226,7 @@ pub(crate) async fn run_phase_review_gate(
     let promotions = memory
         .all()
         .iter()
-        .filter(|entry| entry.source.starts_with("sleep:"))
+        .filter(|entry| entry.source_kind().is_sleep())
         .count();
     let vault_index = Path::new(".aigent/vault/index.md");
     let telegram_token_present = std::env::var("TELEGRAM_BOT_TOKEN")

@@ -127,6 +127,7 @@ mod tests {
             provenance_hash: "hash".to_string(),
             tags: vec![],
             embedding: None,
+            tokens: Default::default(),
         }
     }
 
@@ -142,6 +143,7 @@ mod tests {
             provenance_hash: "hash".to_string(),
             tags: vec![],
             embedding: None,
+            tokens: Default::default(),
         }
     }
 

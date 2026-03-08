@@ -78,6 +78,7 @@ pub struct AgentTurnInput<'a> {
 pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult> {
     let primary = Provider::from(input.config.llm.provider.as_str());
     let step_timeout = Duration::from_secs(input.config.agent.step_timeout_seconds);
+    let tool_timeout = Duration::from_secs(input.config.agent.tool_timeout_secs);
 
     // ── Optional sub-agent debate ────────────────────────────────────────
     //
@@ -130,7 +131,7 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
             let insert_pos = input.messages.len().saturating_sub(1);
             input.messages.insert(
                 insert_pos,
-                ChatMessage::system(&format!(
+                ChatMessage::system(format!(
                     "SUBAGENT ANALYSIS (use these specialist perspectives \
                      to inform your reasoning):\n{debate_block}"
                 )),
@@ -162,6 +163,7 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
         input.token_tx,
         event_sink_ref,
         step_timeout,
+        tool_timeout,
     )
     .await
 }

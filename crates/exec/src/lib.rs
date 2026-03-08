@@ -37,6 +37,20 @@ pub struct ExecutionPolicy {
     pub tool_denylist: Vec<String>,
     /// Tools that bypass interactive approval regardless of `approval_mode`.
     /// In `Balanced` mode these are automatically added to the read-only set.
+    ///
+    /// # Security surface
+    ///
+    /// Any tool listed here can be invoked without user confirmation, even in
+    /// `Safer` mode.  Keep this list to low-risk, user-visible actions (e.g.
+    /// calendar events, reminders) that have no file-system or network
+    /// side-effects.  Adding `run_shell`, `write_file`, or any network tool
+    /// here would silently grant the agent unrestricted execution power —
+    /// always audit additions against the tool's `SecurityLevel` declaration.
+    ///
+    /// The list is populated from `SafetyConfig.approval_exempt_tools` in the
+    /// TOML config, so operators can extend it per deployment.  Consider
+    /// adding a `block_outbound_in_balanced: bool` config flag (TODO) to
+    /// prevent exempt tools from making outbound HTTP calls in `Balanced` mode.
     pub approval_exempt_tools: Vec<String>,
     /// When `true` the executor calls `git add -A && git commit` after every
     /// successful `write_file` or `run_shell` invocation.
@@ -254,10 +268,8 @@ impl ToolExecutor {
     /// | `Safer`      | Every tool (unless explicitly exempt)                   |
     fn requires_approval(&self, tool_name: &str, metadata: &ToolMetadata) -> bool {
         // Explicit exempt list always short-circuits.
-        if self.policy
-            .approval_exempt_tools
-            .contains(&tool_name.to_string())
-        {
+        // Use iter().any() to avoid the String allocation that .contains() requires.
+        if self.policy.approval_exempt_tools.iter().any(|s| s == tool_name) {
             return false;
         }
 
@@ -310,14 +322,15 @@ impl ToolExecutor {
         }
 
         // Per-tool deny-list (supports `@group` expansion, takes precedence over allow-list).
+        // Use iter().any() to avoid allocating a String just for the contains check.
         let expanded_deny = registry.expand_groups(&self.policy.tool_denylist);
-        if expanded_deny.contains(&tool_name.to_string()) {
+        if expanded_deny.iter().any(|s| s == tool_name) {
             bail!("tool '{}' is blocked by policy (tool_denylist)", tool_name);
         }
         // Per-tool allow-list (supports `@group` expansion, empty = all permitted).
         if !self.policy.tool_allowlist.is_empty() {
             let expanded_allow = registry.expand_groups(&self.policy.tool_allowlist);
-            if !expanded_allow.contains(&tool_name.to_string()) {
+            if !expanded_allow.iter().any(|s| s == tool_name) {
                 bail!("tool '{}' is not in the tool_allowlist", tool_name);
             }
         }
@@ -399,11 +412,12 @@ impl ToolExecutor {
         args: &HashMap<String, String>,
         metadata: &ToolMetadata,
     ) -> Result<bool> {
-        // Approval-exempt tools are auto-approved regardless of policy.
-        if self.policy.approval_exempt_tools.contains(&tool_name.to_string()) {
-            info!(tool = tool_name, "tool is approval-exempt; auto-approving");
-            return Ok(true);
-        }
+        // NOTE: The approval-exempt check is intentionally absent here.
+        // `request_approval` is only ever called from `execute()` when
+        // `requires_approval()` has already returned `true`.  Since exempt
+        // tools cause `requires_approval()` to return `false`, this branch
+        // can never be reached for exempt tools — the duplicate check was
+        // dead code and has been removed to keep the approval path clean.
 
         let Some(tx) = &self.approval_tx else {
             // No approval channel → auto-deny when policy says approval required.
@@ -520,6 +534,9 @@ pub fn default_registry(
     serper_api_key: Option<String>,
     exa_api_key: Option<String>,
     search_providers: Vec<String>,
+    max_shell_command_bytes: usize,
+    max_shell_output_bytes: usize,
+    max_file_read_bytes: usize,
 ) -> ToolRegistry {
     use aigent_tools::builtins::{
         BrowsePageTool, CalendarAddEventTool, CpTool, CutTool, DraftEmailTool,
@@ -560,7 +577,7 @@ pub fn default_registry(
     let native_candidates: Vec<(&str, Box<dyn aigent_tools::Tool>)> = vec![
         (
             "read_file",
-            Box::new(ReadFileTool { workspace_root: workspace_root.clone() }),
+            Box::new(ReadFileTool { workspace_root: workspace_root.clone(), max_file_read_bytes }),
         ),
         (
             "write_file",
@@ -568,7 +585,7 @@ pub fn default_registry(
         ),
         (
             "run_shell",
-            Box::new(RunShellTool { workspace_root: workspace_root.clone() }),
+            Box::new(RunShellTool { workspace_root: workspace_root.clone(), max_command_bytes: max_shell_command_bytes, max_output_bytes: max_shell_output_bytes }),
         ),
         (
             "calendar_add_event",
@@ -922,7 +939,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, None, None, None, None, vec![]);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-shell-data"), None, None, None, None, None, vec![], 8192, 32768, 65536);
 
         let mut args = HashMap::new();
         args.insert("command".to_string(), "echo hi".to_string());
@@ -950,7 +967,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, None, None, None, None, vec![]);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-read-data"), None, None, None, None, None, vec![], 8192, 32768, 65536);
 
         let mut args = HashMap::new();
         args.insert("path".to_string(), "hello.txt".to_string());
@@ -973,7 +990,7 @@ mod tests {
 
         let executor = ToolExecutor::new(policy);
         let registry =
-            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, None, None, None, None, vec![]);
+            default_registry(workspace, std::env::temp_dir().join("aigent-exec-unknown-data"), None, None, None, None, None, vec![], 8192, 32768, 65536);
 
         let result = executor
             .execute(&registry, "nonexistent_tool", &HashMap::new())

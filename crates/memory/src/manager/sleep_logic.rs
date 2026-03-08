@@ -4,7 +4,7 @@
 use anyhow::{Result, bail};
 use tracing::{debug, info, instrument, warn};
 
-use crate::schema::MemoryTier;
+use crate::schema::{MemoryTier, SourceKind};
 use crate::sleep::{AgenticSleepInsights, SleepSummary, distill};
 
 use super::{MemoryManager, retire_core_by_prefix};
@@ -436,7 +436,7 @@ impl MemoryManager {
         let already_present = self
             .entries_by_tier(MemoryTier::Core)
             .into_iter()
-            .any(|entry| entry.source == "onboarding:identity");
+            .any(|entry| matches!(entry.source_kind(), SourceKind::OnboardingIdentity));
 
         if already_present {
             debug!(bot_name, user_name, "core identity already seeded — skipping");

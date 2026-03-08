@@ -290,6 +290,9 @@ pub async fn run_unified_daemon(
         serper_api_key,
         exa_api_key,
         config.tools.search_providers.clone(),
+        config.tools.max_shell_command_bytes,
+        config.tools.max_shell_output_bytes,
+        config.tools.max_file_read_bytes,
     );
     let tool_executor = ToolExecutor::new(policy);
 
@@ -683,8 +686,11 @@ pub async fn run_unified_daemon(
         }
     }
     {
+        // VERIFIED: snapshot pattern — no take/restore.
         // Shutdown agentic sleep: snapshot → generate → apply, same pattern
-        // as the nightly consolidation.
+        // as the nightly consolidation. std::mem::take is never used on
+        // DaemonState fields across an .await — only in #[cfg(test)] regression
+        // tests that document the historical bug. See tests::take_pattern_loses_concurrent_writes.
         let (rt_clone, memories_snapshot, identity_snapshot) = {
             let mut s = state.lock().await;
             let _ = s.memory.flush_all();

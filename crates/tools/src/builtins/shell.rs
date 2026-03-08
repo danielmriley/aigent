@@ -10,6 +10,14 @@ use crate::{Tool, ToolSpec, ToolParam, ToolOutput, ToolMetadata, SecurityLevel};
 
 pub struct RunShellTool {
     pub workspace_root: PathBuf,
+    /// Maximum byte length of the command string.  Commands exceeding this
+    /// limit are rejected before execution.  Configurable via
+    /// `config.tools.max_shell_command_bytes`.
+    pub max_command_bytes: usize,
+    /// Maximum byte length of captured output (stdout + stderr combined).
+    /// Output beyond this limit is truncated.  Configurable via
+    /// `config.tools.max_shell_output_bytes`.
+    pub max_output_bytes: usize,
 }
 
 #[async_trait]
@@ -55,8 +63,8 @@ impl Tool for RunShellTool {
 
         // Basic safety guards — the approval gate (safer/balanced mode) is the
         // primary protection; these are a secondary defence-in-depth layer.
-        if command.len() > 8192 {
-            anyhow::bail!("command exceeds 8192-byte limit (got {} bytes)", command.len());
+        if command.len() > self.max_command_bytes {
+            anyhow::bail!("command exceeds {}-byte limit (got {} bytes)", self.max_command_bytes, command.len());
         }
         if command.contains('\0') {
             anyhow::bail!("command must not contain null bytes");
@@ -87,12 +95,11 @@ impl Tool for RunShellTool {
         };
 
         // Truncate output to prevent context explosion
-        let max_output = 32768;
-        let result = if combined.len() > max_output {
+        let result = if combined.len() > self.max_output_bytes {
             format!(
                 "{}…[truncated at {} bytes]",
-                &combined[..max_output],
-                max_output
+                &combined[..self.max_output_bytes],
+                self.max_output_bytes
             )
         } else {
             combined

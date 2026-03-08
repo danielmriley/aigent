@@ -208,6 +208,7 @@ mod tests {
                 provenance_hash: "test-hash".to_string(),
                 tags: vec!["tag1".to_string()],
                 embedding: None,
+                tokens: Default::default(),
             },
         }
     }

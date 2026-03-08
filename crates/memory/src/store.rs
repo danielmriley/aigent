@@ -91,18 +91,30 @@ impl MemoryStore {
     /// Remove a single entry by its full UUID.
     ///
     /// Returns `true` if the entry was found and removed, `false` otherwise.
+    ///
+    /// # Complexity: O(1) amortised
+    ///
+    /// Uses swap-remove: the deleted entry is swapped with the last element
+    /// before popping.  Only the swapped element's index entry needs updating,
+    /// so this is O(1) instead of the O(n) full-rebuild that `retain` requires.
     pub fn remove(&mut self, id: Uuid) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|e| e.id != id);
-        if self.entries.len() < before {
-            self.by_id.remove(&id);
-            // Rebuild both lookup structures.
-            self.by_id = self.entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
-            self.content_keys = self.entries.iter().map(|e| content_dedup_key(e.tier, &e.content)).collect();
-            true
-        } else {
-            false
+        let Some(&idx) = self.by_id.get(&id) else { return false };
+
+        // Remove the content-dedup key for the deleted entry.
+        let ck = content_dedup_key(self.entries[idx].tier, &self.entries[idx].content);
+        self.content_keys.remove(&ck);
+
+        // Swap-remove: swap the target with the last element, then pop.
+        let last_idx = self.entries.len() - 1;
+        if idx != last_idx {
+            self.entries.swap(idx, last_idx);
+            // The formerly-last element now lives at `idx` — update its index entry.
+            let swapped_id = self.entries[idx].id;
+            self.by_id.insert(swapped_id, idx);
         }
+        self.entries.pop();
+        self.by_id.remove(&id);
+        true
     }
 
     /// Identify content-duplicate entries within the store.
@@ -183,6 +195,7 @@ mod tests {
             provenance_hash: "test-hash".to_string(),
             tags: vec![],
             embedding: None,
+            tokens: Default::default(),
         }
     }
 

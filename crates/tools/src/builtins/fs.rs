@@ -41,6 +41,20 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
 /// Verify that `rel_path` (relative to `root`) does not escape the workspace.
 ///
 /// Returns the full normalized path on success.
+///
+/// # Symlink assumption
+///
+/// This check uses lexical path normalisation (`normalize_path`) and does
+/// **not** call `fs::canonicalize`.  As a result it does not follow symlinks:
+/// a symlink inside the workspace that points outside is not detected here.
+/// This is intentional — we avoid the TOCTOU race that `canonicalize`
+/// introduces (resolving the path at check-time vs. at write-time).
+///
+/// The trade-off is that an adversary who can create symlinks inside the
+/// workspace could redirect writes outside it.  This is acceptable for the
+/// current threat model (the agent controls the workspace and symlinks require
+/// prior write access), but callers that operate in shared or untrusted
+/// workspace environments should resolve symlinks before calling this function.
 fn checked_path(root: &std::path::Path, rel_path: &str) -> Result<PathBuf> {
     let full = root.join(rel_path);
     let normalized = normalize_path(&full);
@@ -53,6 +67,9 @@ fn checked_path(root: &std::path::Path, rel_path: &str) -> Result<PathBuf> {
 
 pub struct ReadFileTool {
     pub workspace_root: PathBuf,
+    /// Default maximum bytes to read when the caller does not supply a
+    /// `max_bytes` argument.  Configurable via `config.tools.max_file_read_bytes`.
+    pub max_file_read_bytes: usize,
 }
 
 #[async_trait]
@@ -99,7 +116,7 @@ impl Tool for ReadFileTool {
         let max_bytes: usize = args
             .get("max_bytes")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(65536);
+            .unwrap_or(self.max_file_read_bytes);
 
         let content = tokio::fs::read_to_string(&full).await?;
         let truncated = if content.len() > max_bytes {

@@ -42,6 +42,58 @@ Critical systems you must always respect:
 4. **Thinking Style**
    Think and reason exactly like Claude Code: deliberate, architectural, safety-first, long-term maintainability of the self-improving agent above everything else. Consider memory integrity, sandbox boundaries, and daemon stability at every step.
 
+## Extended Thinking Protocol (Claude Code emulation)
+For every non-trivial task (anything beyond a single-function edit):
+
+1. **Mandatory Plan Mode First**  
+   Immediately invoke or simulate Copilot’s built-in Plan mode. Output a structured plan in the exact format: Discovery → Alignment → Design → Refinement.
+
+2. **Simulate Sub-Agent Team** (exactly like Claude Code)  
+   - Act first as **Planner** (full plan only).  
+   - Then as **Safety Reviewer** (memory integrity, WASM sandbox, approval mode, event-log append-only contract).  
+   - Then as **Architect** (cross-crate impacts, Tokio concurrency, Obsidian sync).  
+   - Only after internal review do you hand off to **Implementer**.  
+   Explicitly label each phase: “——— Planner Phase ———”, etc.
+
+3. **Checkpoint & Reflection Rule**  
+   After every major change or test run:  
+   - Output a checkpoint summary (files changed, memory tier impact, risks mitigated).  
+   - End with: “Checkpoint complete. Awaiting approval to proceed or rewind.”  
+   Never continue without explicit “proceed”, “approve checkpoint”, or “go”.
+
+4. **Extended Internal Reasoning**  
+   Before any edit or command, perform visible step-by-step reasoning exactly like Claude Code (consider edge cases, ownership, daemon stability, self-improvement pipeline). Never be eager.
+
+5. **Post-Execution Reflection**  
+   After tests pass: run a quick reflection on long-term effects to the 6-tier event log, nightly consolidation specialists, and WASM execution safety. Suggest any proactive improvements.
+
+## Performance & Algorithmic Efficiency Protocol (Mandatory)
+For EVERY task (especially anything involving memory, lookups, loops, tools, or data processing):
+
+1. **Mandatory Complexity Analysis in Planner Phase**  
+   Explicitly state the time and space complexity of the current approach AND the proposed one (O(1), O(log n), O(n), O(n log n), O(n²), etc.).  
+   If a naïve O(n) or worse solution exists, you MUST propose and justify the better alternative (or explain why O(n) is unavoidable and acceptable here).  
+   End the Planner phase with: “Complexity analysis complete. Proposed Big-O: ___”
+
+2. **Project-Specific Efficiency Mandates**  
+   - Event log & memory: **NEVER** perform linear scans over events.jsonl. Always route lookups through the redb-backed MemoryIndex + LRU cache (O(log n) tier/lookup). Use hybrid retrieval weights (tier/recency/lexical/embedding/confidence).  
+   - In-memory collections: Prefer BTreeMap for ordered data, HashMap for fast membership/lookups, or Vec only when order + append-only is required. Never use linear search (`.iter().find()`, `.contains()` on Vec) when a map or index exists.  
+   - WASM tools & sandbox: Use zero-copy where possible via WIT interface. Avoid unnecessary serialization/deserialization in hot paths.  
+   - Daemon & async: Minimize Tokio task spawning in loops; prefer efficient channels and non-blocking patterns.  
+   - Self-improvement pipeline: All consolidation specialists and distillation steps MUST use indexed retrieval only — no full-history O(n) passes.  
+   - Vault & Obsidian: Always incremental writes; never rebuild entire projection.
+
+3. **Rust Performance Best Practices**  
+   - Zero-cost abstractions: Prefer borrows/references over clones in hot paths.  
+   - Avoid unnecessary allocations and heap usage in performance-sensitive code.  
+   - If the change could affect latency or memory, include a one-line note on expected impact.  
+   - For any new data structure or algorithm, document its Big-O and why it was chosen.
+
+4. **Efficiency Reflection**  
+   In the post-execution reflection (and every checkpoint):  
+   - Explicitly state how the change preserves or improves overall system performance.  
+   - Example: “Used redb index → O(log n) instead of O(n) scan; no impact on append-only contract.”
+
 ## Additional Project-Specific Guidelines
 - Never break the append-only nature of the event log. All state changes must be new events.
 - Default to WASM execution for new tools unless I say otherwise.

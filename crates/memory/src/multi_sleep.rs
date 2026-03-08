@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crate::identity::IdentityKernel;
-use crate::schema::{MemoryEntry, MemoryTier, truncate_str};
+use crate::schema::{MemoryEntry, MemoryTier, SourceKind, truncate_str};
 use crate::sleep::AgenticSleepInsights;
 
 // ── Identity context ──────────────────────────────────────────────────────────
@@ -584,7 +584,7 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
 fn format_reasoning_traces_block(entries: &[MemoryEntry]) -> Option<String> {
     let mut traces: Vec<&MemoryEntry> = entries
         .iter()
-        .filter(|e| e.source == "agent-reasoning")
+        .filter(|e| matches!(e.source_kind(), SourceKind::AgentReasoning))
         .collect();
     if traces.is_empty() {
         return None;
@@ -734,6 +734,7 @@ mod tests {
             valence: 0.1,
             tags: Vec::new(),
             embedding: None,
+            tokens: Default::default(),
             created_at: Utc::now(),
             provenance_hash: "test".to_string(),
         }

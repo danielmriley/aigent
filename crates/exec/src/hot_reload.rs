@@ -44,7 +44,7 @@ impl HotRegistry {
 
     /// Acquire a read lock and list all tool specs.
     pub fn list_specs(&self) -> Vec<ToolSpec> {
-        self.inner.read().unwrap().list_specs()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).list_specs()
     }
 
     /// Acquire a read lock, look up the tool, then release the lock before
@@ -55,7 +55,7 @@ impl HotRegistry {
         args: &std::collections::HashMap<String, String>,
     ) -> anyhow::Result<ToolOutput> {
         let tool = {
-            let registry = self.inner.read().unwrap();
+            let registry = self.inner.read().unwrap_or_else(|e| e.into_inner());
             registry
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?
@@ -66,13 +66,13 @@ impl HotRegistry {
 
     /// Replace the entire inner registry.
     pub fn swap(&self, new_registry: ToolRegistry) {
-        let mut guard = self.inner.write().unwrap();
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
         *guard = new_registry;
     }
 
     /// Get a read reference to the underlying registry (for `ToolExecutor`).
     pub fn read(&self) -> std::sync::RwLockReadGuard<'_, ToolRegistry> {
-        self.inner.read().unwrap()
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -107,6 +107,16 @@ impl Default for WatcherConfig {
 /// The rebuilder calls [`super::wasm::load_wasm_tools_from_dir`] and then
 /// re-creates the native fallback set from `rebuild_fn` before swapping
 /// the registry.
+///
+/// # Wiring into the daemon
+///
+/// TODO: To activate live hot-reload from `run_unified_daemon`, change
+/// `DaemonState.tool_registry` from `Arc<ToolRegistry>` to `HotRegistry`
+/// (which already wraps `Arc<RwLock<ToolRegistry>>`).  Then call
+/// `spawn_watcher` after the registry is built, keeping the returned
+/// `(_watcher, _join_handle)` alive for the daemon lifetime so the OS
+/// watcher is not dropped prematurely.
+#[allow(dead_code)]
 pub fn spawn_watcher(
     config: WatcherConfig,
     hot_registry: HotRegistry,

@@ -17,7 +17,7 @@ use crate::consistency::{ConsistencyDecision, evaluate_core_update};
 use crate::event_log::{MemoryEventLog, MemoryRecordEvent};
 use crate::identity::IdentityKernel;
 use crate::index::{IndexCacheStats, MemoryIndex};
-use crate::schema::{MemoryEntry, MemoryTier};
+use crate::schema::{MemoryEntry, MemoryTier, SourceKind};
 use crate::store::MemoryStore;
 use crate::vault::{KV_TIER_LIMIT, VaultFileStatus, check_vault_checksums};
 
@@ -198,13 +198,16 @@ impl MemoryManager {
         let mut entries = self
             .all()
             .iter()
-            .filter(|entry| entry.source.starts_with("sleep:"))
+            .filter(|entry| entry.source_kind().is_sleep())
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| right.created_at.cmp(&left.created_at));
         entries.into_iter().take(limit).collect()
     }
 
-    fn apply_replayed_entry(&mut self, entry: MemoryEntry) -> Result<()> {
+    fn apply_replayed_entry(&mut self, mut entry: MemoryEntry) -> Result<()> {
+        // Populate the cached token set from content at replay time so every
+        // entry has O(1) lexical scoring regardless of when it was recorded.
+        entry.tokens = crate::retrieval::tokenize(&entry.content);
         match evaluate_core_update(&self.identity, &entry)? {
             ConsistencyDecision::Accept => {
                 let _ = self.store.insert(entry.clone());
@@ -266,7 +269,7 @@ impl MemoryManager {
         // We log the rejection so it shows up in daemon logs and can be
         // investigated, but we do NOT bail — we return a synthetic entry with
         // confidence 0.0 so the caller's `?` chain continues normally.
-        if tier == MemoryTier::Episodic && source.starts_with("assistant-reply") {
+        if tier == MemoryTier::Episodic && matches!(SourceKind::from_source(&source), SourceKind::AssistantReply) {
             let lc = content.to_ascii_lowercase();
             let is_tool_denial = [
                 "cannot execute",
@@ -302,6 +305,8 @@ impl MemoryManager {
                     provenance_hash: String::new(),
                     tags,
                     embedding: None,
+                    // Zero-confidence entry is never inserted — skip tokenisation.
+                    tokens: Default::default(),
                 });
             }
         }
@@ -321,6 +326,7 @@ impl MemoryManager {
             h.update(created_at.to_rfc3339().as_bytes());
             format!("{:x}", h.finalize())
         };
+        let tokens = crate::retrieval::tokenize(&content);
         let entry = MemoryEntry {
             id: Uuid::new_v4(),
             tier,
@@ -332,6 +338,7 @@ impl MemoryManager {
             provenance_hash,
             tags,
             embedding,
+            tokens,
         };
 
         match evaluate_core_update(&self.identity, &entry)? {
@@ -466,17 +473,18 @@ impl MemoryManager {
             .store
             .all()
             .iter()
-            .filter(|e| e.source.starts_with("belief:retracted:"))
             .filter_map(|e| {
-                e.source
-                    .strip_prefix("belief:retracted:")
-                    .and_then(|s| s.parse::<Uuid>().ok())
+                if let SourceKind::BeliefRetracted(id) = e.source_kind() {
+                    Some(id)
+                } else {
+                    None
+                }
             })
             .collect();
         self.store
             .all()
             .iter()
-            .filter(|e| e.source == "belief" && !retracted_ids.contains(&e.id))
+            .filter(|e| matches!(e.source_kind(), SourceKind::Belief) && !retracted_ids.contains(&e.id))
             .collect()
     }
 
@@ -499,7 +507,8 @@ impl MemoryManager {
             );
             self.cached_identity_block = Some(block);
         }
-        self.cached_identity_block.as_deref().unwrap()
+        // SAFETY: we just set it to Some(_) above.
+        self.cached_identity_block.as_deref().unwrap_or("")
     }
 
     /// Return the cached beliefs prompt block, or compute and cache it.
@@ -529,7 +538,8 @@ impl MemoryManager {
             };
             self.cached_beliefs_block = Some(block);
         }
-        self.cached_beliefs_block.as_deref().unwrap()
+        // SAFETY: we just set it to Some(_) above.
+        self.cached_beliefs_block.as_deref().unwrap_or("")
     }
 
     /// Invalidate all prompt block caches.  Call after sleep cycles,
@@ -613,7 +623,7 @@ impl MemoryManager {
         self.store
             .all()
             .iter()
-            .filter(|e| e.source == "follow-up")
+            .filter(|e| matches!(e.source_kind(), SourceKind::FollowUp))
             .map(|e| (e.id, e.content.clone()))
             .collect()
     }
@@ -644,22 +654,29 @@ impl MemoryManager {
     /// Falls back to generic placeholders when the entry is absent so the
     /// sleep prompt is always well-formed.
     fn bot_and_user_names_from_core(&self) -> (String, String) {
+        use std::sync::LazyLock;
+        use regex::Regex;
+        static RE_USER_NAME: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"[Tt]he user(?:'s)? name is ([^.,\n]+)")
+                .expect("user name regex")
+        });
+        static RE_BOT_NAME: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^You are ([^,.\n]+)").expect("bot name regex")
+        });
+
         for entry in self.entries_by_tier(MemoryTier::Core) {
-            if entry.source == "onboarding:identity" {
-                let user_name = entry
-                    .content
-                    .find("The user's name is ")
-                    .and_then(|idx| {
-                        let after = &entry.content[idx + "The user's name is ".len()..];
-                        let name = after.split(['.', ',', '\n']).next()?.trim().to_string();
-                        if name.is_empty() { None } else { Some(name) }
-                    })
+            if matches!(entry.source_kind(), SourceKind::OnboardingIdentity) {
+                let user_name = RE_USER_NAME
+                    .captures(&entry.content)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().trim().to_string())
+                    .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "the user".to_string());
-                let bot_name = entry
-                    .content
-                    .strip_prefix("You are ")
-                    .and_then(|rest| rest.split(',').next())
-                    .map(|n| n.trim().to_string())
+                let bot_name = RE_BOT_NAME
+                    .captures(&entry.content)
+                    .and_then(|c| c.get(1))
+                    .map(|m| m.as_str().trim().to_string())
+                    .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "the assistant".to_string());
                 return (bot_name, user_name);
             }
@@ -754,7 +771,7 @@ mod tests {
     use super::vault_sync::derive_default_vault_path;
     use crate::event_log::{MemoryEventLog, MemoryRecordEvent};
     use crate::manager::MemoryManager;
-    use crate::schema::{MemoryEntry, MemoryTier};
+    use crate::schema::{MemoryEntry, MemoryTier, SourceKind};
 
     #[tokio::test]
     async fn persists_and_replays_memory_entries() -> Result<()> {
@@ -793,6 +810,7 @@ mod tests {
             provenance_hash: "test-hash".to_string(),
             tags: vec![],
             embedding: None,
+            tokens: Default::default(),
         };
 
         let event = MemoryRecordEvent {

@@ -620,7 +620,7 @@ impl LlmRouter {
         let mut guard = self.get_candle().await?;
         let backend = guard
             .as_mut()
-            .expect("candle backend loaded by get_candle");
+            .ok_or_else(|| anyhow::anyhow!("candle backend failed to initialise"))?;
         let max_tokens = backend.config.max_seq_len;
         let text = backend.generate(&prompt, max_tokens).await?;
 
@@ -649,7 +649,7 @@ impl LlmClient for LlmRouter {
             let mut guard = self.get_candle().await?;
             let backend = guard
                 .as_mut()
-                .expect("candle backend loaded by get_candle");
+                .ok_or_else(|| anyhow::anyhow!("candle backend failed to initialise"))?;
             let text = backend.generate(prompt, backend.config.max_seq_len).await?;
             return Ok((ModelProvider::Candle, text));
         }
@@ -674,7 +674,7 @@ impl LlmClient for LlmRouter {
             let mut guard = self.get_candle().await?;
             let backend = guard
                 .as_mut()
-                .expect("candle backend loaded by get_candle");
+                .ok_or_else(|| anyhow::anyhow!("candle backend failed to initialise"))?;
             let text = backend.generate(prompt, backend.config.max_seq_len).await?;
             let _ = tx.send(text.clone()).await;
             return Ok((ModelProvider::Candle, text));
