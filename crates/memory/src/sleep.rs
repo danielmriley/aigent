@@ -205,6 +205,14 @@ pub struct AgenticSleepInsights {
     /// into higher-tier memories.  These are **deleted outright** from the
     /// store and event log to keep active entry counts bounded.
     pub retire_memory_ids: Vec<String>,
+    /// Short IDs of entries the LLM has determined are **factually wrong**
+    /// and must be retracted.  Unlike `retire_memory_ids` (redundancy
+    /// cleanup), retractions target *incorrect* information — e.g. a stored
+    /// Procedural claim that a tool could not be used when later runs proved
+    /// it works.  Retractions soft-delete: the in-memory confidence is zeroed
+    /// so the entry becomes invisible to retrieval, and a tombstone event is
+    /// appended to the JSONL log for audit.  The original event is NOT erased.
+    pub retract_memory_ids: Vec<String>,
     /// Core entry rewrites: `(id_short, new_content)`. Each rewrite is run
     /// through the consistency firewall before it is committed.
     pub rewrite_core: Vec<(String, String)>,
@@ -407,6 +415,8 @@ PROMOTE: <id_short :: target_tier> (promote an existing entry to a higher tier: 
 PROMOTE: <optionally promote additional entries, or omit>
 RETIRE: <id_short> (delete a redundant, mundane, or fully-consolidated Episodic/Semantic/Reflective/Procedural entry — use aggressively to prune entries whose information has been absorbed into higher-tier memories, or NONE)
 RETIRE: <optionally retire additional entries, or omit>
+RETRACT: <id_short :: reason> (soft-retract an entry that is FACTUALLY WRONG — for example, a Procedural memory claiming a tool cannot be used when subsequent turns proved it works fine, or a false belief about the user's preferences that was contradicted by their behaviour. Unlike RETIRE (redundancy), RETRACT marks the entry incorrect: its confidence is zeroed so it never appears in future context, and a tombstone is recorded for audit. Use when you detect a Procedural or Episodic entry that contradicts demonstrated reality. Format: id_short :: one-line reason, or NONE)
+RETRACT: <optionally retract additional incorrect entries, or omit>
 MEMORY: <tier :: content :: tags> (create any new memory that doesn't fit the fields above; tier is one of Episodic/Semantic/Procedural/Reflective/UserProfile/Core; tags are comma-separated labels like 'agent_belief,opinion' or 'user_fact,preference' or 'relationship,dynamic'; this is your creative freedom to form any memory you want, or NONE)
 MEMORY: <optionally create additional memories, or omit>
 
@@ -552,6 +562,18 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
                     insights.retire_memory_ids.push(id_short);
                 }
             }
+        } else if let Some(rest) = strip_key(line, "RETRACT:") {
+            if !is_none(rest) {
+                // Format: "id_short :: reason"  OR  just "id_short"
+                let id_short = rest
+                    .split_once("::")
+                    .map(|(a, _)| a.trim())
+                    .unwrap_or_else(|| rest.trim())
+                    .to_string();
+                if !id_short.is_empty() {
+                    insights.retract_memory_ids.push(id_short);
+                }
+            }
         } else if let Some(rest) = strip_key(line, "MEMORY:") {
             if !is_none(rest) {
                 // Format: "tier :: content :: tags"
@@ -592,6 +614,7 @@ pub fn parse_agentic_insights(reply: &str) -> AgenticSleepInsights {
         valence_corrections = insights.valence_corrections.len(),
         llm_promotions = insights.llm_promotions.len(),
         free_memories = insights.free_memories.len(),
+        retract_memory = insights.retract_memory_ids.len(),
         "agentic sleep insights parsed"
     );
 

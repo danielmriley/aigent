@@ -149,6 +149,18 @@ impl MemoryStore {
         }
         false
     }
+
+    /// Zero the confidence of the entry with the given ID so the forgetting
+    /// pass will sweep it on the next sleep cycle.  Returns `true` if found.
+    pub fn zero_confidence(&mut self, id: Uuid) -> bool {
+        for entry in &mut self.entries {
+            if entry.id == id {
+                entry.confidence = 0.0;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]

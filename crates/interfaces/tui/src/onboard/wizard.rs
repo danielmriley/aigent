@@ -232,7 +232,7 @@ pub(super) fn is_forbidden_data_dir(path: &Path) -> bool {
         ".git",
         "config",
         "docs",
-        "skills-src",
+        "modules-src",
         "wit",
         ".aigent",
     ];

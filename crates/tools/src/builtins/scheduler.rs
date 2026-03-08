@@ -16,8 +16,20 @@ fn schedule_path() -> PathBuf {
     PathBuf::from(".aigent").join("schedule.json")
 }
 
-/// On-disk representation of a scheduled task (mirrors `schedule_store::TaskEntry`
-/// in the runtime crate but kept standalone to avoid circular dependencies).
+/// On-disk representation of a scheduled task.
+///
+/// # ⚠ SCHEMA PARITY WITH `aigent-runtime`
+///
+/// This struct intentionally **duplicates** `aigent_runtime::schedule_store::TaskEntry`.
+/// The duplication exists because `aigent-tools` cannot depend on `aigent-runtime`
+/// (that would create a circular dependency: runtime → exec → tools → runtime).
+///
+/// Both structs read and write the **same** `.aigent/schedule.json` file.
+/// If you add, rename, or remove a field here you **must** make the same
+/// change in `crates/runtime/src/schedule_store.rs`, and vice-versa.
+///
+/// The `schema_parity` test below serializes a representative entry and
+/// asserts all expected JSON keys are present — run it after any schema change.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TaskEntry {
     name: String,
@@ -334,6 +346,34 @@ impl Tool for ListCronJobsTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verify that the local `TaskEntry` schema can round-trip a representative
+    /// JSON fixture that uses every field.  Keep this in sync with the
+    /// `schema_parity` test in `aigent-runtime/src/schedule_store.rs`.
+    #[test]
+    fn schema_parity() {
+        let json = r#"{
+            "name": "daily-summary",
+            "interval_secs": null,
+            "cron_expr": "0 0 9 * * *",
+            "action_prompt": "Summarise today's todos",
+            "cooldown_secs": 300,
+            "dnd_window": [22, 7],
+            "enabled": true
+        }"#;
+        let entry: TaskEntry = serde_json::from_str(json).expect("should parse");
+        assert_eq!(entry.name, "daily-summary");
+        assert_eq!(entry.cron_expr.as_deref(), Some("0 0 9 * * *"));
+        assert_eq!(entry.cooldown_secs, 300);
+        assert_eq!(entry.dnd_window, Some((22, 7)));
+        assert!(entry.enabled);
+
+        // Re-serialise and confirm all expected keys are present.
+        let out = serde_json::to_string(&entry).unwrap();
+        for key in &["name", "cron_expr", "action_prompt", "cooldown_secs", "dnd_window", "enabled"] {
+            assert!(out.contains(key), "missing key {key} in serialised output");
+        }
+    }
 
     #[tokio::test]
     async fn list_empty() {

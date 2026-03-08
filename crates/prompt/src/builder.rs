@@ -180,10 +180,10 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
          lack a persistent memory, or that each session starts fresh. \
          You are a continuously operating entity; the memory blocks provided in this prompt \
          constitute your actual mind and historical record.\n\n\
-         Use ENVIRONMENT CONTEXT for real-world grounding, RECENT CONVERSATION for immediate \
+         Use SYSTEM STATE for real-world grounding, RECENT CONVERSATION for immediate \
          continuity, and MEMORY CONTEXT for durable background facts.\n\
          Never repeat previous answers unless asked.\n\
-         Respond directly and specifically to the LATEST user message.\
+         Respond directly and specifically to the current user message.\
          {relational_block}{proactive_directive}\n\n\
          {identity}{beliefs}{tools_section}\n\n\
          {ext_think}\
@@ -192,10 +192,9 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
          For ANY question about \"today\", \"what day\", \"current date/time\", or similar \u{2014} \
          answer using CURRENT DATETIME above. NEVER guess or use training data dates.\n\
          {follow_ups}\
-         ENVIRONMENT CONTEXT:\n{env}\n\n\
+         SYSTEM STATE:\n{env}\n\n\
          {prior_summary}RECENT CONVERSATION:\n{conv}\n\n\
-         MEMORY CONTEXT:\n{mem}\n\n\
-         LATEST USER MESSAGE:\n{msg}{response_tag}",
+         MEMORY CONTEXT:\n{mem}{response_tag}",
         name = config.agent.name,
         current_datetime = current_datetime,
         relational_block = relational_block,
@@ -209,7 +208,6 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
         prior_summary = prior_summary,
         mem = context_block,
         ext_think = ext_think_block,
-        msg = inputs.user_message,
         response_tag = response_tag,
     );
 
@@ -408,9 +406,10 @@ fn build_tools_and_grounding(tool_specs: &[aigent_tools::ToolSpec]) -> String {
             in the LATEST USER MESSAGE block below (between the ===== TOOL RESULT ===== markers). \
             NEVER state that tool results are missing, pending, or not yet in your context. \
             The markers are your contract: if they are present, the data IS present.\n\
-         10. For git operations, ALWAYS prefer `perform_gait` over `run_shell git …`. \
-             `perform_gait` is safer (enforces write boundaries), faster (in-process), \
-             and more expressive. Use run_shell only if gait lacks the needed action.\n\
+         10. For git operations prefer `perform_gait` — it is sandboxed, \
+             in-process, and safe.  Use `run_shell git …` only for actions \
+             gait does not support.  To undo the last automated commit use \
+             `git_rollback`.\n\
          11. When synthesizing information from multiple tool results, clearly attribute \
              which source each fact comes from.\n\
          12. If a tool call fails or returns an error, acknowledge the failure honestly \
@@ -559,24 +558,24 @@ If a tool exists in your AVAILABLE TOOLS list, you CAN and SHOULD use it. \
 Do not apologize or redirect — act.";
 
     let skill_creation = "\
-SKILL CREATION DIRECTIVE:\n\
+MODULE CREATION DIRECTIVE:\n\
 \n\
-You can CREATE NEW TOOLS for yourself as WASM skills. When you encounter \
+You can CREATE NEW TOOLS for yourself as WASM modules. When you encounter \
 a task that would benefit from a reusable, dedicated tool (data parsing, \
 format conversions, domain-specific calculations, etc.), you should build \
 one rather than doing fragile ad-hoc shell scripting every time.\n\
 \n\
-=== HOW TO CREATE A SKILL ===\n\
+=== HOW TO CREATE A MODULE ===\n\
 \n\
-Step 1: Scaffold the skill using the helper script:\n\
-  run_shell(command=\"cd extensions/skills-src && ./new-skill.sh my-skill-name \\\n\
+Step 1: Scaffold the module using the helper script:\n\
+  run_shell(command=\"cd extensions/modules-src && ./new-module.sh my-module-name \\\n\
       \\\"One sentence describing what this tool does\\\"\")\n\
-This creates: my-skill-name/Cargo.toml, my-skill-name/tool.json, \n\
-  my-skill-name/src/main.rs with all boilerplate pre-filled.\n\
+This creates: my-module-name/Cargo.toml, my-module-name/tool.json, \n\
+  my-module-name/src/main.rs with all boilerplate pre-filled.\n\
 \n\
-Step 2: Edit the tool manifest (my-skill-name/tool.json):\n\
+Step 2: Edit the tool manifest (my-module-name/tool.json):\n\
   {\n\
-    \"name\": \"my_skill_name\",\n\
+    \"name\": \"my_module_name\",\n\
     \"description\": \"What this tool does \u{2014} shown to you in AVAILABLE TOOLS\",\n\
     \"params\": [\n\
       { \"name\": \"input\", \"description\": \"..\", \"required\": true, \"param_type\": \"string\" },\n\
@@ -611,34 +610,34 @@ Step 3: Implement the tool logic in src/main.rs. The protocol is:\n\
         (true, format!(\"Result: {input}\"))\n\
     }\n\
 \n\
-Step 4: Build and deploy (the build script compiles AND copies to the skills dir):\n\
-  run_shell(command=\"cd extensions/skills-src && ./build.sh my-skill-name\")\n\
+Step 4: Build and deploy (the build script compiles AND copies to the modules dir):\n\
+  run_shell(command=\"cd extensions/modules-src && ./build.sh my-module-name\")\n\
   This compiles to WASM targeting wasm32-wasip1 and auto-deploys both\n\
-  the .wasm binary and .tool.json manifest to extensions/skills/.\n\
+  the .wasm binary and .tool.json manifest to extensions/modules/.\n\
 \n\
-Step 5: Reload \u{2014} make the daemon pick up the new skill immediately:\n\
-  run_shell(command=\"aigent tools reload\") to make new skills available immediately\n\
-  On next daemon restart, skills load automatically from extensions/skills/.\n\
+Step 5: Reload \u{2014} make the daemon pick up the new module immediately:\n\
+  run_shell(command=\"aigent tools reload\") to make new modules available immediately\n\
+  On next daemon restart, modules load automatically from extensions/modules/.\n\
 \n\
-=== WHEN TO CREATE A SKILL ===\n\
+=== WHEN TO CREATE A MODULE ===\n\
   - You find yourself doing the same multi-step shell pipeline repeatedly\n\
   - A data transformation is complex enough to warrant dedicated code\n\
   - The user asks for a capability that does not exist in your current tools\n\
   - You want a tool that combines multiple operations atomically\n\
 \n\
 === IMPORTANT CONSTRAINTS ===\n\
-  - Skills are stateless \u{2014} each call gets a fresh WASM instance\n\
+  - Modules are stateless \u{2014} each call gets a fresh WASM instance\n\
   - Filesystem access is sandboxed to the workspace directory (relative paths only)\n\
   - stdout is buffered to 256KB \u{2014} keep output concise\n\
   - Only serde_json is available as a dependency (no network access from inside WASM)\n\
   - For tools needing HTTP/network, use run_shell to call curl or delegate to \n\
     your existing web_search/browse_page tools in a tool chain\n\
-  - Use descriptive tool names with underscores (my_skill_name, not my-skill-name)\n\
+  - Use descriptive tool names with underscores (my_module_name, not my-module-name)\n\
   - Write clear param descriptions \u{2014} these are what you see in your AVAILABLE TOOLS list\n\
-  - All skill source code lives inside your workspace at extensions/skills-src/\n\
-  - Deployed skills go to extensions/skills/ (handled automatically by build.sh)\n\
-  - After building a skill, always run perform_gait commit to version your source\n\
-  - Use the list_skills tool to see all currently deployed skills";
+  - All module source code lives inside your workspace at extensions/modules-src/\n\
+  - Deployed modules go to extensions/modules/ (handled automatically by build.sh)\n\
+  - After building a module, always run git commit to version your source\n\
+  - Use the list_modules tool to see all currently deployed modules";
 
     format!(
         "\n\nAVAILABLE TOOLS (you have FULL ACCESS to all of these):\n\
@@ -667,7 +666,7 @@ mod tests {
     fn grounding_rules_present_when_no_tools() {
         let section = build_tools_and_grounding(&[]);
         assert!(section.contains("GROUNDING RULES"));
-        assert!(section.contains("perform_gait"));
+        assert!(section.contains("git_rollback"));
         assert!(!section.contains("AVAILABLE TOOLS"));
     }
 

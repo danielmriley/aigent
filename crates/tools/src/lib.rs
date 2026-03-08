@@ -374,7 +374,7 @@ pub enum ToolSource {
     Native,
     /// Compiled WASM guest loaded from `extensions/`.
     Wasm,
-    /// Dynamically loaded at runtime (e.g. from the skills directory).
+    /// Dynamically loaded at runtime (e.g. from the modules directory).
     Dynamic,
 }
 
@@ -542,12 +542,15 @@ pub mod marketplace;
 pub use builtins::{
     BrowsePageTool,
     CalendarAddEventTool, CpTool, CutTool, DraftEmailTool, EchoTool,
-    FetchPageTool, FindTool, GitRollbackTool, GrepTool, HeadTool, ListDirTool,
+    FindTool, GitRollbackTool, GrepTool, HeadTool, ListDirTool, ListModulesTool,
     MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool, RunShellTool,
     SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool, UniqTool,
-    WcTool, WebBrowseTool, WebSearchTool, WorkspaceStatusTool, WriteFileTool,
+    WcTool, WebSearchTool, WorkspaceStatusTool, WriteFileTool,
 };
-pub use builtins::memory_search::{SearchMemoryTool, MemoryQueryFn, MemorySearchResult};
+pub use builtins::memory_search::{
+    SearchMemoryTool, MemoryQueryFn, MemorySearchResult,
+    WriteMemoryTool, MemoryWriteFn,
+};
 
 // ── ToolRegistry tests ───────────────────────────────────────────────────────
 

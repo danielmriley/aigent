@@ -259,7 +259,44 @@ impl MemoryManager {
             }
         }
 
-        // Core rewrites: retire old entry + record rewritten version
+        // Non-Core memory retractions (soft tombstone — zeroes in-memory
+        // confidence so retrieval ignores the entry, appends a tombstone
+        // event so the retraction survives a restart).  Use this path for
+        // entries that are FACTUALLY WRONG rather than just redundant.
+        if !insights.retract_memory_ids.is_empty() {
+            for id_prefix in &insights.retract_memory_ids {
+                let target = self
+                    .store
+                    .all()
+                    .iter()
+                    .find(|e| {
+                        !matches!(e.tier, MemoryTier::Core | MemoryTier::UserProfile)
+                            && e.id.to_string().starts_with(id_prefix.as_str())
+                    })
+                    .map(|e| (e.id, e.content.chars().take(80).collect::<String>()));
+
+                if let Some((target_id, preview)) = target {
+                    match self
+                        .retract_memory(target_id, "sleep:contradicts-observed-behavior")
+                        .await
+                    {
+                        Ok(()) => {
+                            info!(%target_id, %preview, "sleep retraction applied");
+                        }
+                        Err(ref e) => {
+                            warn!(%target_id, err = %e, "retract_memory failed — skipping");
+                        }
+                    }
+                } else {
+                    warn!(
+                        id_prefix,
+                        "RETRACT: no matching non-Core entry found — may have been retired already"
+                    );
+                }
+            }
+        }
+
+
         for (id_prefix, new_content) in &insights.rewrite_core {
             retire_core_by_prefix(
                 &mut self.store,

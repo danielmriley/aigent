@@ -404,7 +404,7 @@ pub(super) fn spawn_proactive_task(
                 let mut s = state.lock().await;
                 let rt = s.runtime.clone();
                 let recent = s.recent_turns.iter().cloned().collect::<Vec<_>>();
-                let specs = s.tool_registry.list_specs();
+                let specs = s.tool_registry.list_specs(); // used in prompt for tool descriptions
                 let reg = Arc::clone(&s.tool_registry);
                 let exe = Arc::clone(&s.tool_executor);
 
@@ -427,7 +427,7 @@ pub(super) fn spawn_proactive_task(
                 config: &rt_clone.config,
                 user_message: proactive_user_msg,
                 recent_turns: &recent,
-                tool_specs: &[],   // tools go via API, not baked into text
+                tool_specs: &tool_specs, // always baked into text for external thinking
                 pending_follow_ups: &[],
                 context_items: &context,
                 stats,
@@ -447,34 +447,20 @@ pub(super) fn spawn_proactive_task(
             }
             messages.push(aigent_llm::ChatMessage::user(proactive_user_msg));
 
-            // Build tool definitions for the API.
-            let tools_json = if tool_specs.is_empty() {
-                None
-            } else {
-                Some(aigent_thinker::build_tools_json(&tool_specs))
-            };
-
-            let primary = aigent_llm::Provider::from(rt_clone.config.llm.provider.as_str());
-
             // Create a sink channel — proactive tokens are NOT shown to the user.
             let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);
             tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
 
-            // Run the full tool loop (silent — no event broadcast to TUI).
-            let loop_result = aigent_thinker::run_tool_loop(
-                &rt_clone.llm,
-                primary,
-                &rt_clone.config.llm.ollama_model,
-                &rt_clone.config.llm.openrouter_model,
-                &mut messages,
-                tools_json.as_ref(),
-                &registry,
-                &executor,
-                sink_tx,
-                None,   // no event_tx → tool events are hidden from the user
-            
-                std::time::Duration::from_secs(rt_clone.config.agent.step_timeout_seconds),
-            ).await;
+            // Run the unified agent turn (silent — no events broadcast to TUI).
+            let loop_result = aigent_agent::run_agent_turn(aigent_agent::AgentTurnInput {
+                llm: &rt_clone.llm,
+                config: &rt_clone.config,
+                messages: &mut messages,
+                registry: Arc::clone(&registry),
+                executor: Arc::clone(&executor),
+                token_tx: sink_tx,
+                event_sink: None,
+            }).await;
 
             // ── Apply phase: re-acquire lock, record results ──
             {
@@ -483,18 +469,47 @@ pub(super) fn spawn_proactive_task(
 
                 match loop_result {
                     Ok(ref result) => {
-                        // Record tool executions to procedural memory.
+                        // Record proactive tool executions to Episodic.
+                        // Pain hook: failures also write a Procedural signal.
                         for exec in &result.tool_executions {
-                            let outcome = format!(
-                                "[proactive] Tool '{}' executed. Output (first 400 chars): {}",
+                            let status = if exec.success { "succeeded" } else { "failed" };
+                            let episodic_text = format!(
+                                "[proactive] Tool '{}' {} ({}ms). Output: {}",
                                 exec.tool_name,
+                                status,
+                                exec.duration_ms,
                                 safe_truncate(&exec.output, 400),
                             );
                             let _: Result<_, _> = s.memory.record(
-                                MemoryTier::Procedural,
-                                outcome,
+                                MemoryTier::Episodic,
+                                episodic_text,
                                 format!("proactive-tool:{}", exec.tool_name),
                             ).await;
+                            if !exec.success {
+                                let pain_text = format!(
+                                    "CAUTION: Proactive tool '{}' failed. Error: {}",
+                                    exec.tool_name,
+                                    safe_truncate(&exec.output, 200),
+                                );
+                                let _: Result<_, _> = s.memory.record(
+                                    MemoryTier::Procedural,
+                                    pain_text,
+                                    format!("proactive-tool-failure:{}", exec.tool_name),
+                                ).await;
+                            }
+                        }
+
+                        // Persist reasoning traces when enabled.
+                        if rt_clone.config.memory.store_reasoning_traces {
+                            for trace in &result.reasoning_traces {
+                                if !trace.is_empty() {
+                                    let _: Result<_, _> = s.memory.record(
+                                        MemoryTier::Reflective,
+                                        aigent_prompt::truncate_for_prompt(trace, 500),
+                                        "agent-reasoning".to_string(),
+                                    ).await;
+                                }
+                            }
                         }
 
                         let reply = result.content.trim();

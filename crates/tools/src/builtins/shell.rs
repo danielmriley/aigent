@@ -52,6 +52,16 @@ impl Tool for RunShellTool {
         let command = args
             .get("command")
             .ok_or_else(|| anyhow::anyhow!("missing required param: command"))?;
+
+        // Basic safety guards — the approval gate (safer/balanced mode) is the
+        // primary protection; these are a secondary defence-in-depth layer.
+        if command.len() > 8192 {
+            anyhow::bail!("command exceeds 8192-byte limit (got {} bytes)", command.len());
+        }
+        if command.contains('\0') {
+            anyhow::bail!("command must not contain null bytes");
+        }
+
         let timeout_secs: u64 = args
             .get("timeout_secs")
             .and_then(|v| v.parse().ok())

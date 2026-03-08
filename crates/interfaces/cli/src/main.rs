@@ -165,7 +165,7 @@ enum ToolCommands {
     Build,
     /// Show per-tool runtime status: WASM binary present or native fallback.
     Status,
-    /// Hot-reload dynamic skills from the skills directory.
+    /// Hot-reload dynamic modules from the modules directory.
     Reload,
 }
 

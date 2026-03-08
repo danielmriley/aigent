@@ -101,7 +101,7 @@ impl Tool for ReadFileTool {
             .and_then(|v| v.parse().ok())
             .unwrap_or(65536);
 
-        let content = std::fs::read_to_string(&full)?;
+        let content = tokio::fs::read_to_string(&full).await?;
         let truncated = if content.len() > max_bytes {
             let end = truncate_byte_boundary(&content, max_bytes);
             format!("{}…[truncated at {} bytes]", &content[..end], max_bytes)
@@ -173,10 +173,10 @@ impl Tool for WriteFileTool {
 
         // Ensure parent directories exist.
         if let Some(parent) = full.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
-        std::fs::write(&full, content)?;
+        tokio::fs::write(&full, content).await?;
         Ok(ToolOutput {
             success: true,
             output: format!("wrote {} bytes to {}", content.len(), rel_path),

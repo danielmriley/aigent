@@ -1,6 +1,5 @@
 //! Core agent runtime — configuration, LLM routing, and conversation orchestration.
 
-mod chat;
 mod proactive;
 mod reflection;
 mod sleep;

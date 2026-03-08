@@ -43,6 +43,7 @@ name = "aigent-agent"
 version = "0.1.0"
 dependencies = [
  "aigent-config",
+ "aigent-exec",
  "aigent-llm",
  "aigent-memory",
  "aigent-prompt",
