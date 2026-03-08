@@ -165,12 +165,11 @@ impl ToolExecutor {
         tool_name: &str,
         args: &HashMap<String, String>,
     ) -> Result<ToolOutput> {
-        // 1. Check if the tool exists
-        let tool = registry
-            .get(tool_name)
+        // 1. Check if the tool exists; retrieve cached metadata in the same
+        //    read-lock pass to avoid a second vtable dispatch + heap allocation.
+        let (tool, metadata) = registry
+            .get_with_metadata(tool_name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {tool_name}"))?;
-
-        let metadata = tool.spec().metadata;
 
         // 2. Enforce capability gates (deny-list / allow-list / shell guard / security level)
         self.check_capability(registry, tool_name, &metadata)?;

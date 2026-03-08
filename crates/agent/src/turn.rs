@@ -164,6 +164,7 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
         event_sink_ref,
         step_timeout,
         tool_timeout,
+        input.config.agent.max_steps_per_turn,
     )
     .await
 }
