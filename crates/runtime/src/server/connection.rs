@@ -107,7 +107,7 @@ pub(super) async fn handle_connection(
                 // MemoryManager stays in DaemonState the entire time so
                 // background tasks never see an empty shell.
                 let (rt_clone, recent, tool_specs, registry, executor, conv_summary,
-                     timing, verbose_routing,
+                     timing,
                      context, stats, identity_block, beliefs_block, user_name, relational_block,
                      memory_prep_elapsed) = {
                     let mut s = state.lock().await;
@@ -117,7 +117,6 @@ pub(super) async fn handle_connection(
                     let _: Result<_, _> = s.memory.record(aigent_memory::MemoryTier::Episodic, user.clone(), "user-input").await;
 
                     let t = rt.config.debug.timing;
-                    let vr = rt.config.debug.verbose_routing;
                     let phase_start = std::time::Instant::now();
 
                     // Build the system prompt using the existing prompt builder.
@@ -144,27 +143,18 @@ pub(super) async fn handle_connection(
                     let exe = Arc::clone(&s.tool_executor);
                     let csumm = s.conversation_summary.clone();
                     (rt, recent, specs, reg, exe, csumm,
-                     t, vr,
+                     t,
                      context, stats, identity_block, beliefs_block, user_name, relational_block,
                      mpe)
                 };
                 // Lock released — memory stays in DaemonState, accessible to background tasks.
 
-                // When external_thinking is active, the text-based JSON thinker
-                // needs the full tool list in the prompt (it doesn't use native
-                // tool calling).  Otherwise, tools go via the native API schema.
-                let tool_specs_for_prompt: &[aigent_tools::ToolSpec] =
-                    if rt_clone.config.agent.external_thinking {
-                        &tool_specs
-                    } else {
-                        &[]
-                    };
-
-                let mut prompt_inputs = aigent_prompt::PromptInputs {
+                // Tools always go as text in the external thinking system prompt.
+                let prompt_inputs = aigent_prompt::PromptInputs {
                     config: &rt_clone.config,
                     user_message: &user,
                     recent_turns: &recent,
-                    tool_specs: tool_specs_for_prompt,
+                    tool_specs: &tool_specs,
                     pending_follow_ups: &[],
                     context_items: &context,
                     stats,
@@ -176,82 +166,18 @@ pub(super) async fn handle_connection(
                     chat_only: false,
                 };
 
-                let primary = if rt_clone.config.llm.provider.to_lowercase() == "openrouter" {
-                    aigent_llm::Provider::OpenRouter
-                } else {
-                    aigent_llm::Provider::Ollama
-                };
-
-                // ── Small-model router ───────────────────────────────────────
-                // When enabled, classify the message as CHAT (simple
-                // conversation) or TOOLS (needs the full thinker loop).
-                //
-                // Resolve the effective router model once: when the config
-                // field is empty, fall back to the primary model to avoid
-                // VRAM model-swap overhead on single-GPU setups.
-                let (router_provider, router_model): (aigent_llm::Provider, String) = {
-                    let rcfg = &rt_clone.config.router;
-                    if rcfg.provider.eq_ignore_ascii_case("openrouter") {
-                        let m = if rcfg.openrouter_model.is_empty() {
-                            rt_clone.config.llm.openrouter_model.clone()
-                        } else {
-                            rcfg.openrouter_model.clone()
-                        };
-                        (aigent_llm::Provider::OpenRouter, m)
-                    } else {
-                        let m = if rcfg.ollama_model.is_empty() {
-                            rt_clone.config.llm.ollama_model.clone()
-                        } else {
-                            rcfg.ollama_model.clone()
-                        };
-                        (aigent_llm::Provider::Ollama, m)
-                    }
-                };
-
-                let router_start = std::time::Instant::now();
-                let router_decision = if rt_clone.config.router.enabled {
-                    aigent_thinker::route_query(
-                        &rt_clone.llm,
-                        router_provider,
-                        &router_model,
-                        &rt_clone.config.router.classify_system_prompt,
-                        std::time::Duration::from_secs(
-                            rt_clone.config.router.classify_timeout_seconds,
-                        ),
-                        &user,
-                        verbose_routing,
-                    )
-                    .await
-                } else {
-                    aigent_llm::RouterDecision::Tools // disabled → always full agent
-                };
-
-                // ── Dispatch based on router decision ────────────────────────
-                let router_elapsed = router_start.elapsed();
-                info!("[ROUTER] decision={:?} model={} provider={:?}",
-                    router_decision, router_model, router_provider);
-
-                // Defer prompt build until after routing so we build exactly
-                // once with the correct mode (chat_only vs full agent).
-                if router_decision == aigent_llm::RouterDecision::Chat {
-                    prompt_inputs.chat_only = true;
-                }
                 let build_start = std::time::Instant::now();
                 let system_prompt = aigent_prompt::build_chat_prompt(&prompt_inputs);
                 let build_elapsed = build_start.elapsed();
                 if timing {
-                    info!("[TIMING] memory_prep={}ms router={}ms prompt_build={}ms chars={} (~{} tokens)",
+                    info!("[TIMING] memory_prep={}ms prompt_build={}ms chars={} (~{} tokens)",
                         memory_prep_elapsed.as_millis(),
-                        router_elapsed.as_millis(),
                         build_elapsed.as_millis(),
                         system_prompt.len(),
                         system_prompt.len() / 4);
                 }
 
-                // Build the chat messages array.
-                // Include recent conversation turns as proper user/assistant
-                // pairs so the model has multi-turn context — not just the
-                // flattened text summary baked into the system prompt.
+                // Build the messages array: system + history + current user turn.
                 let mut messages = vec![aigent_llm::ChatMessage::system(&system_prompt)];
                 for turn in &recent {
                     messages.push(aigent_llm::ChatMessage::user(&turn.user));
@@ -259,158 +185,36 @@ pub(super) async fn handle_connection(
                 }
                 messages.push(aigent_llm::ChatMessage::user(&user));
 
-                // ── Parallel subagent reasoning ──────────────────────────────
-                // When enabled and the router chose the full TOOLS path, run
-                // specialist subagents (Researcher, Planner, Critic) in
-                // parallel.  Their debate is injected as a system-level
-                // context block so the Captain (main agent) can leverage
-                // multi-perspective reasoning.
-                if rt_clone.config.subagents.enabled
-                    && router_decision != aigent_llm::RouterDecision::Chat
-                {
-                    let subagent_start = std::time::Instant::now();
-                    let manager = aigent_agent::subagents::SubagentManager::new(
-                        &rt_clone.llm,
-                        &rt_clone.config.subagents,
-                        &rt_clone.config.llm.ollama_model,
-                        &rt_clone.config.llm.openrouter_model,
-                    );
-                    let team_results = manager
-                        .run_parallel_team(primary, &user, &system_prompt)
-                        .await;
-
-                    let debate_block =
-                        aigent_agent::subagents::SubagentManager::format_debate_block(
-                            &team_results,
-                        );
-
-                    if !debate_block.is_empty() {
-                        // Insert after the system prompt but before the user
-                        // message so the Captain sees the debate as context.
-                        let insert_pos = messages.len().saturating_sub(1);
-                        messages.insert(
-                            insert_pos,
-                            aigent_llm::ChatMessage::system(&format!(
-                                "SUBAGENT ANALYSIS (use these specialist perspectives to inform your response):\n{debate_block}"
-                            )),
-                        );
-                        info!(
-                            specialists = team_results.len(),
-                            elapsed_ms = subagent_start.elapsed().as_millis() as u64,
-                            "subagents: debate block injected into context"
-                        );
-                    } else {
-                        warn!("subagents: all specialists failed — proceeding without debate");
-                    }
-
-                    if timing {
-                        info!(
-                            "[TIMING] subagents={}ms specialists={}",
-                            subagent_start.elapsed().as_millis(),
-                            team_results.len()
-                        );
-                    }
-                }
-
+                // ── Unified agent turn ───────────────────────────────────────
+                // All reasoning goes through run_agent_turn — one pipeline,
+                // external thinking loop, optional sub-agent debate.
                 let llm_start = std::time::Instant::now();
-                let loop_result = if router_decision == aigent_llm::RouterDecision::Chat {
-                    // Fast path: skip tool loop, external thinking, and
-                    // reflection.  Stream a direct answer using the already-
-                    // built chat-only prompt.
-                    let chat_timeout = std::time::Duration::from_secs(
-                        rt_clone.config.router.chat_timeout_seconds,
-                    );
-                    match aigent_thinker::run_simple_chat(
-                        &rt_clone.llm,
-                        router_provider,
-                        &router_model,
-                        &messages,
-                        chunk_tx,
-                        chat_timeout,
-                    )
-                    .await
-                    {
-                        Ok(content) => Ok(aigent_thinker::ToolLoopResult {
-                            provider: router_provider,
-                            content,
-                            tool_executions: vec![],
-                        }),
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    // Full thinker path: tool loop with primary model.
 
-                    // Build native tool schemas for the LLM API.
-                    // When external_thinking is active, disable native tool schemas
-                    // entirely — the JSON thinker handles tool dispatch via its own
-                    // text protocol.  Sending both would give the model contradictory
-                    // instructions and cause it to freeze.
-                    let tools_json = if rt_clone.config.agent.external_thinking {
-                        None
-                    } else if tool_specs.is_empty() {
-                        None
-                    } else {
-                        Some(aigent_thinker::build_tools_json(&tool_specs))
+                // Bridge thinker events into the runtime BackendEvent system.
+                let event_tx_clone = event_tx.clone();
+                let event_sink = move |evt: aigent_thinker::ThinkerEvent| {
+                    use aigent_thinker::ThinkerEvent;
+                    let backend_evt = match evt {
+                        ThinkerEvent::ToolCallStart(info) => crate::BackendEvent::ToolCallStart(info),
+                        ThinkerEvent::ToolCallEnd(result) => crate::BackendEvent::ToolCallEnd(result),
+                        ThinkerEvent::AgentThought(thought) => crate::BackendEvent::AgentThought(thought),
                     };
-
-                    let step_timeout = std::time::Duration::from_secs(
-                        rt_clone.config.agent.step_timeout_seconds,
-                    );
-                    // Bridge thinker events into the runtime BackendEvent system.
-                    let event_tx_clone = event_tx.clone();
-                    let event_sink = move |evt: aigent_thinker::ThinkerEvent| {
-                        use aigent_thinker::ThinkerEvent;
-                        let backend_evt = match evt {
-                            ThinkerEvent::ToolCallStart(info) => crate::BackendEvent::ToolCallStart(info),
-                            ThinkerEvent::ToolCallEnd(result) => crate::BackendEvent::ToolCallEnd(result),
-                            ThinkerEvent::AgentThought(thought) => crate::BackendEvent::AgentThought(thought),
-                        };
-                        let _ = event_tx_clone.send(backend_evt);
-                    };
-
-                    // When external_thinking is active, use the JSON-intercepting
-                    // loop that parses the model's structured JSON output, emits
-                    // clean AgentThought events, executes tool calls internally,
-                    // and streams only the final_answer text to the user.
-                    // Otherwise, use the native structured tool calling loop.
-                    if rt_clone.config.agent.external_thinking {
-                        aigent_thinker::run_external_thinking_loop(
-                            &rt_clone.llm,
-                            primary,
-                            &rt_clone.config.llm.ollama_model,
-                            &rt_clone.config.llm.openrouter_model,
-                            &mut messages,
-                            &registry,
-                            &executor,
-                            chunk_tx,
-                            Some(&event_sink),
-                            step_timeout,
-                        ).await
-                    } else {
-                        aigent_thinker::run_tool_loop(
-                            &rt_clone.llm,
-                            primary,
-                            &rt_clone.config.llm.ollama_model,
-                            &rt_clone.config.llm.openrouter_model,
-                            &mut messages,
-                            tools_json.as_ref(),
-                            &registry,
-                            &executor,
-                            chunk_tx,
-                            Some(&event_sink),
-                            step_timeout,
-                        ).await
-                    }
+                    let _ = event_tx_clone.send(backend_evt);
                 };
+
+                let loop_result = aigent_agent::run_agent_turn(aigent_agent::AgentTurnInput {
+                    llm: &rt_clone.llm,
+                    config: &rt_clone.config,
+                    messages: &mut messages,
+                    registry: Arc::clone(&registry),
+                    executor: Arc::clone(&executor),
+                    token_tx: chunk_tx,
+                    event_sink: Some(Box::new(event_sink)),
+                }).await;
 
                 let llm_elapsed = llm_start.elapsed();
                 if timing {
-                    let path = if router_decision == aigent_llm::RouterDecision::Chat {
-                        "CHAT"
-                    } else {
-                        "TOOLS"
-                    };
-                    info!("[TIMING] llm_path={} llm_response={}ms", path, llm_elapsed.as_millis());
+                    info!("[TIMING] llm_response={}ms", llm_elapsed.as_millis());
                 }
 
                 let _ = streamer.await;
@@ -419,47 +223,85 @@ pub(super) async fn handle_connection(
                 // The canonical MemoryManager was never displaced from state,
                 // so any concurrent writes during the LLM call are preserved.
                 let memory_start = std::time::Instant::now();
-                let skip_reflection = rt_clone.config.agent.external_thinking
-                    || router_decision == aigent_llm::RouterDecision::Chat;
+                // External thinking always handles its own internal reasoning;
+                // a separate reflection pass is not needed.
+                let skip_reflection = true;
 
                 let outcome: Result<Vec<BackendEvent>, anyhow::Error> = {
                     let mut s = state.lock().await;
 
                     let reply_result: Result<String, anyhow::Error> = match loop_result {
                         Ok(ref result) => {
-                            // Record tool results to procedural memory
+                            // Record tool invocations to Episodic memory so
+                            // the sleep cycle can distill procedural patterns.
+                            // Raw tool logs belong in Episodic (transient);
+                            // Procedural is reserved for learned patterns.
+                            //
+                            // "Pain hook": tool failures also write a direct
+                            // Procedural memory so the agent has immediate
+                            // awareness of failure patterns even before the
+                            // next sleep cycle runs.
                             for exec in &result.tool_executions {
-                                let outcome = format!(
-                                    "Tool '{}' executed. Output (first 400 chars): {}",
+                                let status = if exec.success { "succeeded" } else { "failed" };
+                                let episodic_text = format!(
+                                    "Tool '{}' {} ({}ms). Output: {}",
                                     exec.tool_name,
+                                    status,
+                                    exec.duration_ms,
                                     safe_truncate(&exec.output, 400),
                                 );
                                 let _: Result<_, _> = s.memory.record(
-                                    MemoryTier::Procedural,
-                                    outcome,
-                                    format!("tool-use:{}", exec.tool_name),
+                                    MemoryTier::Episodic,
+                                    episodic_text,
+                                    format!("tool-log:{}", exec.tool_name),
                                 ).await;
+
+                                // Pain hook: failed tools → immediate Procedural signal.
+                                if !exec.success {
+                                    let pain_text = format!(
+                                        "CAUTION: Tool '{}' failed. Error: {}",
+                                        exec.tool_name,
+                                        safe_truncate(&exec.output, 200),
+                                    );
+                                    let _: Result<_, _> = s.memory.record(
+                                        MemoryTier::Procedural,
+                                        pain_text,
+                                        format!("tool-failure:{}", exec.tool_name),
+                                    ).await;
+                                }
                             }
                             // Record assistant reply
                             if !result.content.is_empty() {
-                                let model_tag = if router_decision == aigent_llm::RouterDecision::Chat {
-                                    format!("router:{}", router_model)
-                                } else {
-                                    rt_clone.config.active_model().to_string()
-                                };
+                                let model_tag = rt_clone.config.active_model().to_string();
                                 let _: Result<_, _> = s.memory.record(
                                     aigent_memory::MemoryTier::Episodic,
                                     aigent_prompt::truncate_for_prompt(&result.content, 1024),
                                     format!("assistant-reply:model={}", model_tag),
                                 ).await;
                             }
+                            // Persist reasoning traces when enabled.
+                            if rt_clone.config.memory.store_reasoning_traces {
+                                for trace in &result.reasoning_traces {
+                                    if !trace.is_empty() {
+                                        let _: Result<_, _> = s.memory.record(
+                                            aigent_memory::MemoryTier::Reflective,
+                                            aigent_prompt::truncate_for_prompt(trace, 500),
+                                            "agent-reasoning".to_string(),
+                                        ).await;
+                                    }
+                                }
+                            }
                             Ok(result.content.clone())
                         }
                         Err(e) => Err(e),
                     };
 
-                    // Reflect on the exchange — skip when using external thinking
-                    // mode or the router CHAT fast-path.
+                    // Reflect on the exchange — skip when:
+                    //  • external thinking mode is active (has its own loop)
+                    //  • the router took the CHAT fast-path
+                    //  • `memory.reflection_enabled` is false (saves LLM tokens)
+                    let skip_reflection = skip_reflection
+                        || !rt_clone.config.memory.reflection_enabled;
                     let reflect_events: Vec<BackendEvent> = if skip_reflection {
                         vec![]
                     } else {
@@ -563,15 +405,13 @@ pub(super) async fn handle_connection(
                 if timing {
                     let total = turn_start.elapsed();
                     info!(
-                        "[TIMING] turn_total={}ms mem_prep={}ms router={}ms build={}ms llm={}ms memory+reflect={}ms path={} model={}",
+                        "[TIMING] turn_total={}ms mem_prep={}ms build={}ms llm={}ms memory={}ms model={}",
                         total.as_millis(),
                         memory_prep_elapsed.as_millis(),
-                        router_elapsed.as_millis(),
                         build_elapsed.as_millis(),
                         llm_elapsed.as_millis(),
                         memory_elapsed.as_millis(),
-                        if router_decision == aigent_llm::RouterDecision::Chat { "CHAT" } else { "TOOLS" },
-                        if router_decision == aigent_llm::RouterDecision::Chat { &router_model } else { rt_clone.config.active_model() },
+                        rt_clone.config.active_model(),
                     );
                 }
 
@@ -620,8 +460,10 @@ pub(super) async fn handle_connection(
                 .await;
             match result {
                 Ok(output) => {
-                    // Record tool outcome so the sleep cycle can reason about
-                    // tool-use patterns and add TOOL_INSIGHT entries.
+                    // Record tool outcome to Episodic so the sleep cycle can
+                    // reason about tool-use patterns. Raw logs belong in Episodic
+                    // (transient); Procedural is for distilled patterns the sleep
+                    // cycle extracts from these Episodic entries.
                     let outcome_text = format!(
                         "Tool '{}' {}: {}",
                         name,
@@ -629,11 +471,20 @@ pub(super) async fn handle_connection(
                         safe_truncate(&output.output, 200),
                     );
                     if let Err(err) = state.memory.record(
-                        MemoryTier::Procedural,
+                        MemoryTier::Episodic,
                         outcome_text,
-                        format!("tool-execution:{name}"),
+                        format!("tool-log:{name}"),
                     ).await {
-                        warn!(?err, tool = %name, "failed to record tool outcome to procedural memory");
+                        warn!(?err, tool = %name, "failed to record tool outcome to episodic memory");
+                    }
+                    // Pain hook: tool ran but returned failure → Procedural signal.
+                    if !output.success {
+                        let _ = state.memory.record(
+                            MemoryTier::Procedural,
+                            format!("CAUTION: Tool '{}' failed. Error: {}", name,
+                                safe_truncate(&output.output, 200)),
+                            format!("tool-failure:{name}"),
+                        ).await;
                     }
                     send_event(
                         &mut write_half,
@@ -645,6 +496,13 @@ pub(super) async fn handle_connection(
                     .await?;
                 }
                 Err(err) => {
+                    // Record executor-level failures (policy denial, unknown tool,
+                    // rate limit) to Episodic so the sleep cycle can surface them.
+                    let _ = state.memory.record(
+                        MemoryTier::Episodic,
+                        format!("Tool '{}' rejected by executor: {}", name, err),
+                        format!("tool-error:{name}"),
+                    ).await;
                     send_event(
                         &mut write_half,
                         ServerEvent::ToolResult {
@@ -669,19 +527,19 @@ pub(super) async fn handle_connection(
             let _ = dotenvy::from_path_override(std::path::Path::new(".env"));
             let updated = AppConfig::load_from("config/default.toml")?;
 
-            // Hot-reload dynamic skills when the skills subsystem is enabled
+            // Hot-reload dynamic modules when the modules subsystem is enabled
             // and auto_reload is on.
-            let skills_msg = if updated.tools.skills.enabled && updated.tools.skills.auto_reload {
-                reload_dynamic_skills(&state.tool_registry, &updated)
+            let modules_msg = if updated.tools.modules.enabled && updated.tools.modules.auto_reload {
+                reload_dynamic_modules(&state.tool_registry, &updated)
             } else {
                 String::new()
             };
 
             state.runtime.config = updated;
-            let msg = if skills_msg.is_empty() {
+            let msg = if modules_msg.is_empty() {
                 "config reloaded".to_string()
             } else {
-                format!("config reloaded; {skills_msg}")
+                format!("config reloaded; {modules_msg}")
             };
             send_event(
                 &mut write_half,
@@ -691,10 +549,10 @@ pub(super) async fn handle_connection(
         }
         ClientCommand::ReloadTools => {
             let state = state.lock().await;
-            let msg = if state.runtime.config.tools.skills.enabled {
-                reload_dynamic_skills(&state.tool_registry, &state.runtime.config)
+            let msg = if state.runtime.config.tools.modules.enabled {
+                reload_dynamic_modules(&state.tool_registry, &state.runtime.config)
             } else {
-                "skills subsystem is disabled".to_string()
+                "modules subsystem is disabled".to_string()
             };
             send_event(
                 &mut write_half,
@@ -971,23 +829,23 @@ async fn send_event(
     Ok(())
 }
 
-// ── Dynamic skill reload ─────────────────────────────────────────────────────
+// ── Dynamic module reload ─────────────────────────────────────────────────────
 
-/// Scan the configured skills directory for `.wasm` files and register them
-/// as dynamic tools (replacing any previously loaded dynamic skills).
+/// Scan the configured modules directory for `.wasm` files and register them
+/// as dynamic tools (replacing any previously loaded dynamic modules).
 ///
 /// This is a *synchronous* registry mutation — safe to call while holding
 /// the `DaemonState` mutex because the RwLock inside `ToolRegistry` is a
 /// `std::sync::RwLock`, not a tokio one.
-fn reload_dynamic_skills(
+fn reload_dynamic_modules(
     registry: &aigent_tools::ToolRegistry,
     config: &aigent_config::AppConfig,
 ) -> String {
     use std::path::Path;
 
-    let skills_cfg = &config.tools.skills;
+    let modules_cfg = &config.tools.modules;
     let workspace = Path::new(&config.agent.workspace_path);
-    let skills_dir = workspace.join(&skills_cfg.skills_dir);
+    let modules_dir = workspace.join(&modules_cfg.modules_dir);
 
     // Remove all previously loaded dynamic tools.
     let old_names = registry.dynamic_tool_names();
@@ -995,36 +853,36 @@ fn reload_dynamic_skills(
         registry.unregister(name);
     }
 
-    if !skills_dir.is_dir() {
+    if !modules_dir.is_dir() {
         if old_names.is_empty() {
-            return "skills dir not found; nothing to load".to_string();
+            return "modules dir not found; nothing to load".to_string();
         }
         return format!(
-            "skills dir not found; unloaded {} previous dynamic tool(s)",
+            "modules dir not found; unloaded {} previous dynamic tool(s)",
             old_names.len()
         );
     }
 
-    // Discover .wasm files in the skills directory.
+    // Discover .wasm files in the modules directory.
     let mut loaded: Vec<String> = Vec::new();
-    let max = if skills_cfg.max_skills == 0 {
+    let max = if modules_cfg.max_modules == 0 {
         usize::MAX
     } else {
-        skills_cfg.max_skills
+        modules_cfg.max_modules
     };
 
-    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+    if let Ok(entries) = std::fs::read_dir(&modules_dir) {
         for entry in entries.flatten() {
             if loaded.len() >= max {
                 warn!(
-                    max_skills = skills_cfg.max_skills,
-                    "hit max_skills limit — ignoring remaining skills"
+                    max_modules = modules_cfg.max_modules,
+                    "hit max_modules limit — ignoring remaining modules"
                 );
                 break;
             }
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
-                // For now, log the discovered skill.  Actual WASM instantiation
+                // For now, log the discovered module.  Actual WASM instantiation
                 // will be wired up in Phase 2 (sandboxed compilation pipeline).
                 // This ensures the discovery + registration plumbing is tested.
                 let stem = path
@@ -1032,14 +890,14 @@ fn reload_dynamic_skills(
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                info!(skill = %stem, path = %path.display(), "discovered dynamic skill");
+                info!(module = %stem, path = %path.display(), "discovered dynamic module");
                 loaded.push(stem);
             }
         }
     }
 
     let msg = format!(
-        "skills reload: unloaded {} old, discovered {} new dynamic tool(s)",
+        "modules reload: unloaded {} old, discovered {} new dynamic tool(s)",
         old_names.len(),
         loaded.len()
     );

@@ -123,6 +123,35 @@ pub fn remove_task(path: &Path, name: &str) -> Result<bool> {
 mod tests {
     use super::*;
 
+    /// Verify that `TaskEntry` can round-trip a representative JSON fixture
+    /// that uses every field.  Keep this in sync with the `schema_parity` test
+    /// in `aigent-tools/src/builtins/scheduler.rs` — both must parse the same
+    /// JSON without error (schema parity assertion).
+    #[test]
+    fn schema_parity() {
+        let json = r#"{
+            "name": "daily-summary",
+            "interval_secs": null,
+            "cron_expr": "0 0 9 * * *",
+            "action_prompt": "Summarise today's todos",
+            "cooldown_secs": 300,
+            "dnd_window": [22, 7],
+            "enabled": true
+        }"#;
+        let entry: TaskEntry = serde_json::from_str(json).expect("should parse");
+        assert_eq!(entry.name, "daily-summary");
+        assert_eq!(entry.cron_expr.as_deref(), Some("0 0 9 * * *"));
+        assert_eq!(entry.cooldown_secs, 300);
+        assert_eq!(entry.dnd_window, Some((22, 7)));
+        assert!(entry.enabled);
+
+        // Re-serialise and confirm all expected keys are present.
+        let out = serde_json::to_string(&entry).unwrap();
+        for key in &["name", "cron_expr", "action_prompt", "cooldown_secs", "dnd_window", "enabled"] {
+            assert!(out.contains(key), "missing key {key} in serialised output");
+        }
+    }
+
     #[test]
     fn roundtrip_tasks() {
         let dir = tempfile::tempdir().unwrap();

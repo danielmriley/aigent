@@ -29,7 +29,7 @@ pub enum ClientCommand {
     ExecuteTool { name: String, args: HashMap<String, String> },
     ListTools,
     ReloadConfig,
-    /// Hot-reload dynamic skills from the skills directory without touching
+    /// Hot-reload dynamic modules from the modules directory without touching
     /// the main config.
     ReloadTools,
     Shutdown,

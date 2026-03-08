@@ -7,12 +7,14 @@ user_name = ""
 workspace_path = "./workspace"
 thinking_level = "balanced"
 
-# Externalized reasoning mode.  When true, the agent outputs short JSON
-# steps instead of long internal monologues.  Best for large local models
-# (e.g. Qwen 3.5 35B MoE via Ollama) that tend to timeout during long
-# unstructured reasoning.
+# Externalized reasoning mode.  Must be true — run_agent_turn always uses the
+# external thinking loop, and this flag gates the JSON format instructions in
+# the system prompt.  Setting it false means the model never receives the
+# expected output schema and will respond in plain text.
+# Also causes "think: false" to be sent in every Ollama request, which prevents
+# the model's native chain-of-thought from polluting the structured JSON output.
 # Toggle at runtime: /thinking external  or  /thinking model
-external_thinking = false
+external_thinking = true
 # Per-step timeout in seconds (only in external thinking mode).
 step_timeout_seconds = 12
 # Maximum reasoning steps per turn.
@@ -237,33 +239,6 @@ candle_device = "cpu"
 # concurrently (set OLLAMA_MAX_LOADED_MODELS=2), you can set ollama_model
 # to a small model like "qwen3.5:0.8b" for even faster classification and
 # responses.
-[router]
-enabled = false
-
-# Which provider the router model lives on: "ollama" or "openrouter".
-provider = "ollama"
-
-# Model to use for classification and fast-path chat.
-# When empty (the default), the router reuses the primary model from [llm]
-# — zero VRAM overhead.  Set to a specific model only if your GPU can
-# keep both loaded simultaneously.
-ollama_model = ""
-openrouter_model = ""
-
-# Timeout for the classification call (seconds).  Falls back to TOOLS on timeout.
-classify_timeout_seconds = 8
-# Timeout for the router model's chat response (seconds).
-chat_timeout_seconds = 45
-
-# Classification system prompt.  Uncomment to override the built-in default.
-# classify_system_prompt = "..."
-
-# ── Debug and observability ──────────────────────────────────────────────────
-
-# ── Parallel subagent reasoning ─────────────────────────────────────────────
-# When enabled, complex queries are evaluated by multiple specialist agents
-# (Researcher, Planner, Critic) running in parallel before the main agent
-# responds.  Requires OLLAMA_NUM_PARALLEL >= 3 on the Ollama server.
 [subagents]
 enabled = false
 
@@ -288,8 +263,5 @@ log_to_file = true
 # Log full details for each router classify call: the system prompt sent,
 # the raw model response, and per-phase timing.  Useful when diagnosing
 # why the router picks TOOLS vs CHAT.
-verbose_routing = false
-
-# Log per-turn timing breakdowns: prompt build, router classify, LLM
 # response, memory writes, reflection, and total wall-clock time.
 timing = true

@@ -1,3 +1,4 @@
+pub mod gait;
 pub mod git;
 pub mod sandbox;
 
@@ -523,11 +524,10 @@ pub fn default_registry(
     use aigent_tools::builtins::{
         BrowsePageTool, CalendarAddEventTool, CpTool, CutTool, DraftEmailTool,
         EchoTool, FindTool, GetCurrentDatetimeTool, GitRollbackTool, GrepTool, HeadTool,
-        ListDirTool, MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool,
+        ListDirTool, ListModulesTool, MkdirTool, MvTool, ReadFileTool, RemindMeTool, RmTool,
         RunShellTool, SedTool, SeqTool, SortTool, TailTool, TouchTool, TreeTool,
         UniqTool, WcTool, WebSearchTool, WorkspaceStatusTool,
         WriteFileTool, CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool,
-        ListSkillsTool,
     };
 
     let registry = ToolRegistry::default();
@@ -694,15 +694,22 @@ pub fn default_registry(
             Box::new(ListCronJobsTool),
         ),
         (
-            "list_skills",
-            Box::new(ListSkillsTool {
-                skills_dir: workspace_root.join("extensions/skills"),
+            "list_modules",
+            Box::new(ListModulesTool {
+                modules_dir: workspace_root.join("extensions/modules"),
             }),
         ),
         // ── Utility ────────────────────────────────────────────────────
         (
             "get_current_datetime",
             Box::new(GetCurrentDatetimeTool),
+        ),
+        // ── Safe in-process git (preferred over run_shell git) ──────────
+        (
+            "perform_gait",
+            Box::new(crate::gait::GaitTool {
+                policy: crate::gait::GaitPolicy::with_workspace_root(workspace_root.clone()),
+            }),
         ),
     ];
 

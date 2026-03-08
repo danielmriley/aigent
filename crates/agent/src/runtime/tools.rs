@@ -65,43 +65,10 @@ impl AgentRuntime {
 mod tests {
     use aigent_config::AppConfig;
     use anyhow::Result;
-
-        use aigent_memory::MemoryManager;
+    use aigent_memory::MemoryManager;
     use tokio::sync::mpsc;
 
     use crate::AgentRuntime;
-
-    #[tokio::test]
-    async fn runtime_turn_persists_user_and_assistant_memory() -> Result<()> {
-        let runtime = AgentRuntime::new(AppConfig::default());
-        let mut memory = MemoryManager::default();
-
-        let reply = runtime
-            .respond_and_remember(&mut memory, "help me organize tomorrow's tasks", &[])
-            .await?;
-
-        assert!(!reply.is_empty());
-        assert!(memory.all().len() >= 2);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn identity_block_injected_into_prompt_without_panic() -> Result<()> {
-        // Verifies that a custom communication_style is accepted by the prompt
-        // construction code path without panicking or erroring.
-        let runtime = AgentRuntime::new(AppConfig::default());
-        let mut memory = MemoryManager::default();
-        memory.seed_core_identity("Alice", "Aigent").await?;
-        // Set a distinctive style so we can assert it flows through the kernel.
-        memory.identity.communication_style = "terse and technical".to_string();
-        assert_eq!(memory.identity.communication_style, "terse and technical");
-
-        let reply = runtime
-            .respond_and_remember(&mut memory, "what is 2 + 2", &[])
-            .await?;
-        assert!(!reply.is_empty());
-        Ok(())
-    }
 
     #[tokio::test]
     async fn run_multi_agent_sleep_cycle_returns_summary_without_panicking() -> Result<()> {

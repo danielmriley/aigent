@@ -26,7 +26,7 @@
 //! 3. Dispatches the parsed step (emit thought, execute tool, or return answer).
 //! 4. Appends the assistant reply + tool observation to `messages` and loops.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -44,11 +44,16 @@ use crate::tool_loop::{EventSink, ToolExecution, ToolLoopResult};
 /// Maximum number of tool-call → observation → re-prompt rounds.
 const MAX_EXT_ROUNDS: usize = 10;
 
+/// Maximum wall-clock time for a single tool execution.
+/// Separate from `step_timeout` (which covers LLM inference).
+const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Run the external thinking loop.
 ///
-/// This replaces `run_tool_loop` when `external_thinking` is active.
-/// The model is called in plain-text mode (no native tool schemas) and
-/// its JSON output is intercepted, parsed, and routed cleanly.
+/// The model is called in plain-text mode (no native tool schemas).
+/// Its output is intercepted, parsed as structured JSON steps, and routed:
+/// tool calls are executed and fed back; a `final_answer` step terminates
+/// the loop and delivers clean text to the user.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_external_thinking_loop(
     llm: &LlmRouter,
@@ -63,7 +68,12 @@ pub async fn run_external_thinking_loop(
     step_timeout: Duration,
 ) -> Result<ToolLoopResult> {
     let mut all_executions: Vec<ToolExecution> = Vec::new();
+    let mut reasoning_traces: Vec<String> = Vec::new();
     let final_provider = primary;
+    // Circuit breaker: track (tool_name, canonical_args) pairs we've already
+    // executed.  An exact repeat signals an infinite loop — we inject an error
+    // and force a final_answer instead of running indefinitely.
+    let mut seen_tool_calls: HashSet<(String, String)> = HashSet::new();
 
     for round in 0..MAX_EXT_ROUNDS {
         // Log prompt size on the first step so we can spot bloated prompts
@@ -108,7 +118,7 @@ pub async fn run_external_thinking_loop(
             None,   // no native tool schemas — the JSON prompt handles dispatch
             drain_tx,
             false,
-            false,
+            true,   // always suppress native thinking — ext_loop IS the thinking mechanism
         );
 
         // Wait for the LLM to finish (or timeout).
@@ -142,6 +152,7 @@ pub async fn run_external_thinking_loop(
                 provider: final_provider,
                 content: fallback,
                 tool_executions: all_executions,
+                reasoning_traces,
             });
         }
 
@@ -189,6 +200,7 @@ pub async fn run_external_thinking_loop(
                     provider: final_provider,
                     content: fallback,
                     tool_executions: all_executions,
+                    reasoning_traces,
                 });
             }
         };
@@ -196,12 +208,25 @@ pub async fn run_external_thinking_loop(
         // ── Dispatch based on step type ──────────────────────────────────
         match step {
             AgentStep::FinalAnswer { thought, answer } => {
-                // Emit the model's chain-of-thought for UI display.
+                info!(round, thought_len = thought.len(), answer_len = answer.len(), "ext_loop: final_answer");
+
+                // Collect and emit the model's chain-of-thought.
                 if !thought.is_empty() {
+                    reasoning_traces.push(thought.clone());
                     if let Some(sink) = event_sink {
                         sink(ThinkerEvent::AgentThought(thought));
                     }
                 }
+
+                // If the model emitted a valid final_answer JSON but left the
+                // answer field empty, fall back to the raw LLM output so the
+                // user sees *something* rather than a blank response.
+                let answer = if answer.is_empty() {
+                    warn!(round, "final_answer field empty — falling back to raw LLM text");
+                    full_text.clone()
+                } else {
+                    answer
+                };
 
                 // Stream the clean answer to the user (no raw JSON).
                 let _ = user_token_tx.send(answer.clone()).await;
@@ -213,14 +238,16 @@ pub async fn run_external_thinking_loop(
                     provider: final_provider,
                     content: answer,
                     tool_executions: all_executions,
+                    reasoning_traces,
                 });
             }
 
             AgentStep::ToolCall { thought, tool_name, args } => {
                 info!(round, tool = %tool_name, "external thinking: tool call");
 
-                // Emit the model's chain-of-thought.
+                // Collect and emit the model's chain-of-thought.
                 if !thought.is_empty() {
+                    reasoning_traces.push(thought.clone());
                     if let Some(sink) = event_sink {
                         sink(ThinkerEvent::AgentThought(thought));
                     }
@@ -305,6 +332,39 @@ pub async fn run_external_thinking_loop(
                     }
                 }
 
+                // ── Repeated-call circuit breaker ───────────────────────
+                //
+                // Build a canonical key for (tool_name, args) using sorted
+                // keys so insertion order doesn't matter.  If we've already
+                // executed this exact call in this turn, the model is looping:
+                // inject an error and force it to produce a final_answer.
+                {
+                    let canonical: std::collections::BTreeMap<_, _> = args.iter().collect();
+                    let call_key = (
+                        tool_name.clone(),
+                        serde_json::to_string(&canonical).unwrap_or_default(),
+                    );
+                    if seen_tool_calls.contains(&call_key) {
+                        warn!(round, tool = %tool_name, "repeated tool call detected — circuit breaking");
+
+                        if let Some(sink) = event_sink {
+                            sink(ThinkerEvent::AgentThought(format!(
+                                "Detected repeated call to '{tool_name}' with identical args — breaking loop."
+                            )));
+                        }
+
+                        messages.push(ChatMessage::assistant(&full_text));
+                        messages.push(ChatMessage::user(&format!(
+                            "ERROR: You already called '{tool_name}' with these exact arguments and \
+                             received a result. Calling it again would loop forever. \
+                             You MUST now produce a {{\"type\":\"final_answer\",...}} response \
+                             using the information you already have. No further tool calls."
+                        )));
+                        continue;
+                    }
+                    seen_tool_calls.insert(call_key);
+                }
+
                 // Emit ToolCallStart event for UI.
                 let call_info = ToolCallInfo {
                     name: tool_name.clone(),
@@ -326,13 +386,22 @@ pub async fn run_external_thinking_loop(
                     })
                     .collect();
 
-                // Execute the tool.
+                // Execute the tool (with per-tool timeout, separate from the
+                // LLM step timeout so a slow shell command doesn't cancel inference).
                 let start = Instant::now();
-                let result = tool_executor.execute(tool_registry, &tool_name, &string_args).await;
+                let exec_result = tokio::time::timeout(
+                    TOOL_TIMEOUT,
+                    tool_executor.execute(tool_registry, &tool_name, &string_args),
+                ).await;
                 let duration_ms = start.elapsed().as_millis() as u64;
-                let (success, output) = match result {
-                    Ok(ref o) => (o.success, o.output.clone()),
-                    Err(ref e) => (false, e.to_string()),
+                let (success, output) = match exec_result {
+                    Ok(Ok(ref o)) => (o.success, o.output.clone()),
+                    Ok(Err(ref e)) => (false, e.to_string()),
+                    Err(_) => {
+                        warn!(round, tool = %tool_name, timeout_secs = TOOL_TIMEOUT.as_secs(),
+                              "tool execution timed out");
+                        (false, format!("ERROR: Tool '{tool_name}' timed out after {}s.", TOOL_TIMEOUT.as_secs()))
+                    }
                 };
 
                 // Emit ToolCallEnd event for UI.
@@ -395,7 +464,9 @@ pub async fn run_external_thinking_loop(
     let fallback = if all_executions.is_empty() {
         "I was unable to complete the request within the allowed number of steps.".to_string()
     } else {
-        "I was unable to formulate a complete answer within the allowed steps,          but I have gathered some tool data in the background. Please try again          or rephrase your question.".to_string()
+        "I was unable to formulate a complete answer within the allowed steps, \
+         but I have gathered some tool data in the background. Please try again \
+         or rephrase your question.".to_string()
     };
     let _ = user_token_tx.send(fallback.clone()).await;
 
@@ -403,5 +474,6 @@ pub async fn run_external_thinking_loop(
         provider: final_provider,
         content: fallback,
         tool_executions: all_executions,
+        reasoning_traces,
     })
 }

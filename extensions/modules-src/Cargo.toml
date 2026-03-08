@@ -1,0 +1,14 @@
+# Workspace manifest for WASM modules.
+# Module crates are added here as workspace members by new-module.sh.
+# Build with: ./build.sh [module-name]
+
+[workspace]
+members = []
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+serde_json = "1"

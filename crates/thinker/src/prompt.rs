@@ -31,8 +31,8 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          TOOL CALL: {\"type\":\"tool_call\",\"thought\":\"<why>\",\"tool_call\":{\"name\":\"<TOOL>\",\"args\":{...}}}\n\
          FINAL ANSWER: {\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<response>\"}\n\n\
          Use a tool for anything that needs current/live data (files, web, system info).\n\
-         For date/time questions, use CURRENT_DATETIME from the CURRENT CONTEXT section, \
-         or call get_current_datetime.\n\n",
+         For date/time questions, read CURRENT_DATETIME from the CURRENT CONTEXT section \
+         — the value is already there, no tool call needed.\n\n",
     );
 
     // ── Anti-announcement / strict action rule ─────────────────────────
@@ -66,19 +66,35 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
     // ── Temporal grounding rule ─────────────────────────────────────────
     buf.push_str(
         "TEMPORAL AWARENESS RULE:\n\
-         CURRENT_DATETIME is provided in the CURRENT CONTEXT section of this prompt. \
-         When answering questions about 'next', 'upcoming', or 'future' events, you MUST \
-         strictly compare dates found in tool results against CURRENT_DATETIME. \
-         NEVER present an event from the past as an upcoming event. \
-         Ignore outdated search results and tell the user if no future-dated information was found.\n\n",
+         CURRENT_DATETIME is already in the CURRENT CONTEXT section — use it directly, \
+         never call a tool just to get the date or time. \
+         When answering about 'next', 'upcoming', or 'future' events, compare dates in \
+         tool results against CURRENT_DATETIME. \
+         NEVER present a past event as upcoming. \
+         Ignore outdated search results and tell the user if no future data was found.\n\n",
     );
 
     // ── Compact tool list + web workflow hint ─────────────────────────────
     if !tool_specs.is_empty() {
-        buf.push_str("TOOLS: ");
-        let names: Vec<&str> = tool_specs.iter().map(|s| s.name.as_str()).collect();
-        buf.push_str(&names.join(", "));
-        buf.push_str("\nrun_shell can execute ANY shell command (ls, curl, etc.)\n");
+        buf.push_str("TOOLS (* = required param, [x|y] = allowed values):\n");
+        for spec in tool_specs {
+            if spec.params.is_empty() {
+                buf.push_str(&format!("• {}()\n", spec.name));
+            } else {
+                let params: Vec<String> = spec.params.iter().map(|p| {
+                    let mut s = p.name.clone();
+                    if p.required { s.push('*'); }
+                    if !p.enum_values.is_empty() {
+                        s.push('[');
+                        s.push_str(&p.enum_values.join("|"));
+                        s.push(']');
+                    }
+                    s
+                }).collect();
+                buf.push_str(&format!("• {}({})\n", spec.name, params.join(", ")));
+            }
+        }
+        buf.push_str("run_shell can execute ANY shell command (ls, curl, etc.)\n");
 
         // Teach the search->browse two-step pattern so the model doesn't
         // hallucinate from search snippets alone.
@@ -104,20 +120,37 @@ pub fn build_external_thinking_block(tool_specs: &[aigent_tools::ToolSpec]) -> S
          (e.g. web_search, browse_page, run_shell) to accomplish the task instead.\n\n",
     );
 
-    // ── Capabilities awareness / list_skills directive ───────────────
+    // ── Capabilities awareness / list_modules directive ──────────────
     //
-    // When the model has access to list_skills, it should call it rather
+    // When the model has access to list_modules, it should call it rather
     // than guessing or giving a vague answer about its capabilities.
-    if tool_specs.iter().any(|s| s.name == "list_skills") {
+    if tool_specs.iter().any(|s| s.name == "list_modules") {
         buf.push_str(
             "CAPABILITIES RULE:\n\
              When the user asks about your capabilities, what you can do, your tools, \
-             or your skills, you MUST call the `list_skills` tool to get an accurate, \
+             or your modules, you MUST call the `list_modules` tool to get an accurate, \
              up-to-date list. NEVER guess or give a vague summary from memory — the \
-             skill registry is dynamic and may have changed. Call list_skills first, \
+             module registry is dynamic and may have changed. Call list_modules first, \
              then summarize the results in your final_answer.\n\n",
         );
     }
+
+    // ── Autonomy directive (compact) ─────────────────────────────────
+    //
+    // The full AUTONOMOUS AGENT DIRECTIVE and MODULE CREATION DIRECTIVE live
+    // in the prose tools section, which is suppressed in ext_think mode.
+    // This compact version ensures key behaviours are always in scope.
+    buf.push_str(
+        "AUTONOMY RULE:\n\
+         You are an autonomous agent — act, do not just announce.\n\
+         • Schedule background research: create_cron_job with a clear action_prompt.\n\
+         • Build reusable tools: scaffold in extensions/modules-src/ via run_shell, \
+           implement src/main.rs (stdin→JSON args, stdout→{\"success\":bool,\"output\":str}), \
+           build with build.sh, then reload with run_shell(command=\"aigent tools reload\").\n\
+         • At proactive wake-up: call list_cron_jobs and search_memory before deciding what to do.\n\
+         • Do NOT put intended future actions in final_answer — either act now (tool_call) \
+           or schedule them (create_cron_job).\n\n",
+    );
 
     // ── Retry-limit / termination rule ────────────────────────────────
     buf.push_str(
@@ -165,7 +198,7 @@ mod tests {
         assert!(block.contains("JSON AGENT MODE"));
         assert!(block.contains("tool_call"));
         assert!(block.contains("final_answer"));
-        assert!(!block.contains("TOOLS:"));
+        assert!(!block.contains("TOOLS ("));
     }
 
     #[test]
@@ -182,8 +215,11 @@ mod tests {
             metadata: aigent_tools::ToolMetadata::default(),
         }];
         let block = build_external_thinking_block(&specs);
-        assert!(block.contains("TOOLS:"));
+        assert!(block.contains("TOOLS ("));
         assert!(block.contains("read_file"));
+        // Required params marked with *
+        assert!(block.contains("path*"), "required param should have * suffix");
+        assert!(block.contains("• read_file(path*)"), "compact signature should appear");
     }
 
     #[test]
@@ -236,7 +272,7 @@ mod tests {
         let block = build_external_thinking_block(&[]);
         assert!(block.contains("TEMPORAL AWARENESS RULE"));
         assert!(block.contains("CURRENT_DATETIME"));
-        assert!(block.contains("NEVER present an event from the past"));
+        assert!(block.contains("NEVER present a past event as upcoming"));
     }
 
     #[test]
@@ -270,20 +306,20 @@ mod tests {
     }
 
     #[test]
-    fn external_thinking_block_has_list_skills_rule_when_present() {
+    fn external_thinking_block_has_list_modules_rule_when_present() {
         let specs = vec![aigent_tools::ToolSpec {
-            name: "list_skills".to_string(),
-            description: "List available skills".to_string(),
+            name: "list_modules".to_string(),
+            description: "List available modules".to_string(),
             params: vec![],
             metadata: aigent_tools::ToolMetadata::default(),
         }];
         let block = build_external_thinking_block(&specs);
         assert!(block.contains("CAPABILITIES RULE"));
-        assert!(block.contains("list_skills"));
+        assert!(block.contains("list_modules"));
     }
 
     #[test]
-    fn external_thinking_block_no_list_skills_rule_when_absent() {
+    fn external_thinking_block_no_list_modules_rule_when_absent() {
         let specs = vec![aigent_tools::ToolSpec {
             name: "web_search".to_string(),
             description: "Search the web".to_string(),
@@ -292,5 +328,37 @@ mod tests {
         }];
         let block = build_external_thinking_block(&specs);
         assert!(!block.contains("CAPABILITIES RULE"));
+    }
+
+    #[test]
+    fn external_thinking_block_shows_enum_values_in_params() {
+        let specs = vec![aigent_tools::ToolSpec {
+            name: "write_memory".to_string(),
+            description: "Write to memory".to_string(),
+            params: vec![
+                aigent_tools::ToolParam {
+                    name: "content".to_string(),
+                    description: "content to store".to_string(),
+                    required: true,
+                    ..Default::default()
+                },
+                aigent_tools::ToolParam {
+                    name: "tier".to_string(),
+                    description: "memory tier".to_string(),
+                    required: false,
+                    enum_values: vec![
+                        "episodic".to_string(),
+                        "semantic".to_string(),
+                        "reflective".to_string(),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            metadata: aigent_tools::ToolMetadata::default(),
+        }];
+        let block = build_external_thinking_block(&specs);
+        assert!(block.contains("content*"), "required param should have *");
+        assert!(block.contains("tier[episodic|semantic|reflective]"), "enum values should appear in brackets");
+        assert!(block.contains("• write_memory(content*, tier[episodic|semantic|reflective])"));
     }
 }

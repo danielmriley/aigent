@@ -167,6 +167,45 @@ impl GaitPolicy {
             self_repo_path,
         }
     }
+
+    /// Synchronous minimal constructor used when only the workspace root is
+    /// known (e.g. from `default_registry`).  Applies conservative defaults:
+    /// trusted_write_paths = [workspace_root], allow_system_read = true.
+    pub fn with_workspace_root(workspace_root: PathBuf) -> Self {
+        let canonical = std::fs::canonicalize(&workspace_root)
+            .unwrap_or_else(|_| workspace_root.clone());
+
+        // Detect Aigent source directory the same way from_config does.
+        let self_repo_path = std::env::var("AIGENT_SOURCE_DIR")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe().ok().and_then(|exe| {
+                    let mut dir = exe.parent()?.to_path_buf();
+                    for _ in 0..5 {
+                        if dir.join("crates/exec/src/gait").exists() {
+                            return Some(dir);
+                        }
+                        dir = dir.parent()?.to_path_buf();
+                    }
+                    None
+                })
+            })
+            .and_then(|p| std::fs::canonicalize(p).ok());
+
+        let trusted_repos: HashSet<String> =
+            ["https://github.com/danielmriley/aigent".to_string()]
+                .into_iter()
+                .collect();
+
+        Self {
+            trusted_write_paths: vec![canonical.clone()],
+            trusted_repos,
+            allow_system_read: true,
+            workspace_root: canonical,
+            self_repo_path,
+        }
+    }
 }
 
 // ── Path resolution & authorisation ──────────────────────────────────────────

@@ -176,7 +176,7 @@ impl DaemonClient {
         bail!("daemon reload config response missing")
     }
 
-    /// Hot-reload dynamic skills from the skills directory.
+    /// Hot-reload dynamic modules from the modules directory.
     pub async fn reload_tools(&self) -> Result<String> {
         let events = self.request_events(ClientCommand::ReloadTools).await?;
         for event in events {

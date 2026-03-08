@@ -1,10 +1,10 @@
-//! `search_memory` tool — lets the agent actively query its long-term memory,
-//! beliefs, and episodic history during a conversation or background tick.
+//! Memory tools — lets the agent actively query and write its long-term memory
+//! during a conversation or background tick.
 //!
 //! Because the `MemoryManager` lives inside the daemon state (behind `Arc<Mutex>`),
-//! this tool communicates through a boxed async closure (`MemoryQueryFn`) injected
-//! at startup.  The closure captures a clone of the daemon state handle and
-//! performs the actual search while the tool itself stays crate-independent.
+//! these tools communicate through boxed async closures injected at startup.
+//! The closures capture a clone of the daemon state handle and perform the actual
+//! work while the tools themselves stay crate-independent.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -129,6 +129,110 @@ impl Tool for SearchMemoryTool {
             success: true,
             output: out,
         })
+    }
+}
+
+// ── WriteMemoryTool ───────────────────────────────────────────────────────────
+
+/// Async callback that records a new entry into the agent's memory store.
+///
+/// Signature: `(content: String, tier: String) -> Result<String, String>`
+/// Returns the ID of the newly created memory entry, or an error message.
+pub type MemoryWriteFn = Arc<
+    dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Tool that lets the agent explicitly record a fact or insight to its memory.
+///
+/// Distinct from the automatic recording that happens at turn-end: this lets
+/// the agent decide *right now* that something is important enough to persist,
+/// at a tier it chooses.
+pub struct WriteMemoryTool {
+    pub write_fn: MemoryWriteFn,
+}
+
+#[async_trait]
+impl Tool for WriteMemoryTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "write_memory".to_string(),
+            description:
+                "Explicitly record a fact, insight, or note to your long-term memory. \
+                 Use this when you learn something important mid-conversation that you \
+                 want to ensure survives the current session, or when you want to leave \
+                 a note for your future self. For general observations prefer 'episodic'; \
+                 for stable learned facts prefer 'semantic'; for plans or intentions use \
+                 'reflective'."
+                    .to_string(),
+            params: vec![
+                ToolParam::required(
+                    "content",
+                    "The text to store — write it as a self-contained sentence or short \
+                     paragraph, as if briefing your future self",
+                ),
+                ToolParam {
+                    name: "tier".to_string(),
+                    description: "Memory tier: 'episodic' (recent event), 'semantic' (stable \
+                                  fact), or 'reflective' (insight / plan)"
+                        .to_string(),
+                    required: false,
+                    enum_values: vec![
+                        "episodic".to_string(),
+                        "semantic".to_string(),
+                        "reflective".to_string(),
+                    ],
+                    default: Some("episodic".to_string()),
+                    ..Default::default()
+                },
+            ],
+            metadata: ToolMetadata {
+                read_only: false,
+                group: "memory".to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
+    async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
+        let content = args
+            .get("content")
+            .ok_or_else(|| anyhow::anyhow!("missing required param: content"))?;
+
+        if content.trim().is_empty() {
+            return Ok(ToolOutput {
+                success: false,
+                output: "content must not be empty".to_string(),
+            });
+        }
+
+        let tier = args
+            .get("tier")
+            .map(|s| s.as_str())
+            .unwrap_or("episodic")
+            .to_string();
+
+        if !matches!(tier.as_str(), "episodic" | "semantic" | "reflective") {
+            return Ok(ToolOutput {
+                success: false,
+                output: format!(
+                    "invalid tier '{}'. Must be one of: episodic, semantic, reflective",
+                    tier
+                ),
+            });
+        }
+
+        match (self.write_fn)(content.clone(), tier.clone()).await {
+            Ok(id) => Ok(ToolOutput {
+                success: true,
+                output: format!("Memory recorded to {} tier (id: {})", tier, id),
+            }),
+            Err(e) => Ok(ToolOutput {
+                success: false,
+                output: format!("Failed to record memory: {}", e),
+            }),
+        }
     }
 }
 

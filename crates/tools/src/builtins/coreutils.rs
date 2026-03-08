@@ -341,11 +341,19 @@ impl Tool for RmTool {
                 default: Some("false".into()),
                 ..Default::default()
             },
+            ToolParam {
+                name: "confirm".to_string(),
+                description: "Must be \"true\" when recursive=true. Safety guard against accidental directory deletion.".to_string(),
+                required: false,
+                param_type: ParamType::Boolean,
+                default: Some("false".into()),
+                ..Default::default()
+            },
         ];
         push_output_params(&mut params);
         ToolSpec {
             name: "rm".to_string(),
-            description: "Remove a file or directory (recursively).".to_string(),
+            description: "Remove a file or directory. Requires confirm=\"true\" when removing recursively.".to_string(),
             params,
             metadata: ToolMetadata {
                 security_level: SecurityLevel::High,
@@ -364,6 +372,16 @@ impl Tool for RmTool {
 
         if !full.exists() {
             bail!("path does not exist: {}", rel);
+        }
+
+        let confirm = args.get("confirm").map(|v| v == "true").unwrap_or(false);
+        if recursive && !confirm {
+            return Ok(ToolOutput {
+                success: false,
+                output: "Recursive delete requires confirm=\"true\". \
+                    Re-call with confirm=\"true\" to proceed."
+                    .to_string(),
+            });
         }
 
         let kind;
@@ -727,15 +745,23 @@ impl Tool for GrepTool {
 
     async fn run(&self, args: &HashMap<String, String>) -> Result<ToolOutput> {
         let pattern = args.get("pattern").ok_or_else(|| anyhow::anyhow!("missing: pattern"))?;
+
+        // Defend against ReDoS: reject patterns that are implausibly long.
+        if pattern.len() > 512 {
+            anyhow::bail!("grep pattern exceeds 512-character limit (got {} chars)", pattern.len());
+        }
+
         let start = args.get("path")
             .map(|p| resolve_path(&self.workspace_root, p))
             .unwrap_or_else(|| self.workspace_root.clone());
         let case_insensitive = args.get("case_insensitive")
             .map(|v| v != "false")
             .unwrap_or(true);
+        // Cap max_results to 1000 regardless of what the model requests.
         let max: usize = args.get("max_results")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(100);
+            .unwrap_or(100)
+            .min(1000);
         let ctx: usize = args.get("context")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);

@@ -11,6 +11,7 @@ mod events;
 pub mod micro_profile;
 mod runtime;
 pub mod subagents;
+pub mod turn;
 
 // ── Error types ───────────────────────────────────────────────────────────────
 
@@ -33,3 +34,7 @@ pub use aigent_thinker::{ToolCallInfo, ToolResult};
 // ── Runtime types ─────────────────────────────────────────────────────────────
 
 pub use runtime::{AgentRuntime, ConversationTurn, SleepGenerationResult, SUMMARIZE_THRESHOLD};
+
+// ── Unified agent turn ────────────────────────────────────────────────────────
+
+pub use turn::{AgentTurnInput, run_agent_turn};

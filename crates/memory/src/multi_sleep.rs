@@ -321,13 +321,25 @@ Use NONE for fields outside your role."
     let profile_block = format_profile_block(batch);
     let response_format = response_format_instructions(bot_name, user_name);
 
+    // Critic and Strategist receive an additional "PAST REASONING" block so
+    // they can evaluate the quality of recent decisions and identify patterns
+    // in how the agent reasoned through problems.
+    let reasoning_section = match role {
+        SpecialistRole::Critic | SpecialistRole::Strategist => {
+            format_reasoning_traces_block(batch)
+                .map(|block| format!("\nPAST REASONING TRACES (agent chain-of-thought, newest first):\n{block}\n"))
+                .unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+
     format!(
         "{identity_ctx}\n\
 === {role_label} SPECIALIST ===\n\
 {role_framing}\n\n\
 RECENT MEMORIES (newest first):\n{memory_block}\n\n\
 CURRENT CORE MEMORIES (id_short | content):\n{core_block}\n\n\
-USER PROFILE (what you know about {user_name}):\n{profile_block}\n\n\
+USER PROFILE (what you know about {user_name}):\n{profile_block}\n{reasoning_section}\n\
 {response_format}",
         role_label = role.label(),
     )
@@ -561,6 +573,36 @@ pub fn merge_insights(insights: Vec<AgenticSleepInsights>) -> AgenticSleepInsigh
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Build the reasoning-traces block for Critic/Strategist prompts.
+///
+/// Filters entries whose `source == "agent-reasoning"` — these are the
+/// chain-of-thought strings persisted by the external thinking loop when
+/// `memory.store_reasoning_traces = true`.  Showing them only to the
+/// Critic and Strategist avoids bloating the Archivist/Psychologist context
+/// with internal monologue that isn't relevant to their roles.
+fn format_reasoning_traces_block(entries: &[MemoryEntry]) -> Option<String> {
+    let mut traces: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|e| e.source == "agent-reasoning")
+        .collect();
+    if traces.is_empty() {
+        return None;
+    }
+    traces.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let lines: Vec<String> = traces
+        .iter()
+        .map(|e| {
+            format!(
+                "  [{}] {} :: {}",
+                e.created_at.format("%Y-%m-%d %H:%M"),
+                e.id_short(),
+                truncate_str(&e.content, 400)
+            )
+        })
+        .collect();
+    Some(lines.join("\n"))
+}
 
 fn format_memory_block(entries: &[MemoryEntry]) -> String {
     let mut recent: Vec<&MemoryEntry> = entries

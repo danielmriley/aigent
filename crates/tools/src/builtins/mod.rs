@@ -7,7 +7,6 @@ mod coreutils;
 mod shell;
 mod web;
 mod calendar;
-mod web_browse;
 mod scheduler;
 pub mod memory_search;
 mod datetime;
@@ -20,9 +19,8 @@ pub use coreutils::{
 };
 pub use fs::{ReadFileTool, WriteFileTool};
 pub use shell::RunShellTool;
-pub use web::{WebSearchTool, FetchPageTool};
+pub use web::WebSearchTool;
 pub use calendar::CalendarAddEventTool;
-pub use web_browse::WebBrowseTool;
 pub use scheduler::{CreateCronJobTool, RemoveCronJobTool, ListCronJobsTool};
 pub use memory_search::{SearchMemoryTool, MemoryQueryFn, MemorySearchResult};
 pub use datetime::GetCurrentDatetimeTool;
@@ -264,37 +262,37 @@ impl Tool for GitRollbackTool {
 }
 
 
-/// Lists all deployed WASM skills by reading `.tool.json` manifests from the
-/// skills directory.  Shows name, description, and security level for each.
-pub struct ListSkillsTool {
-    pub skills_dir: PathBuf,
+/// Lists all deployed WASM modules by reading `.tool.json` manifests from the
+/// modules directory.  Shows name, description, and security level for each.
+pub struct ListModulesTool {
+    pub modules_dir: PathBuf,
 }
 
 #[async_trait]
-impl Tool for ListSkillsTool {
+impl Tool for ListModulesTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "list_skills".to_string(),
-            description: "List all deployed WASM skills with their name, description, and security level.".to_string(),
+            name: "list_modules".to_string(),
+            description: "List all deployed WASM modules with their name, description, and security level.".to_string(),
             params: vec![],
             metadata: ToolMetadata {
                 security_level: SecurityLevel::Low,
                 read_only: true,
-                group: "skills".to_string(),
+                group: "modules".to_string(),
                 ..Default::default()
             },
         }
     }
 
     async fn run(&self, _args: &HashMap<String, String>) -> Result<ToolOutput> {
-        if !self.skills_dir.is_dir() {
+        if !self.modules_dir.is_dir() {
             return Ok(ToolOutput {
-                output: "No skills directory found.".to_string(),
+                output: "No modules directory found.".to_string(),
                 success: true,
             });
         }
 
-        let entries = std::fs::read_dir(&self.skills_dir)?;
+        let entries = std::fs::read_dir(&self.modules_dir)?;
         let mut skills: Vec<String> = Vec::new();
 
         for entry in entries.flatten() {
@@ -331,7 +329,7 @@ impl Tool for ListSkillsTool {
 
         if skills.is_empty() {
             return Ok(ToolOutput {
-                output: "No skills deployed yet.".to_string(),
+                output: "No modules deployed yet.".to_string(),
                 success: true,
             });
         }
@@ -339,7 +337,7 @@ impl Tool for ListSkillsTool {
         skills.sort();
         Ok(ToolOutput {
             output: format!(
-                "Deployed skills ({}):\n{}",
+                "Deployed modules ({}):\n{}",
                 skills.len(),
                 skills.join("\n")
             ),
@@ -352,7 +350,7 @@ impl Tool for ListSkillsTool {
 mod tests {
     
         use crate::builtins::fs::truncate_byte_boundary;
-        use crate::builtins::web::html_to_text;
+        use crate::builtins::browse::extract_body_text as html_to_text;
 
     // ── truncate_byte_boundary ──────────────────────────────────────────────
 

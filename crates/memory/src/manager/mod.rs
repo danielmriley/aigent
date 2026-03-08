@@ -254,6 +254,58 @@ impl MemoryManager {
         tags: Vec<String>,
         confidence_override: Option<f32>,
     ) -> Result<MemoryEntry> {
+        // ── Episodic quality gate ─────────────────────────────────────────
+        //
+        // Reject assistant-reply Episodic entries that contain tool-denial
+        // hallucination patterns.  These arise when the model falsely claims
+        // it cannot use a tool (e.g. "I cannot execute list_dir due to access
+        // restrictions") and should never be stored as factual memory.
+        // Storing them seeds a feedback loop: the memory is retrieved on the
+        // next turn, reinforcing the hallucination.
+        //
+        // We log the rejection so it shows up in daemon logs and can be
+        // investigated, but we do NOT bail — we return a synthetic entry with
+        // confidence 0.0 so the caller's `?` chain continues normally.
+        if tier == MemoryTier::Episodic && source.starts_with("assistant-reply") {
+            let lc = content.to_ascii_lowercase();
+            let is_tool_denial = [
+                "cannot execute",
+                "cannot run",
+                "i cannot use",
+                "access restriction",
+                "permission restriction",
+                "without active tool permission",
+                "environment simulation",
+                "imposed access",
+                "did not succeed in using",
+                "unable to call",
+            ]
+            .iter()
+            .any(|pat| lc.contains(pat));
+
+            if is_tool_denial {
+                warn!(
+                    source = %source,
+                    content_preview = &content[..content.len().min(120)],
+                    "episodic quality gate: rejecting tool-denial hallucination — not stored"
+                );
+                // Return a zero-confidence synthetic entry that is NOT inserted
+                // into the store or event log.
+                return Ok(MemoryEntry {
+                    id: uuid::Uuid::new_v4(),
+                    tier,
+                    content,
+                    source,
+                    confidence: 0.0,
+                    valence: -0.5,
+                    created_at: Utc::now(),
+                    provenance_hash: String::new(),
+                    tags,
+                    embedding: None,
+                });
+            }
+        }
+
         let embedding = match &self.embed_fn {
             Some(f) => f(content.clone()).await,
             None => None,
@@ -354,6 +406,54 @@ impl MemoryManager {
         .await?;
         self.invalidate_prompt_caches();
         info!(%belief_id, "belief retracted");
+        Ok(())
+    }
+
+    /// Soft-retract a memory entry: zeroes its in-memory confidence so the
+    /// forgetting pass will sweep it on the next sleep cycle, and appends a
+    /// tombstone event to the log so the retraction survives a daemon restart.
+    ///
+    /// Unlike `retire_memory_ids` (hard-delete for redundant/consolidated
+    /// entries), **retractions are non-destructive** — the original event
+    /// remains in the append-only JSONL log for forensic audit.  Use when an
+    /// entry is *factually wrong* (e.g. a Procedural claim that a tool cannot
+    /// be used when later runs proved it works fine).
+    ///
+    /// Never call on `Core` or `UserProfile` entries — use `retract_belief()`
+    /// for Core beliefs.  The method is a no-op for unknown IDs (warns but
+    /// does not error) so sleep-loop callers are safe to fire-and-forget.
+    pub async fn retract_memory(&mut self, target_id: uuid::Uuid, reason: &str) -> Result<()> {
+        // Zero confidence on the live in-memory entry so retrieval scoring
+        // treats it as invisible right away.  The forgetting pass will fully
+        // remove it from the store on the next sleep cycle.
+        let tier_guard = self
+            .store
+            .get(target_id)
+            .map(|e| (e.tier, e.content.chars().take(120).collect::<String>()));
+
+        if let Some((tier, preview)) = tier_guard {
+            if matches!(tier, MemoryTier::Core | MemoryTier::UserProfile) {
+                warn!(%target_id, "retract_memory: refused — Core/UserProfile entries must use retract_belief()");
+                return Ok(());
+            }
+            // Zero confidence in-memory.
+            self.store.zero_confidence(target_id);
+            info!(%target_id, %preview, reason, "memory retracted: confidence zeroed");
+        } else {
+            warn!(%target_id, reason, "retract_memory: target ID not found in store (may have been hard-deleted)");
+            return Ok(());
+        }
+
+        // Append tombstone event — preserves append-only guarantee.  On
+        // replay the tombstone entry has `source = "sleep:retraction:{id}"`
+        // which the quality gate ignores, keeping load idempotent.
+        self.record_inner(
+            MemoryTier::Episodic,
+            format!("RETRACTED [{target_id}]: {reason}"),
+            format!("sleep:retraction:{target_id}"),
+        )
+        .await?;
+        self.invalidate_prompt_caches();
         Ok(())
     }
 

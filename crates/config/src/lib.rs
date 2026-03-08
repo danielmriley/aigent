@@ -150,6 +150,17 @@ pub struct MemoryConfig {
     /// Prevents rapid-fire messages when the agent becomes very active.
     /// Only checked after a message has been sent; a first message is never blocked.
     pub proactive_cooldown_minutes: u64,
+    /// Run an inline reflection pass (extra LLM call) after every TOOLS turn
+    /// to extract beliefs and insights.  Disable to reduce LLM token usage on
+    /// resource-constrained hardware.  Default: `true`.
+    #[serde(default = "default_reflection_enabled")]
+    pub reflection_enabled: bool,
+    /// Persist each reasoning step's `thought` field to `MemoryTier::Reflective`
+    /// after every agent turn.  Produces a searchable trace of the agent's
+    /// chain-of-thought reasoning across conversations.
+    /// Default: `false` (off by default to save memory writes on every turn).
+    #[serde(default)]
+    pub store_reasoning_traces: bool,
 }
 
 impl Default for MemoryConfig {
@@ -174,8 +185,14 @@ impl Default for MemoryConfig {
             max_relational_in_prompt: 20,
             max_prompt_chars: 48_000,
             proactive_cooldown_minutes: 5,
+            reflection_enabled: default_reflection_enabled(),
+            store_reasoning_traces: false,
         }
     }
+}
+
+fn default_reflection_enabled() -> bool {
+    true
 }
 
 // ── Tools config ─────────────────────────────────────────────────────────────
@@ -233,38 +250,45 @@ pub struct ToolsConfig {
     /// Prevents infinite tool-calling loops.  Default: 5.
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
-    /// Dynamic skills subsystem configuration.
-    #[serde(default)]
-    pub skills: SkillsConfig,
+    /// Agent-written WASM modules subsystem configuration.
+    #[serde(default, alias = "skills")]
+    pub modules: ModulesConfig,
 }
 
-/// Configuration for the dynamic skills subsystem.
+/// Configuration for the agent-written WASM modules subsystem.
 ///
-/// Skills are WASM (or future native-plugin) tools that the agent can
-/// discover and hot-load at runtime from a dedicated directory.
+/// Modules are WASM tools that the agent writes for itself and hot-loads
+/// from a dedicated directory.  Distinct from built-in tools (compiled into
+/// the daemon) and from thinker-driven prompt workflows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct SkillsConfig {
-    /// Master switch — when `false` the skills directory is never scanned.
+pub struct ModulesConfig {
+    /// Master switch — when `false` the modules directory is never scanned.
     pub enabled: bool,
-    /// Path to the skills directory, relative to the workspace root.
-    pub skills_dir: String,
-    /// Automatically reload skills when `ReloadConfig` is triggered.
+    /// Path to the modules directory, relative to the workspace root.
+    #[serde(default = "default_modules_dir", alias = "skills_dir")]
+    pub modules_dir: String,
+    /// Automatically reload modules when `ReloadConfig` is triggered.
     pub auto_reload: bool,
-    /// Hard cap on the number of dynamic skills that may be loaded.
+    /// Hard cap on the number of dynamic modules that may be loaded.
     /// Acts as a safety guard.  `0` means unlimited.
-    pub max_skills: usize,
+    #[serde(alias = "max_skills")]
+    pub max_modules: usize,
 }
 
-impl Default for SkillsConfig {
+impl Default for ModulesConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            skills_dir: "extensions/skills".to_string(),
+            modules_dir: default_modules_dir(),
             auto_reload: true,
-            max_skills: 64,
+            max_modules: 64,
         }
     }
+}
+
+fn default_modules_dir() -> String {
+    "extensions/modules".to_string()
 }
 
 impl Default for ToolsConfig {
@@ -280,7 +304,7 @@ impl Default for ToolsConfig {
             git_auto_commit: false,
             sandbox_enabled: true,
             max_tool_rounds: 5,
-            skills: SkillsConfig::default(),
+            modules: ModulesConfig::default(),
         }
     }
 }
@@ -523,101 +547,6 @@ impl Default for InferenceConfig {
     }
 }
 
-// ── Small-model router ───────────────────────────────────────────────────────
-
-/// Optional router that classifies incoming messages as either
-/// simple conversation (handled directly, no tool loop) or tool-requiring
-/// queries (dispatched to the full thinker loop with the primary model).
-///
-/// By default the router uses the **primary model** for both classification
-/// and chat responses.  This avoids VRAM model-swapping on single-GPU
-/// setups (which can add 10-15 s of latency per swap).  The speed benefit
-/// comes from skipping the tool loop, external-thinking JSON parsing, and
-/// the reflection step — not from using a smaller model.
-///
-/// If you have a multi-GPU rig or enough VRAM to keep two models loaded
-/// concurrently (set `OLLAMA_MAX_LOADED_MODELS=2`), you can set
-/// `ollama_model` to a small model like `"qwen3.5:0.8b"` for even faster
-/// classification and responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RouterConfig {
-    /// When `false`, the router is disabled and the primary model handles
-    /// every turn.  Default: `false`.
-    pub enabled: bool,
-
-    /// Which provider the router model lives on: `"ollama"` or `"openrouter"`.
-    /// Only used when `ollama_model` or `openrouter_model` is non-empty.
-    pub provider: String,
-
-    /// Model name when provider = `"ollama"`.
-    /// When empty (the default), the router reuses the primary model from
-    /// `[llm]` — no VRAM model-swap overhead.
-    /// Set to a specific model (e.g. `"qwen3.5:0.8b"`) only if your GPU
-    /// can keep both models loaded simultaneously.
-    pub ollama_model: String,
-
-    /// Model name when provider = `"openrouter"`.
-    /// When empty, the primary OpenRouter model is used.
-    pub openrouter_model: String,
-
-    /// Timeout in seconds for the classification call.
-    /// If the router call exceeds this, falls back to `TOOLS` (safe default).
-    pub classify_timeout_seconds: u64,
-
-    /// Timeout in seconds for the router model's chat response when the
-    /// decision is `CHAT`.  Should be shorter than the primary model's
-    /// `step_timeout_seconds`.
-    pub chat_timeout_seconds: u64,
-
-    /// The system prompt shown to the router model when classifying.
-    /// Fully user-customisable.  When empty, the built-in default is used.
-    #[serde(default = "default_classify_system_prompt")]
-    pub classify_system_prompt: String,
-}
-
-impl Default for RouterConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            provider: "ollama".to_string(),
-            ollama_model: String::new(),       // empty → use primary model
-            openrouter_model: String::new(),   // empty → use primary model
-            classify_timeout_seconds: 8,
-            chat_timeout_seconds: 45,
-            classify_system_prompt: default_classify_system_prompt(),
-        }
-    }
-}
-
-fn default_classify_system_prompt() -> String {
-    "You are a routing assistant. Classify the user's message into exactly one category.\n\
-     \n\
-     Reply with ONLY the word \"TOOLS\" if the message requires any of:\n\
-     - Accessing files, directories, or the filesystem\n\
-     - Running code, shell commands, or scripts\n\
-     - Searching the web or fetching URLs\n\
-     - Calendar events, reminders, or scheduling\n\
-     - Email drafting or sending\n\
-     - Recalling or searching memories of past conversations\n\
-     - Multi-step reasoning requiring more than one operation\n\
-     - Any other tool use\n\
-     \n\
-     Reply with ONLY the word \"CHAT\" if the message is:\n\
-     - A conversational exchange or greeting\n\
-     - A question about the current date, time, day of the week, or similar\n\
-     - An opinion question, request for advice, or creative writing\n\
-     - Anything that can be answered from general knowledge or existing context \
-       without tool use\n\
-     \n\
-     If unsure, reply TOOLS. Better to use the full thinker than miss something important.\n\
-     \n\
-     Reply with ONLY one word: TOOLS or CHAT."
-        .to_string()
-}
-
-// ── Debug / observability ────────────────────────────────────────────────────
-
 // ── Subagents ─────────────────────────────────────────────────────────────────
 
 /// Configuration for the parallel subagent reasoning system.
@@ -632,6 +561,20 @@ fn default_classify_system_prompt() -> String {
 pub struct SubagentsConfig {
     /// Master switch.  When `false`, the subagent pipeline is skipped entirely.
     pub enabled: bool,
+
+    /// Ollama model used for the three specialist subagents.
+    ///
+    /// Set this to a smaller, faster model (e.g. `"qwen3:8b"`) while the
+    /// Captain uses a larger model (e.g. `"qwen3:35b"`).  This unlocks
+    /// better capability at lower latency when `OLLAMA_NUM_PARALLEL >= 3`.
+    ///
+    /// When empty (the default), subagents use the same model as the Captain
+    /// (`[llm].ollama_model`).
+    pub ollama_model: String,
+
+    /// OpenRouter model used for subagents.  Empty = use captain's model.
+    pub openrouter_model: String,
+
     /// Researcher role system prompt.
     pub researcher_prompt: String,
     /// Planner role system prompt.
@@ -644,6 +587,8 @@ impl Default for SubagentsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            ollama_model: String::new(),
+            openrouter_model: String::new(),
             researcher_prompt: "You are a meticulous researcher. Examine the conversation history and memory context deeply. Identify key facts, missing information, and relevant background knowledge that could help answer the user's request. Output your findings as structured analysis.".to_string(),
             planner_prompt: "You are a strategic planner. Given the conversation and context, devise a clear step-by-step plan for how to best respond to or accomplish the user's request. Consider which tools might be needed and in what order. Output your plan as structured analysis.".to_string(),
             critic_prompt: "You are a rigorous critic. Examine the conversation for potential pitfalls: hallucination risks, incorrect assumptions, edge cases, security concerns, and logical gaps. Challenge the obvious approach. Output your critique as structured analysis.".to_string(),
@@ -671,12 +616,6 @@ pub struct DebugConfig {
     /// Default: `true`.
     pub log_to_file: bool,
 
-    /// When `true`, emit detailed `info!` logs for the router's
-    /// classification call: the full classify prompt, the raw model
-    /// response, and per-phase timing (load / prompt-eval / generation).
-    /// Default: `false`.
-    pub verbose_routing: bool,
-
     /// When `true`, emit per-turn timing breakdowns as `info!` logs:
     /// prompt build time, router classify time, LLM response time,
     /// memory write time, and total wall-clock time.
@@ -689,7 +628,6 @@ impl Default for DebugConfig {
         Self {
             log_level: "info".to_string(),
             log_to_file: true,
-            verbose_routing: false,
             timing: true,
         }
     }
@@ -710,7 +648,6 @@ pub struct AppConfig {
     pub ui: UiConfig,
     pub git: GitConfig,
     pub inference: InferenceConfig,
-    pub router: RouterConfig,
     pub subagents: SubagentsConfig,
     pub debug: DebugConfig,
 }

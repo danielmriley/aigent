@@ -623,7 +623,7 @@ fn is_private_ip(ip: IpAddr) -> bool {
 //  HTML helpers
 // ═════════════════════════════════════════════════════════════════════════════
 
-fn build_client() -> Result<reqwest::Client> {
+pub(super) fn build_client() -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(TIMEOUT)
         .user_agent(USER_AGENT)
@@ -633,7 +633,7 @@ fn build_client() -> Result<reqwest::Client> {
 
 /// Extract structured metadata from HTML: `<title>`, `<meta>` description/OG,
 /// JSON-LD, published dates.
-fn extract_structured_data(html: &str) -> String {
+pub(super) fn extract_structured_data(html: &str) -> String {
     let doc = Html::parse_document(html);
     let mut parts: Vec<String> = Vec::new();
 
@@ -817,7 +817,7 @@ fn summarise_ld_json(val: &serde_json::Value) -> String {
 }
 
 /// Extract readable body text from HTML, targeting article/main/body regions.
-fn extract_body_text(html: &str, max_chars: usize) -> String {
+pub(super) fn extract_body_text(html: &str, max_chars: usize) -> String {
     let doc = Html::parse_document(html);
 
     // Try focused content regions first.

@@ -190,8 +190,14 @@ fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
     // ── Canonical "type" field present ────────────────────────────────────
     match step_type {
         "final_answer" => {
+            // Models commonly use 'content', 'response', or 'answer' instead of
+            // 'final_answer' as the value key (e.g. qwen3.5:4b uses 'content'
+            // after tool calls and 'answer' after web searches).
             let answer = obj
                 .get("final_answer")
+                .or_else(|| obj.get("content"))
+                .or_else(|| obj.get("answer"))
+                .or_else(|| obj.get("response"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -227,10 +233,18 @@ fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
 
     // ── Heuristic recovery for off-schema responses ──────────────────────
 
-    // Case A: "final_answer" key present (regardless of "type").
-    if let Some(answer_val) = obj.get("final_answer") {
-        let answer = answer_val.as_str().unwrap_or("").to_string();
-        return Ok(AgentStep::FinalAnswer { thought, answer });
+    // Case A: "final_answer", "content", "answer", or "response" key present (regardless of "type").
+    // qwen3.5:4b and some other models use "content" or "answer" instead of "final_answer".
+    let final_answer_val = obj.get("final_answer")
+        .or_else(|| obj.get("content"))
+        .or_else(|| obj.get("answer"))
+        .or_else(|| obj.get("response"));
+    if let Some(answer_val) = final_answer_val {
+        // Only treat as FinalAnswer if value is a plain string (not nested
+        // object/array), to avoid misidentifying tool-call structures.
+        if let Some(answer) = answer_val.as_str() {
+            return Ok(AgentStep::FinalAnswer { thought, answer: answer.to_string() });
+        }
     }
 
     // Case B: "tool_call" key is a nested object (canonical structure, just

@@ -40,4 +40,4 @@ pub use aigent_prompt::{build_chat_prompt, truncate_for_prompt, PromptInputs};
 
 // ── Re-exports from aigent-thinker ────────────────────────────────────────────
 
-pub use aigent_thinker::{ToolLoopResult, ToolExecution, build_tools_json, run_tool_loop};
+pub use aigent_thinker::{ToolLoopResult, ToolExecution};

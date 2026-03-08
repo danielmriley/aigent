@@ -179,11 +179,13 @@ pub async fn run_unified_daemon(
     socket_path: impl AsRef<Path>,
 ) -> Result<()> {
     let socket_path = socket_path.as_ref().to_path_buf();
+    // Materialise the path so we can use it after the manager takes ownership.
+    let memory_log_path = memory_log_path.as_ref().to_path_buf();
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    let mut memory = MemoryManager::with_event_log(memory_log_path).await?;
+    let mut memory = MemoryManager::with_event_log(&memory_log_path).await?;
 
     // Wire in the Ollama embedding backend so all new entries are automatically
     // embedded and retrieval uses hybrid lexical+vector scoring.
@@ -196,6 +198,36 @@ pub async fn run_unified_daemon(
 
     // Apply config-driven memory tuning.
     memory.set_kv_tier_limit(config.memory.kv_tier_limit);
+
+    // Wire the redb-backed MemoryIndex for O(1) tier lookups and fast
+    // deduplication.  Stored as a sibling to the JSONL event log so both
+    // files live under `.aigent/memory/`.  Rebuilt from the event log on
+    // every daemon start so the index is always consistent with the log.
+    // All failures are non-fatal — the manager falls back to O(n) scans.
+    {
+        let index_path = memory_log_path.with_file_name("memory.index");
+        let event_log = aigent_memory::event_log::MemoryEventLog::new(&memory_log_path);
+        let index_result: anyhow::Result<aigent_memory::MemoryIndex> = async {
+            let mut idx = aigent_memory::MemoryIndex::open(&index_path)?;
+            match idx.rebuild_from_log(&event_log).await {
+                Ok(n) => {
+                    info!(entries = n, path = %index_path.display(), "memory index rebuilt");
+                    Ok(idx)
+                }
+                Err(e) => {
+                    warn!(?e, "index rebuild failed — resetting corrupt index and retrying");
+                    let mut fresh = aigent_memory::MemoryIndex::reset(&index_path)?;
+                    let n = fresh.rebuild_from_log(&event_log).await?;
+                    info!(entries = n, "memory index rebuilt after reset");
+                    Ok(fresh)
+                }
+            }
+        }.await;
+        match index_result {
+            Ok(idx) => memory.set_index(idx),
+            Err(e) => warn!(?e, path = %index_path.display(), "memory index unavailable — continuing without it (non-fatal)"),
+        }
+    }
 
     // Auto-seed Core identity if it's missing (safety net for upgrades or
     // first-run cases where onboarding seeded the config but not the event log).
@@ -261,26 +293,26 @@ pub async fn run_unified_daemon(
     );
     let tool_executor = ToolExecutor::new(policy);
 
-    // ── Bootstrap skills scaffolding scripts into the workspace ─────────
-    if config.tools.skills.enabled {
-        bootstrap_skills_infra(std::path::Path::new(&config.agent.workspace_path));
+    // ── Bootstrap modules scaffolding scripts into the workspace ─────────
+    if config.tools.modules.enabled {
+        bootstrap_modules_infra(std::path::Path::new(&config.agent.workspace_path));
     }
 
-    // ── Load dynamic skills from the skills directory at startup ─────────
-    if config.tools.skills.enabled {
-        let skills_dir = std::path::Path::new(&config.agent.workspace_path)
-            .join(&config.tools.skills.skills_dir);
-        if skills_dir.is_dir() {
-            info!(dir = %skills_dir.display(), "scanning skills directory at startup");
+    // ── Load dynamic modules from the modules directory at startup ─────────
+    if config.tools.modules.enabled {
+        let modules_dir = std::path::Path::new(&config.agent.workspace_path)
+            .join(&config.tools.modules.modules_dir);
+        if modules_dir.is_dir() {
+            info!(dir = %modules_dir.display(), "scanning modules directory at startup");
             let workspace = std::path::Path::new(&config.agent.workspace_path);
-            let max = if config.tools.skills.max_skills == 0 {
+            let max = if config.tools.modules.max_modules == 0 {
                 usize::MAX
             } else {
-                config.tools.skills.max_skills
+                config.tools.modules.max_modules
             };
             let mut count = 0usize;
             let mut seen_names = std::collections::HashSet::new();
-            if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+            if let Ok(entries) = std::fs::read_dir(&modules_dir) {
                 for entry in entries.flatten() {
                     if count >= max { break; }
                     let path = entry.path();
@@ -291,25 +323,25 @@ pub async fn run_unified_daemon(
                         ) {
                             let name = tool.spec().name.clone();
                             if !seen_names.insert(name.clone()) {
-                                warn!(skill = %name, path = %path.display(),
-                                    "duplicate skill name \u{2014} skipping");
+                                warn!(module = %name, path = %path.display(),
+                                    "duplicate module name \u{2014} skipping");
                                 continue;
                             }
                             tool_registry.register_with_source(
                                 Box::new(tool),
                                 aigent_tools::ToolSource::Dynamic,
                             );
-                            info!(skill = %name, "loaded dynamic skill at startup");
+                            info!(module = %name, "loaded dynamic module at startup");
                             count += 1;
                         } else {
                             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown");
-                            warn!(skill = %stem, "failed to load skill WASM at startup");
+                            warn!(module = %stem, "failed to load module WASM at startup");
                         }
                     }
                 }
             }
             if count > 0 {
-                info!(count, "dynamic skills loaded at startup");
+                info!(count, "dynamic modules loaded at startup");
             }
         }
     }
@@ -420,6 +452,29 @@ pub async fn run_unified_daemon(
         info!("registered search_memory tool with live daemon memory handle");
     }
 
+    // ── Register WriteMemoryTool (needs daemon state handle) ─────────────────
+    {
+        let state_for_write = state.clone();
+        let memory_write_fn: aigent_tools::MemoryWriteFn = Arc::new(move |content, tier| {
+            let st = state_for_write.clone();
+            Box::pin(async move {
+                let memory_tier = match tier.as_str() {
+                    "semantic"   => aigent_memory::MemoryTier::Semantic,
+                    "reflective" => aigent_memory::MemoryTier::Reflective,
+                    _            => aigent_memory::MemoryTier::Episodic,
+                };
+                let mut s = st.lock().await;
+                s.memory.record(memory_tier, content, "agent-explicit".to_string())
+                    .await
+                    .map(|e| e.id.to_string())
+                    .map_err(|e| e.to_string())
+            })
+        });
+        let write_tool = aigent_tools::WriteMemoryTool { write_fn: memory_write_fn };
+        state.lock().await.tool_registry.register(Box::new(write_tool));
+        info!("registered write_memory tool with live daemon memory handle");
+    }
+
     let listener = UnixListener::bind(&socket_path)?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     info!(path = %socket_path.display(), "unified daemon listening");
@@ -433,73 +488,65 @@ pub async fn run_unified_daemon(
     sleep::spawn_vault_watcher_task(state.clone(), vault_path_for_watcher);
 
     // ── Model warm-up ──────────────────────────────────────────────────────
-    // Pre-load model(s) into VRAM so the first request isn't penalised by
-    // cold model loading.  When the router uses a *different* model to the
-    // primary, we warm both concurrently — this requires
-    // OLLAMA_MAX_LOADED_MODELS≥2 so Ollama doesn't evict the first model
-    // while loading the second.
+    // Pre-load the primary model into VRAM so the first request isn't
+    // penalised by cold model loading.
     {
-        let (primary_model, router_model, provider_name, router_provider) = {
+        let (primary_model, provider_name) = {
             let st = state.lock().await;
-            let rcfg = &st.runtime.config.router;
-            let r_model = if rcfg.ollama_model.is_empty() {
-                st.runtime.config.active_model().to_string()
-            } else {
-                rcfg.ollama_model.clone()
-            };
             (
                 st.runtime.config.active_model().to_string(),
-                r_model,
                 st.runtime.config.llm.provider.clone(),
-                rcfg.provider.clone(),
             )
         };
-        // Collect distinct Ollama models that need warming.
-        let mut models_to_warm: Vec<String> = Vec::new();
         if provider_name.eq_ignore_ascii_case("ollama") && !primary_model.is_empty() {
-            models_to_warm.push(primary_model.clone());
-        }
-        if router_provider.eq_ignore_ascii_case("ollama")
-            && !router_model.is_empty()
-            && router_model != primary_model
-        {
-            models_to_warm.push(router_model.clone());
-        }
-        if !models_to_warm.is_empty() {
-            info!(
-                "warming {} model(s): {}",
-                models_to_warm.len(),
-                models_to_warm.join(", ")
-            );
+            let model = primary_model.clone();
+            info!("warming model: {}", model);
             tokio::spawn(async move {
                 let base_url = std::env::var("OLLAMA_BASE_URL")
                     .unwrap_or_else(|_| "http://localhost:11434".to_string());
                 let endpoint = format!("{}/api/chat", base_url.trim_end_matches('/'));
-                let client = reqwest::Client::new();
-                // Fire warm-up requests concurrently.
-                let futures: Vec<_> = models_to_warm
-                    .iter()
-                    .map(|model| {
-                        let payload = serde_json::json!({
-                            "model": model,
-                            "messages": [{"role": "user", "content": "hi"}],
-                            "stream": false,
-                            "keep_alive": "30m",
-                            "options": { "num_predict": 1 }
-                        });
-                        let c = client.clone();
-                        let ep = endpoint.clone();
-                        let m = model.clone();
-                        async move {
-                            match c.post(&ep).json(&payload).send().await {
-                                Ok(_) => info!("warm-up complete: {} loaded into VRAM", m),
-                                Err(e) => warn!("warm-up failed for {} (non-fatal): {}", m, e),
-                            }
-                        }
-                    })
-                    .collect();
-                futures::future::join_all(futures).await;
+                let payload = serde_json::json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": false,
+                    "keep_alive": "30m",
+                    "options": { "num_predict": 1 }
+                });
+                match reqwest::Client::new().post(&endpoint).json(&payload).send().await {
+                    Ok(_) => info!("warm-up complete: {} loaded into VRAM", model),
+                    Err(e) => warn!("warm-up failed for {} (non-fatal): {}", model, e),
+                }
             });
+        }
+    }
+
+    // ── Subagent parallelism check ─────────────────────────────────────────
+    // Sub-agents run in parallel via tokio::join!, so Ollama must be
+    // configured to handle multiple concurrent requests.  Without
+    // OLLAMA_NUM_PARALLEL ≥ 3 (or ≥ 4 when sleep specialists also run),
+    // requests queue up and inference falls back to serial execution.
+    {
+        let (subagents_enabled, provider_name) = {
+            let st = state.lock().await;
+            (
+                st.runtime.config.subagents.enabled,
+                st.runtime.config.llm.provider.clone(),
+            )
+        };
+        if subagents_enabled && provider_name.eq_ignore_ascii_case("ollama") {
+            let parallel = std::env::var("OLLAMA_NUM_PARALLEL")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            if parallel < 3 {
+                warn!(
+                    current = parallel,
+                    recommended = 3,
+                    "subagents are enabled but OLLAMA_NUM_PARALLEL is not set to ≥ 3; \
+                     parallel specialist calls will queue and degrade to serial. \
+                     Set OLLAMA_NUM_PARALLEL=4 in your Ollama environment."
+                );
+            }
         }
     }
 
@@ -673,31 +720,31 @@ pub async fn run_unified_daemon(
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
-// ── Skills infrastructure bootstrap ──────────────────────────────────────────
+// ── Modules infrastructure bootstrap ─────────────────────────────────────────
 
-/// Ensures the workspace has the skills scaffolding scripts and directories.
+/// Ensures the workspace has the modules scaffolding scripts and directories.
 ///
 /// On a fresh install the `workspace/` dir is empty (it's gitignored).
-/// The scripts are embedded at compile time from `extensions/skills-src/` so
+/// The scripts are embedded at compile time from `extensions/modules-src/` so
 /// they are always available regardless of how the binary was distributed.
-fn bootstrap_skills_infra(workspace: &std::path::Path) {
+fn bootstrap_modules_infra(workspace: &std::path::Path) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    let src_dir = workspace.join("extensions/skills-src");
-    let skills_dir = workspace.join("extensions/skills");
+    let src_dir = workspace.join("extensions/modules-src");
+    let modules_dir = workspace.join("extensions/modules");
 
     // Create both directories if needed.
     let _ = fs::create_dir_all(&src_dir);
-    let _ = fs::create_dir_all(&skills_dir);
+    let _ = fs::create_dir_all(&modules_dir);
 
     // Embedded scripts (compiled into the binary).
-    static NEW_SKILL_SH: &str = include_str!("../../../../extensions/skills-src/new-skill.sh");
-    static BUILD_SH: &str = include_str!("../../../../extensions/skills-src/build.sh");
-    static CARGO_TOML: &str = include_str!("../../../../extensions/skills-src/Cargo.toml");
+    static NEW_MODULE_SH: &str = include_str!("../../../../extensions/modules-src/new-module.sh");
+    static BUILD_SH: &str = include_str!("../../../../extensions/modules-src/build.sh");
+    static CARGO_TOML: &str = include_str!("../../../../extensions/modules-src/Cargo.toml");
 
     let files: &[(&str, &str, bool)] = &[
-        ("new-skill.sh", NEW_SKILL_SH, true),
+        ("new-module.sh", NEW_MODULE_SH, true),
         ("build.sh", BUILD_SH, true),
         ("Cargo.toml", CARGO_TOML, false),
     ];
@@ -711,13 +758,13 @@ fn bootstrap_skills_infra(workspace: &std::path::Path) {
         };
         if needs_write {
             if let Err(e) = fs::write(&path, contents) {
-                tracing::warn!(file = %path.display(), err = %e, "failed to write skill script");
+                tracing::warn!(file = %path.display(), err = %e, "failed to write module script");
                 continue;
             }
             if executable {
                 let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
             }
-            tracing::info!(file = %path.display(), "bootstrapped skill script");
+            tracing::info!(file = %path.display(), "bootstrapped module script");
         }
     }
 }
