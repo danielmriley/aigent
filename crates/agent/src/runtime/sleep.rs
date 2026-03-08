@@ -206,79 +206,78 @@ impl AgentRuntime {
                 self.sleep_llm_call(primary, &critic_prompt, "Critic"),
             );
 
-            // If any specialist failed, fall back to single-agent for this batch.
-            let (arch_reply, psych_reply, strat_reply, critic_reply) =
-                match (arch_reply, psych_reply, strat_reply, critic_reply) {
-                    (Some(a), Some(p), Some(s), Some(c)) => (a, p, s, c),
-                    _ => {
-                        warn!(
-                            batch = batch_idx + 1,
-                            "multi-agent sleep: specialist call failed — using single-agent fallback for this batch"
-                        );
-                        let _ = progress.send(format!(
-                            "Batch {}/{}: specialist unavailable — using single-agent fallback…",
-                            batch_idx + 1,
-                            batches.len()
-                        ));
-                        // Build the standard single-agent prompt for this batch's entries.
-                        let fallback_prompt = aigent_memory::sleep::agentic_sleep_prompt(
-                            batch,
-                            bot_name,
-                            user_name,
-                            &identity.trait_scores,
-                        );
-                        match self
-                            .sleep_llm_call(primary, &fallback_prompt, "fallback-single")
-                            .await
-                        {
-                            Some(reply) => {
-                                let insights = parse_agentic_insights(&reply);
-                                all_batch_insights.push(insights);
-                                any_batch_succeeded = true;
-                            }
-                            None => {
-                                warn!(batch = batch_idx + 1, "multi-agent sleep: fallback also failed — skipping batch");
-                            }
-                        }
-                        continue;
-                    }
-                };
+            // Collect available replies — degrade gracefully to a partial team
+            // rather than discarding all successful results when one specialist
+            // fails.  Only fall back to single-agent when ALL four fail.
+            let mut specialist_reports: Vec<(SpecialistRole, String)> = Vec::with_capacity(4);
+            if let Some(r) = arch_reply   { specialist_reports.push((SpecialistRole::Archivist,    r)); }
+            if let Some(r) = psych_reply  { specialist_reports.push((SpecialistRole::Psychologist, r)); }
+            if let Some(r) = strat_reply  { specialist_reports.push((SpecialistRole::Strategist,   r)); }
+            if let Some(r) = critic_reply { specialist_reports.push((SpecialistRole::Critic,        r)); }
 
-            // Parse specialist replies to detect Core ID conflicts.
-            let arch_insights = parse_agentic_insights(&arch_reply);
-            let psych_insights = parse_agentic_insights(&psych_reply);
-            let strat_insights = parse_agentic_insights(&strat_reply);
-            let critic_insights = parse_agentic_insights(&critic_reply);
+            if specialist_reports.is_empty() {
+                // All 4 failed — single-agent fallback for this batch.
+                warn!(
+                    batch = batch_idx + 1,
+                    "multi-agent sleep: all specialists failed — using single-agent fallback for this batch"
+                );
+                let _ = progress.send(format!(
+                    "Batch {}/{}: all specialists unavailable — using single-agent fallback…",
+                    batch_idx + 1,
+                    batches.len()
+                ));
+                let fallback_prompt = aigent_memory::sleep::agentic_sleep_prompt(
+                    batch,
+                    bot_name,
+                    user_name,
+                    &identity.trait_scores,
+                );
+                match self
+                    .sleep_llm_call(primary, &fallback_prompt, "fallback-single")
+                    .await
+                {
+                    Some(reply) => {
+                        all_batch_insights.push(parse_agentic_insights(&reply));
+                        any_batch_succeeded = true;
+                    }
+                    None => {
+                        warn!(batch = batch_idx + 1, "multi-agent sleep: fallback also failed — skipping batch");
+                    }
+                }
+                continue;
+            }
+
+            if specialist_reports.len() < 4 {
+                warn!(
+                    batch = batch_idx + 1,
+                    succeeded = specialist_reports.len(),
+                    "multi-agent sleep: partial specialist team — proceeding with available reports"
+                );
+            }
+
+            // Parse available specialist replies to detect Core ID conflicts.
+            let parsed_insights: Vec<AgenticSleepInsights> = specialist_reports
+                .iter()
+                .map(|(_, reply)| parse_agentic_insights(reply))
+                .collect();
 
             // Conflicting IDs: mentioned in retire by one specialist AND in
             // rewrite/consolidate by another.
-            let all_retire: std::collections::HashSet<String> = arch_insights
-                .retire_core_ids
+            let all_retire: std::collections::HashSet<String> = parsed_insights
                 .iter()
-                .chain(&psych_insights.retire_core_ids)
-                .chain(&strat_insights.retire_core_ids)
-                .chain(&critic_insights.retire_core_ids)
-                .cloned()
+                .flat_map(|i| i.retire_core_ids.iter().cloned())
                 .collect();
 
-            let all_rewrite_or_consolidate: std::collections::HashSet<String> = arch_insights
-                .rewrite_core
+            let all_rewrite_or_consolidate: std::collections::HashSet<String> = parsed_insights
                 .iter()
-                .chain(&psych_insights.rewrite_core)
-                .chain(&strat_insights.rewrite_core)
-                .chain(&critic_insights.rewrite_core)
-                .map(|(id, _)| id.clone())
-                .chain(
-                    arch_insights
-                        .consolidate_core
+                .flat_map(|i| i.rewrite_core.iter().map(|(id, _)| id.clone()))
+                .chain(parsed_insights.iter().flat_map(|i| {
+                    i.consolidate_core
                         .iter()
-                        .chain(&psych_insights.consolidate_core)
-                        .chain(&strat_insights.consolidate_core)
-                        .chain(&critic_insights.consolidate_core)
                         .flat_map(|(ids_csv, _)| {
                             ids_csv.split(',').map(|s| s.trim().to_string()).collect::<Vec<_>>()
-                        }),
-                )
+                        })
+                }))
                 .collect();
 
             let conflicting_ids: Vec<String> = all_retire
@@ -288,26 +287,22 @@ impl AgentRuntime {
 
             info!(
                 batch = batch_idx + 1,
+                specialists = specialist_reports.len(),
                 conflicts = conflicting_ids.len(),
                 "multi-agent sleep: running synthesis deliberation"
             );
             let _ = progress.send(format!(
-                "Batch {}/{}: synthesising specialist reports{}…",
+                "Batch {}/{}: synthesising {} specialist report{}{}…",
                 batch_idx + 1,
                 batches.len(),
+                specialist_reports.len(),
+                if specialist_reports.len() == 1 { "" } else { "s" },
                 if conflicting_ids.is_empty() {
                     String::new()
                 } else {
                     format!(" ({} conflict{})", conflicting_ids.len(), if conflicting_ids.len() == 1 { "" } else { "s" })
                 }
             ));
-
-            let specialist_reports = vec![
-                (SpecialistRole::Archivist, arch_reply),
-                (SpecialistRole::Psychologist, psych_reply),
-                (SpecialistRole::Strategist, strat_reply),
-                (SpecialistRole::Critic, critic_reply),
-            ];
 
             let identity_ctx =
                 build_identity_context(batch, &identity_snap, bot_name, user_name);
@@ -337,15 +332,10 @@ impl AgentRuntime {
                 None => {
                     warn!(
                         batch = batch_idx + 1,
-                        "multi-agent sleep: synthesis call failed — merging specialist insights directly"
+                        "multi-agent sleep: synthesis call failed — merging available specialist insights directly"
                     );
-                    // Merge the 4 specialist insights as a degraded fallback.
-                    let batch_merged = merge_insights(vec![
-                        arch_insights,
-                        psych_insights,
-                        strat_insights,
-                        critic_insights,
-                    ]);
+                    // Merge whatever specialist insights we have as a degraded fallback.
+                    let batch_merged = merge_insights(parsed_insights);
                     all_batch_insights.push(batch_merged);
                     any_batch_succeeded = true;
                 }

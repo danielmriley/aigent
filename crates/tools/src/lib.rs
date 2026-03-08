@@ -468,6 +468,37 @@ impl ToolRegistry {
             .map(|e| Arc::clone(&e.tool))
     }
 
+    /// Look up a tool and return its cached [`ToolMetadata`] alongside the
+    /// executable handle, within a single read-lock acquisition.
+    ///
+    /// Avoids the vtable dispatch + heap allocation that calling
+    /// `Arc<dyn Tool>::spec()` would incur on the hot execution path.
+    /// O(n) scan, same as [`get`](Self::get).
+    pub fn get_with_metadata(&self, name: &str) -> Option<(Arc<dyn Tool>, ToolMetadata)> {
+        self.tools
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.spec.name == name)
+            .map(|e| (Arc::clone(&e.tool), e.spec.metadata.clone()))
+    }
+
+    /// Look up a tool and return its full cached [`ToolSpec`] alongside the
+    /// executable handle, within a single read-lock acquisition.
+    ///
+    /// Use this on the hot tool-call path when both the executable handle and
+    /// the parameter list are needed (e.g. for required-param validation in
+    /// `ext_loop`).  Returns the cached spec without vtable dispatch.
+    /// O(n) scan, same as [`get`](Self::get).
+    pub fn get_with_spec(&self, name: &str) -> Option<(Arc<dyn Tool>, ToolSpec)> {
+        self.tools
+            .read()
+            .unwrap()
+            .iter()
+            .find(|e| e.spec.name == name)
+            .map(|e| (Arc::clone(&e.tool), e.spec.clone()))
+    }
+
     /// Number of currently registered tools.
     pub fn len(&self) -> usize {
         self.tools.read().unwrap().len()

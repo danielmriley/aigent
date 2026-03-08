@@ -42,12 +42,14 @@ use crate::events::{ThinkerEvent, ToolCallInfo, ToolResult as ToolResultEvent};
 use crate::json_stream::{AgentStep, JsonStreamBuffer};
 use crate::tool_loop::{EventSink, ToolExecution, ToolLoopResult};
 
-/// Maximum number of tool-call → observation → re-prompt rounds.
-const MAX_EXT_ROUNDS: usize = 10;
-
-/// Fallback tool execution timeout used when no config value is provided.
-#[allow(dead_code)]
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Truncate `s` to at most `max_chars` Unicode scalar values, preserving
+/// UTF-8 validity.  Returns a `&str` slice — no allocation.
+fn truncate_to_char_boundary(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
 
 /// Run the external thinking loop.
 ///
@@ -68,6 +70,9 @@ pub async fn run_external_thinking_loop(
     event_sink: Option<&EventSink>,
     step_timeout: Duration,
     tool_timeout: Duration,
+    // Maximum tool-call → observation → re-prompt rounds. Wired from
+    // `config.agent.max_steps_per_turn`; 0 is treated as "use default (10)".
+    max_rounds: usize,
 ) -> Result<ToolLoopResult> {
     let mut all_executions: Vec<ToolExecution> = Vec::new();
     let mut reasoning_traces: Vec<String> = Vec::new();
@@ -82,7 +87,15 @@ pub async fn run_external_thinking_loop(
     // every tool invocation in a turn.
     let mut seen_tool_calls: HashSet<(String, u64)> = HashSet::new();
 
-    for round in 0..MAX_EXT_ROUNDS {
+    // Malformed-JSON retry cap: prevent the model burning all rounds on
+    // structurally broken output.  After 2 consecutive malformed replies we
+    // bail with a final_answer rather than repeating indefinitely.
+    let mut malformed_retries: u8 = 0;
+    const MAX_MALFORMED_RETRIES: u8 = 2;
+
+    let effective_max_rounds = if max_rounds == 0 { 10 } else { max_rounds };
+
+    for round in 0..effective_max_rounds {
         // Log prompt size on the first step so we can spot bloated prompts
         // that cause prefill timeouts on large local models.
         if round == 0 {
@@ -168,9 +181,26 @@ pub async fn run_external_thinking_loop(
         jsb.feed(&full_text);
 
         let step = match jsb.take_parsed() {
-            Some(Ok(s)) => s,
+            Some(Ok(s)) => {
+                // Successful parse resets the consecutive-malformed counter.
+                malformed_retries = 0;
+                s
+            }
             Some(Err(e)) => {
-                warn!(round, error = %e, "failed to parse agent step, will retry");
+                malformed_retries += 1;
+                warn!(round, error = %e, malformed_retries, "failed to parse agent step");
+
+                if malformed_retries > MAX_MALFORMED_RETRIES {
+                    warn!(round, "malformed JSON retry cap reached — returning fallback");
+                    let fallback = "I was unable to produce a valid structured response. Please try again.".to_string();
+                    let _ = user_token_tx.send(fallback.clone()).await;
+                    return Ok(ToolLoopResult {
+                        provider: final_provider,
+                        content: fallback,
+                        tool_executions: all_executions,
+                        reasoning_traces,
+                    });
+                }
 
                 if let Some(sink) = event_sink {
                     sink(ThinkerEvent::AgentThought(format!(
@@ -260,14 +290,19 @@ pub async fn run_external_thinking_loop(
                     }
                 }
 
-                // ── Hallucinated tool guard ─────────────────────────────
+                // ── Hallucinated tool guard + required-param validation ─
+                //
+                // `get_with_spec` does a single O(n) registry scan and returns
+                // both the executable handle and the cached ToolSpec — avoiding
+                // the extra vtable dispatch + heap allocation that calling
+                // `tool_handle.spec()` would require on the hot path.
                 //
                 // If the model invents a tool name that doesn't exist in the
                 // registry, we feed it an error message and let it self-correct
                 // on the next round (e.g. switch to web_search).  We do NOT
                 // force a final_answer — the model may recover productively.
-                let tool_handle = match tool_registry.get(&tool_name) {
-                    Some(t) => t,
+                let (_tool_handle, tool_spec) = match tool_registry.get_with_spec(&tool_name) {
+                    Some(pair) => pair,
                     None => {
                         warn!(round, tool = %tool_name, "model hallucinated non-existent tool");
 
@@ -302,8 +337,7 @@ pub async fn run_external_thinking_loop(
                 // a cryptic message).  By catching this early, we feed a clear
                 // error that lets the model self-correct on the next round.
                 {
-                    let spec = tool_handle.spec();
-                    let missing: Vec<&str> = spec.params.iter()
+                    let missing: Vec<&str> = tool_spec.params.iter()
                         .filter(|p| p.required && !args.contains_key(&p.name))
                         .map(|p| p.name.as_str())
                         .collect();
@@ -321,7 +355,7 @@ pub async fn run_external_thinking_loop(
 
                         messages.push(ChatMessage::assistant(&full_text));
 
-                        let params_help: Vec<String> = spec.params.iter()
+                        let params_help: Vec<String> = tool_spec.params.iter()
                             .filter(|p| p.required)
                             .map(|p| format!("\"{}\" ({})", p.name, p.description))
                             .collect();
@@ -456,8 +490,16 @@ pub async fn run_external_thinking_loop(
                 // Truncate very long tool outputs to avoid blowing the
                 // context window.  Use a generous limit so the model can
                 // see past large navigation headers on heavy sites.
-                let obs = if output.len() > 12_000 {
-                    format!("{}... (truncated, {} total chars)", &output[..12_000], output.len())
+                //
+                // `truncate_to_char_boundary` counts Unicode scalar values, not
+                // bytes, so it never splits a multi-byte codepoint (which would
+                // panic with a byte-index slice like `&output[..12_000]`).
+                let obs = if output.chars().count() > 12_000 {
+                    format!(
+                        "{}... (truncated, {} total chars)",
+                        truncate_to_char_boundary(&output, 12_000),
+                        output.len()
+                    )
                 } else {
                     output
                 };
@@ -477,7 +519,7 @@ pub async fn run_external_thinking_loop(
         }
     }
 
-    warn!("external thinking loop exhausted {MAX_EXT_ROUNDS} rounds");
+    warn!(effective_max_rounds, "external thinking loop exhausted all rounds");
 
     // Fallback: always send a clean, human-readable message.
     // Never dump raw tool output (HTML, JSON fragments, etc.) to the user —

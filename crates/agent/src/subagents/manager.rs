@@ -257,13 +257,18 @@ fn parse_analysis(role: &str, raw: &str) -> SubagentAnalysis {
 }
 
 /// Check if `line` is a section header for `header` (e.g. "KEY_FACTS").
-/// Accepts `KEY_FACTS:`, `KEY_FACTS`, `**KEY_FACTS:**`, etc.
+///
+/// Accepts any of these forms (case-insensitive; `_` and ` ` are equivalent):
+/// - `KEY_FACTS`, `KEY FACTS`, `Key Facts`, `## Key Facts`, `**KEY_FACTS:**`
 fn matches_header(line: &str, header: &str) -> bool {
-    // Strip common markdown decorations.
+    // Strip common markdown decorations then normalise: uppercase + underscores→spaces.
     let stripped = line.trim_start_matches('*').trim_start_matches('#').trim();
-    stripped == header
-        || stripped.starts_with(&format!("{header}:"))
-        || stripped.starts_with(&format!("{header} :"))
+    let norm = |s: &str| s.replace('_', " ").to_ascii_uppercase();
+    let s = norm(stripped);
+    let h = norm(header);
+    s == h
+        || s.starts_with(&format!("{h}:"))
+        || s.starts_with(&format!("{h} :"))
 }
 
 #[cfg(test)]
