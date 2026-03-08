@@ -6,7 +6,7 @@
 /// ```
 /// When no embedding backend is available the embedding weight is redistributed
 /// to lexical and recency.
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 use chrono::Utc;
 use tracing::trace;
@@ -53,6 +53,7 @@ pub fn assemble_context_with_provenance(
         .filter(|e| seen_ids.insert(e.id))
         .collect();
 
+    // HashSet for O(1) `contains` when matching against each entry's cached token set.
     let query_terms = tokenize(query);
     let query_emb_slice: &[f32] = query_embedding.as_deref().unwrap_or(&[]);
     let now = Utc::now();
@@ -86,15 +87,18 @@ pub fn assemble_context_with_provenance(
 /// Score-only helper: computes score and rationale without cloning the entry.
 /// Used by `assemble_context_with_provenance` to rank by reference before
 /// deciding which entries to clone into the final output.
+///
+/// Uses `entry.tokens` (pre-computed at record/replay time) for O(1) lexical
+/// scoring instead of re-scanning the content string on every call.
 pub(crate) fn score_entry_ref(
     entry: &MemoryEntry,
-    query_terms: &BTreeSet<String>,
+    query_terms: &HashSet<String>,
     now: chrono::DateTime<Utc>,
     embedding_cos_sim: Option<f32>,
 ) -> ScoreOnly {
     let tier_score = tier_priority(entry.tier);
     let recency = recency_score(now, entry.created_at);
-    let lexical = lexical_relevance_score(&entry.content, query_terms);
+    let lexical = lexical_relevance_score(&entry.tokens, query_terms);
     let confidence = entry.confidence.clamp(0.0, 1.0);
 
     let score = if let Some(emb) = embedding_cos_sim {
@@ -146,12 +150,15 @@ fn recency_score(now: chrono::DateTime<Utc>, created_at: chrono::DateTime<Utc>) 
 
 // ── Lexical relevance ─────────────────────────────────────────────────────────
 
-fn lexical_relevance_score(content: &str, query_terms: &BTreeSet<String>) -> f32 {
+/// O(|query_terms|) relevance check using the entry's pre-computed token set.
+///
+/// `entry_tokens` comes from [`MemoryEntry::tokens`] (cached at record time).
+/// Each `query_terms.contains()` call is O(1) on the `HashSet`.
+fn lexical_relevance_score(entry_tokens: &HashSet<String>, query_terms: &HashSet<String>) -> f32 {
     if query_terms.is_empty() {
         return 0.0;
     }
-    let content_terms = tokenize(content);
-    let overlap = query_terms.intersection(&content_terms).count() as f32;
+    let overlap = query_terms.iter().filter(|t| entry_tokens.contains(t.as_str())).count() as f32;
     overlap / query_terms.len() as f32
 }
 
@@ -165,7 +172,13 @@ const STOP_WORDS: &[&str] = &[
     "how", "out", "our", "new", "now",
 ];
 
-pub(crate) fn tokenize(text: &str) -> BTreeSet<String> {
+/// Tokenise `text` into a de-duplicated `HashSet` of lowercase alphanumeric
+/// terms (length ≥ 3, stop-words excluded).
+///
+/// Returns `HashSet` (not `BTreeSet`) so callers get O(1) `contains` checks.
+/// Called once per entry at record/replay time; the result is cached in
+/// [`crate::schema::MemoryEntry::tokens`].
+pub(crate) fn tokenize(text: &str) -> HashSet<String> {
     text.split(|ch: char| !ch.is_alphanumeric())
         .filter(|t| t.len() >= 3)
         .map(|t| t.to_lowercase())
@@ -221,6 +234,7 @@ mod tests {
             valence: 0.0,
             tags: Vec::new(),
             embedding: None,
+            tokens: super::tokenize(content),
             created_at: Utc::now() - Duration::hours(age_hours),
             provenance_hash: "hash".to_string(),
         }

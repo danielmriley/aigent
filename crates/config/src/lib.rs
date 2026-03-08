@@ -45,6 +45,12 @@ pub struct AgentConfig {
     /// Prevents infinite loops in external thinking mode.
     #[serde(default = "default_max_steps_per_turn")]
     pub max_steps_per_turn: usize,
+    /// Maximum wall-clock seconds a single tool execution may take before it
+    /// is cancelled and an error observation is injected into the loop.
+    /// Separate from `step_timeout_seconds` (which covers LLM inference).
+    /// Default: 60.
+    #[serde(default = "default_tool_timeout_secs")]
+    pub tool_timeout_secs: u64,
 }
 
 impl Default for AgentConfig {
@@ -57,6 +63,7 @@ impl Default for AgentConfig {
             external_thinking: false,
             step_timeout_seconds: default_step_timeout_seconds(),
             max_steps_per_turn: default_max_steps_per_turn(),
+            tool_timeout_secs: default_tool_timeout_secs(),
         }
     }
 }
@@ -67,6 +74,10 @@ fn default_step_timeout_seconds() -> u64 {
 
 fn default_max_steps_per_turn() -> usize {
     10
+}
+
+fn default_tool_timeout_secs() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +261,19 @@ pub struct ToolsConfig {
     /// Prevents infinite tool-calling loops.  Default: 5.
     #[serde(default = "default_max_tool_rounds")]
     pub max_tool_rounds: usize,
+    /// Maximum byte length of a shell command string passed to `run_shell`.
+    /// Commands exceeding this limit are rejected before execution.
+    /// Default: 8192.
+    #[serde(default = "default_max_shell_command_bytes")]
+    pub max_shell_command_bytes: usize,
+    /// Maximum byte length of combined stdout+stderr captured from `run_shell`.
+    /// Output beyond this limit is truncated.  Default: 32768.
+    #[serde(default = "default_max_shell_output_bytes")]
+    pub max_shell_output_bytes: usize,
+    /// Default maximum bytes to read when `read_file` is called without an
+    /// explicit `max_bytes` argument.  Default: 65536.
+    #[serde(default = "default_max_file_read_bytes")]
+    pub max_file_read_bytes: usize,
     /// Agent-written WASM modules subsystem configuration.
     #[serde(default, alias = "skills")]
     pub modules: ModulesConfig,
@@ -304,6 +328,9 @@ impl Default for ToolsConfig {
             git_auto_commit: false,
             sandbox_enabled: true,
             max_tool_rounds: 5,
+            max_shell_command_bytes: default_max_shell_command_bytes(),
+            max_shell_output_bytes: default_max_shell_output_bytes(),
+            max_file_read_bytes: default_max_file_read_bytes(),
             modules: ModulesConfig::default(),
         }
     }
@@ -326,6 +353,18 @@ fn default_sandbox_enabled() -> bool {
 
 fn default_max_tool_rounds() -> usize {
     5
+}
+
+fn default_max_shell_command_bytes() -> usize {
+    8192
+}
+
+fn default_max_shell_output_bytes() -> usize {
+    32768
+}
+
+fn default_max_file_read_bytes() -> usize {
+    65536
 }
 
 // ── Safety config ─────────────────────────────────────────────────────────────

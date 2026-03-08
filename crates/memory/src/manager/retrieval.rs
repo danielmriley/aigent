@@ -31,17 +31,19 @@ impl MemoryManager {
         limit: usize,
         query_embedding: Option<Vec<f32>>,
     ) -> Vec<RankedMemoryContext> {
-        let core_entries = self.entries_by_tier(MemoryTier::Core);
-        let non_core: Vec<&MemoryEntry> = self
-            .store
-            .all()
-            .iter()
-            .filter(|entry| {
-                entry.tier != MemoryTier::Core
-                    && !entry.source.starts_with("assistant-turn")
-                    && entry.source != "sleep:cycle"
-            })
-            .collect();
+        // Single O(n) pass building both buckets simultaneously, halving
+        // the memory working set compared to two independent filter passes.
+        let mut core_entries: Vec<&MemoryEntry> = Vec::new();
+        let mut non_core: Vec<&MemoryEntry> = Vec::new();
+        for entry in self.store.all() {
+            if entry.tier == MemoryTier::Core {
+                core_entries.push(entry);
+            } else if !entry.source.starts_with("assistant-turn")
+                && entry.source != "sleep:cycle"
+            {
+                non_core.push(entry);
+            }
+        }
         let mut ranked = assemble_context_with_provenance(&non_core, &core_entries, query, limit, query_embedding);
         self.prepend_kv_identity_block(&mut ranked);
         ranked
@@ -67,6 +69,8 @@ impl MemoryManager {
                     provenance_hash: "kv_summary".to_string(),
                     tags: vec!["identity".to_string(), "auto_injected".to_string()],
                     embedding: None,
+                    // Pinned synthetic entry — not scored lexically, skip tokenisation.
+                    tokens: Default::default(),
                 },
                 score: 2.0,
                 rationale: "pinned: KV identity summary auto-injected from vault".to_string(),
@@ -190,9 +194,15 @@ impl MemoryManager {
         // ── Dedup + sort + cap each bucket ─────────────────────────────
         let dedup_sort_cap = |bucket: &mut Vec<(String, chrono::DateTime<chrono::Utc>)>| -> Vec<String> {
             // Dedup by content: keep the most recent occurrence of each
-            // unique string.
-            let mut seen = HashSet::new();
-            bucket.retain(|(content, _)| seen.insert(content.clone()));
+            // unique string.  Store u64 hashes instead of full String clones
+            // to avoid O(n·L) allocations across all bucket entries.
+            use std::hash::{Hash, Hasher};
+            let mut seen: HashSet<u64> = HashSet::new();
+            bucket.retain(|(content, _)| {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut h);
+                seen.insert(h.finish())
+            });
             // Most recent first.
             bucket.sort_by(|a, b| b.1.cmp(&a.1));
             let take_n = if max_per_bucket == 0 { bucket.len() } else { max_per_bucket.min(bucket.len()) };

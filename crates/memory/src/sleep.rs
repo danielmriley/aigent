@@ -47,7 +47,7 @@ pub fn distill(entries: &[MemoryEntry]) -> SleepSummary {
     for entry in entries {
         // Exclude sleep-produced copies from repetition counts — otherwise
         // each distillation round inflates the count for the original content.
-        if entry.source.starts_with("sleep:") {
+        if entry.source_kind().is_sleep() {
             continue;
         }
         let key = entry.content.trim().to_lowercase();
@@ -68,7 +68,7 @@ pub fn distill(entries: &[MemoryEntry]) -> SleepSummary {
         // geometric growth because each cycle's promoted copies would be
         // promoted again next cycle.  Sleep-produced entries are already
         // placed at the correct tier by the agentic or passive pipeline.
-        if entry.source.starts_with("sleep:") {
+        if entry.source_kind().is_sleep() {
             continue;
         }
 
@@ -650,6 +650,7 @@ mod tests {
             valence: 0.2,
             tags: Vec::new(),
             embedding: None,
+            tokens: Default::default(),
             created_at: Utc::now(),
             provenance_hash: "test".to_string(),
         }
@@ -795,6 +796,7 @@ VALENCE: abcd1234 :: 0.8
             valence: 0.0,
             tags: Vec::new(),
             embedding: None,
+            tokens: Default::default(),
             created_at: old_date,
             provenance_hash: "test".to_string(),
         };

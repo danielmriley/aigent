@@ -5,7 +5,7 @@ use regex::Regex;
 use tracing::{debug, warn};
 
 use crate::identity::IdentityKernel;
-use crate::schema::{MemoryEntry, MemoryTier};
+use crate::schema::{MemoryEntry, MemoryTier, SourceKind};
 
 #[derive(Debug)]
 pub enum ConsistencyDecision {
@@ -105,7 +105,7 @@ pub fn evaluate_core_update(
 
 fn evaluate_core(identity: &IdentityKernel, entry: &MemoryEntry) -> ConsistencyDecision {
     let trusted_source = entry.source.starts_with("onboarding")
-        || entry.source.starts_with("sleep:")
+        || entry.source_kind().is_sleep()
         || entry.source.starts_with("identity:")
         || entry.source.starts_with("constitution:")
         || entry.source.starts_with("belief");
@@ -140,7 +140,7 @@ fn evaluate_core(identity: &IdentityKernel, entry: &MemoryEntry) -> ConsistencyD
 
 fn evaluate_user_profile(entry: &MemoryEntry) -> ConsistencyDecision {
     let trusted = entry.source.starts_with("user-profile:")
-        || entry.source.starts_with("sleep:")
+        || entry.source_kind().is_sleep()
         || entry.source.starts_with("onboarding")
         || entry.source.starts_with("user-input");
 
@@ -162,9 +162,9 @@ fn evaluate_user_profile(entry: &MemoryEntry) -> ConsistencyDecision {
 
 fn evaluate_reflective(entry: &MemoryEntry) -> ConsistencyDecision {
     let trusted = entry.source.starts_with("reflect:")
-        || entry.source.starts_with("sleep:")
+        || entry.source_kind().is_sleep()
         || entry.source.starts_with("onboarding")
-        || entry.source.starts_with("assistant-reply")
+        || matches!(entry.source_kind(), SourceKind::AssistantReply)
         || entry.source.starts_with("agentic-sleep");
 
     if !trusted {
@@ -201,6 +201,7 @@ mod tests {
             provenance_hash: "hash".to_string(),
             tags: vec![],
             embedding: None,
+            tokens: Default::default(),
         }
     }
 

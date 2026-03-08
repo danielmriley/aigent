@@ -50,7 +50,10 @@ pub fn history_file_path() -> PathBuf {
 /// Creates the file (and parent directories) if they don't exist.
 pub fn append_turn(role: impl Into<String>, content: impl Into<String>) -> Result<()> {
     let path = history_file_path();
-    fs::create_dir_all(path.parent().unwrap())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("history path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
 
     let record = TurnRecord {
         role: role.into(),

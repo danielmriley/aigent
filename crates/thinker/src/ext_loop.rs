@@ -27,6 +27,7 @@
 //! 4. Appends the assistant reply + tool observation to `messages` and loops.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -44,9 +45,9 @@ use crate::tool_loop::{EventSink, ToolExecution, ToolLoopResult};
 /// Maximum number of tool-call → observation → re-prompt rounds.
 const MAX_EXT_ROUNDS: usize = 10;
 
-/// Maximum wall-clock time for a single tool execution.
-/// Separate from `step_timeout` (which covers LLM inference).
-const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Fallback tool execution timeout used when no config value is provided.
+#[allow(dead_code)]
+const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Run the external thinking loop.
 ///
@@ -66,14 +67,20 @@ pub async fn run_external_thinking_loop(
     user_token_tx: mpsc::Sender<String>,
     event_sink: Option<&EventSink>,
     step_timeout: Duration,
+    tool_timeout: Duration,
 ) -> Result<ToolLoopResult> {
     let mut all_executions: Vec<ToolExecution> = Vec::new();
     let mut reasoning_traces: Vec<String> = Vec::new();
     let final_provider = primary;
-    // Circuit breaker: track (tool_name, canonical_args) pairs we've already
+    // Circuit breaker: track (tool_name, args_hash) pairs we've already
     // executed.  An exact repeat signals an infinite loop — we inject an error
     // and force a final_answer instead of running indefinitely.
-    let mut seen_tool_calls: HashSet<(String, String)> = HashSet::new();
+    //
+    // The args hash is computed by sorting key-value pairs by key (for
+    // determinism) and feeding them through DefaultHasher — this avoids the
+    // previous BTreeMap allocation + serde_json::to_string call that ran on
+    // every tool invocation in a turn.
+    let mut seen_tool_calls: HashSet<(String, u64)> = HashSet::new();
 
     for round in 0..MAX_EXT_ROUNDS {
         // Log prompt size on the first step so we can spot bloated prompts
@@ -176,7 +183,7 @@ pub async fn run_external_thinking_loop(
                 // correction prompt — same pattern as the hallucinated-tool
                 // and missing-params guards.
                 messages.push(ChatMessage::assistant(&full_text));
-                messages.push(ChatMessage::user(&format!(
+                messages.push(ChatMessage::user(format!(
                     "ERROR: Your response was not valid structured JSON. Parse error: {e}\n\n\
                      You MUST respond with EXACTLY ONE JSON object in one of these forms:\n\
                      {{\"type\":\"final_answer\",\"thought\":\"<why>\",\"final_answer\":\"<text>\"}}\n\
@@ -334,16 +341,30 @@ pub async fn run_external_thinking_loop(
 
                 // ── Repeated-call circuit breaker ───────────────────────
                 //
-                // Build a canonical key for (tool_name, args) using sorted
-                // keys so insertion order doesn't matter.  If we've already
-                // executed this exact call in this turn, the model is looping:
-                // inject an error and force it to produce a final_answer.
+                // Build a canonical key for (tool_name, args_hash) using
+                // sorted key-value pairs so insertion order doesn't matter.
+                // If we've already executed this exact call in this turn, the
+                // model is looping: inject an error and force a final_answer.
+                //
+                // We hash directly instead of BTreeMap + serde_json::to_string
+                // to avoid two heap allocations per tool call.
                 {
-                    let canonical: std::collections::BTreeMap<_, _> = args.iter().collect();
-                    let call_key = (
-                        tool_name.clone(),
-                        serde_json::to_string(&canonical).unwrap_or_default(),
-                    );
+                    let call_key = {
+                        // Build a deterministic hash over (tool_name, sorted args)
+                        // without allocating a BTreeMap or JSON string.
+                        // `serde_json::Value` doesn't implement Hash so we
+                        // serialise each value with to_string() — this is one
+                        // small per-argument alloc rather than a full JSON doc.
+                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                        tool_name.hash(&mut hasher);
+                        let mut sorted: Vec<(&String, &serde_json::Value)> = args.iter().collect();
+                        sorted.sort_unstable_by_key(|(k, _)| k.as_str());
+                        for (k, v) in &sorted {
+                            k.hash(&mut hasher);
+                            v.to_string().hash(&mut hasher);
+                        }
+                        (tool_name.clone(), hasher.finish())
+                    };
                     if seen_tool_calls.contains(&call_key) {
                         warn!(round, tool = %tool_name, "repeated tool call detected — circuit breaking");
 
@@ -354,7 +375,7 @@ pub async fn run_external_thinking_loop(
                         }
 
                         messages.push(ChatMessage::assistant(&full_text));
-                        messages.push(ChatMessage::user(&format!(
+                        messages.push(ChatMessage::user(format!(
                             "ERROR: You already called '{tool_name}' with these exact arguments and \
                              received a result. Calling it again would loop forever. \
                              You MUST now produce a {{\"type\":\"final_answer\",...}} response \
@@ -390,7 +411,7 @@ pub async fn run_external_thinking_loop(
                 // LLM step timeout so a slow shell command doesn't cancel inference).
                 let start = Instant::now();
                 let exec_result = tokio::time::timeout(
-                    TOOL_TIMEOUT,
+                    tool_timeout,
                     tool_executor.execute(tool_registry, &tool_name, &string_args),
                 ).await;
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -398,9 +419,9 @@ pub async fn run_external_thinking_loop(
                     Ok(Ok(ref o)) => (o.success, o.output.clone()),
                     Ok(Err(ref e)) => (false, e.to_string()),
                     Err(_) => {
-                        warn!(round, tool = %tool_name, timeout_secs = TOOL_TIMEOUT.as_secs(),
+                        warn!(round, tool = %tool_name, timeout_secs = tool_timeout.as_secs(),
                               "tool execution timed out");
-                        (false, format!("ERROR: Tool '{tool_name}' timed out after {}s.", TOOL_TIMEOUT.as_secs()))
+                        (false, format!("ERROR: Tool '{tool_name}' timed out after {}s.", tool_timeout.as_secs()))
                     }
                 };
 

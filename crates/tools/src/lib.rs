@@ -131,53 +131,7 @@ impl ToolSpec {
     /// This format is accepted by both OpenRouter (OpenAI-compatible) and
     /// Ollama's `/api/chat` endpoint.
     pub fn to_openai_tool_schema(&self) -> serde_json::Value {
-        let mut properties = serde_json::Map::new();
-        let mut required: Vec<String> = Vec::new();
-
-        for p in &self.params {
-            let type_str = match p.param_type {
-                ParamType::String => "string",
-                ParamType::Number => "number",
-                ParamType::Integer => "integer",
-                ParamType::Boolean => "boolean",
-                ParamType::Array => "array",
-                ParamType::Object => "object",
-            };
-            let mut prop = serde_json::json!({
-                "type": type_str,
-                "description": p.description,
-            });
-            if !p.enum_values.is_empty() {
-                prop["enum"] = serde_json::json!(p.enum_values);
-            }
-            if let Some(ref def) = p.default {
-                // Serialize the default as the appropriate JSON type rather
-                // than always wrapping it in a JSON string.
-                prop["default"] = match p.param_type {
-                    ParamType::Number => def.parse::<f64>()
-                        .map(|n| serde_json::json!(n))
-                        .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
-                    ParamType::Integer => def.parse::<i64>()
-                        .map(|n| serde_json::json!(n))
-                        .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
-                    ParamType::Boolean => match def.as_str() {
-                        "true" => serde_json::json!(true),
-                        "false" => serde_json::json!(false),
-                        _ => serde_json::Value::String(def.clone()),
-                    },
-                    ParamType::Array | ParamType::Object => {
-                        serde_json::from_str(def)
-                            .unwrap_or_else(|_| serde_json::Value::String(def.clone()))
-                    }
-                    ParamType::String => serde_json::Value::String(def.clone()),
-                };
-            }
-            properties.insert(p.name.clone(), prop);
-            if p.required {
-                required.push(p.name.clone());
-            }
-        }
-
+        let (properties, required) = build_param_properties(&self.params);
         serde_json::json!({
             "type": "function",
             "function": {
@@ -198,50 +152,7 @@ impl ToolSpec {
     /// produces a self-contained `$schema`-annotated document suitable for
     /// validation or IDE tooling.
     pub fn to_json_schema(&self) -> serde_json::Value {
-        let mut properties = serde_json::Map::new();
-        let mut required: Vec<String> = Vec::new();
-
-        for p in &self.params {
-            let type_str = match p.param_type {
-                ParamType::String => "string",
-                ParamType::Number => "number",
-                ParamType::Integer => "integer",
-                ParamType::Boolean => "boolean",
-                ParamType::Array => "array",
-                ParamType::Object => "object",
-            };
-            let mut prop = serde_json::json!({
-                "type": type_str,
-                "description": p.description,
-            });
-            if !p.enum_values.is_empty() {
-                prop["enum"] = serde_json::json!(p.enum_values);
-            }
-            if let Some(ref def) = p.default {
-                prop["default"] = match p.param_type {
-                    ParamType::Number => def.parse::<f64>()
-                        .map(|n| serde_json::json!(n))
-                        .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
-                    ParamType::Integer => def.parse::<i64>()
-                        .map(|n| serde_json::json!(n))
-                        .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
-                    ParamType::Boolean => match def.as_str() {
-                        "true" => serde_json::json!(true),
-                        "false" => serde_json::json!(false),
-                        _ => serde_json::Value::String(def.clone()),
-                    },
-                    ParamType::Array | ParamType::Object => {
-                        serde_json::from_str(def)
-                            .unwrap_or_else(|_| serde_json::Value::String(def.clone()))
-                    }
-                    ParamType::String => serde_json::Value::String(def.clone()),
-                };
-            }
-            properties.insert(p.name.clone(), prop);
-            if p.required {
-                required.push(p.name.clone());
-            }
-        }
+        let (properties, required) = build_param_properties(&self.params);
 
         serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -314,6 +225,63 @@ impl ToolSpec {
 /// Generate a JSON Schema document describing all tool-related types.
 ///
 /// This uses `schemars` to produce a proper `$schema`-annotated document
+/// Build a JSON Schema `properties` map and `required` array from a slice of
+/// [`ToolParam`]s.  Shared by [`ToolSpec::to_openai_tool_schema`] and
+/// [`ToolSpec::to_json_schema`] to avoid duplicating the type-mapping logic.
+fn build_param_properties(params: &[ToolParam]) -> (serde_json::Map<String, serde_json::Value>, Vec<String>) {
+    let mut properties = serde_json::Map::new();
+    let mut required: Vec<String> = Vec::new();
+    for p in params {
+        properties.insert(p.name.clone(), build_schema_property(p));
+        if p.required {
+            required.push(p.name.clone());
+        }
+    }
+    (properties, required)
+}
+
+/// Build a single JSON Schema property object from a [`ToolParam`].
+fn build_schema_property(p: &ToolParam) -> serde_json::Value {
+    let type_str = match p.param_type {
+        ParamType::String  => "string",
+        ParamType::Number  => "number",
+        ParamType::Integer => "integer",
+        ParamType::Boolean => "boolean",
+        ParamType::Array   => "array",
+        ParamType::Object  => "object",
+    };
+    let mut prop = serde_json::json!({
+        "type": type_str,
+        "description": p.description,
+    });
+    if !p.enum_values.is_empty() {
+        prop["enum"] = serde_json::json!(p.enum_values);
+    }
+    if let Some(ref def) = p.default {
+        // Serialize the default as the appropriate JSON type rather than
+        // always wrapping it in a JSON string.
+        prop["default"] = match p.param_type {
+            ParamType::Number => def.parse::<f64>()
+                .map(|n| serde_json::json!(n))
+                .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
+            ParamType::Integer => def.parse::<i64>()
+                .map(|n| serde_json::json!(n))
+                .unwrap_or_else(|_| serde_json::Value::String(def.clone())),
+            ParamType::Boolean => match def.as_str() {
+                "true"  => serde_json::json!(true),
+                "false" => serde_json::json!(false),
+                _       => serde_json::Value::String(def.clone()),
+            },
+            ParamType::Array | ParamType::Object => {
+                serde_json::from_str(def)
+                    .unwrap_or_else(|_| serde_json::Value::String(def.clone()))
+            }
+            ParamType::String => serde_json::Value::String(def.clone()),
+        };
+    }
+    prop
+}
+
 /// suitable for IDE tooling, validation, and marketplace manifests.
 pub fn tool_registry_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(ToolSpec)
@@ -389,7 +357,15 @@ impl std::fmt::Display for ToolSource {
 }
 
 /// An entry in the tool registry, associating a tool with its source metadata.
+///
+/// `spec` is computed once at registration time (via `Tool::spec()`) and
+/// cached here so that all hot-path reads — `get()`, `list_specs()`,
+/// `tools_in_group()`, `expand_groups()`, etc. — are allocation-free
+/// string comparisons over contiguous memory rather than repeated trait-
+/// dispatch calls that heap-allocate a fresh `ToolSpec` per iteration.
 struct ToolEntry {
+    /// Cached at registration; never mutated after that.
+    spec: ToolSpec,
     tool: Arc<dyn Tool>,
     source: ToolSource,
 }
@@ -437,7 +413,10 @@ impl ToolRegistry {
 
     /// Register a tool with an explicit [`ToolSource`] tag.
     pub fn register_with_source(&self, tool: Box<dyn Tool>, source: ToolSource) {
+        // Call spec() once here so every subsequent hot-path read is O(1).
+        let spec = tool.spec();
         let entry = ToolEntry {
+            spec,
             tool: Arc::from(tool),
             source,
         };
@@ -450,13 +429,13 @@ impl ToolRegistry {
     pub fn unregister(&self, name: &str) -> bool {
         let mut tools = self.tools.write().unwrap();
         let before = tools.len();
-        tools.retain(|e| e.tool.spec().name != name);
+        tools.retain(|e| e.spec.name != name);
         tools.len() < before
     }
 
     /// Return specs for all registered tools.
     pub fn list_specs(&self) -> Vec<ToolSpec> {
-        self.tools.read().unwrap().iter().map(|e| e.tool.spec()).collect()
+        self.tools.read().unwrap().iter().map(|e| e.spec.clone()).collect()
     }
 
     /// Detailed listing including source metadata.
@@ -466,7 +445,7 @@ impl ToolRegistry {
             .unwrap()
             .iter()
             .map(|e| ToolInfo {
-                spec: e.tool.spec(),
+                spec: e.spec.clone(),
                 source: e.source,
             })
             .collect()
@@ -475,12 +454,17 @@ impl ToolRegistry {
     /// Look up a tool by name (first-match wins, preserving WASM-first
     /// semantics).  Returns an `Arc` so the caller owns the handle and
     /// can safely hold it across `.await` points.
+    ///
+    /// O(n) scan over a contiguous Vec — allocation-free because the name
+    /// comparison reads the cached `ToolEntry::spec.name` rather than calling
+    /// `Tool::spec()` on every entry.  For typical registry sizes (30–60
+    /// tools) this is ~100 ns and does not warrant a HashMap index.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools
             .read()
             .unwrap()
             .iter()
-            .find(|e| e.tool.spec().name == name)
+            .find(|e| e.spec.name == name)
             .map(|e| Arc::clone(&e.tool))
     }
 
@@ -501,7 +485,7 @@ impl ToolRegistry {
             .unwrap()
             .iter()
             .filter(|e| e.source == ToolSource::Dynamic)
-            .map(|e| e.tool.spec().name)
+            .map(|e| e.spec.name.clone())
             .collect()
     }
 
@@ -511,8 +495,8 @@ impl ToolRegistry {
             .read()
             .unwrap()
             .iter()
-            .filter(|e| e.tool.spec().metadata.group == group)
-            .map(|e| e.tool.spec().name)
+            .filter(|e| e.spec.metadata.group == group)
+            .map(|e| e.spec.name.clone())
             .collect()
     }
 

@@ -56,6 +56,12 @@ pub struct JsonStreamBuffer {
     completed: Option<String>,
 }
 
+impl Default for JsonStreamBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JsonStreamBuffer {
     pub fn new() -> Self {
         Self {
