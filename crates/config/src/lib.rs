@@ -733,6 +733,20 @@ pub struct MemorySleepConfig {
     /// new Opinion entry.  The hard lower bound is 5 and this value may not be
     /// set below it at runtime.  Default: 5.
     pub opinion_min_observations: usize,
+    /// Nightly quiet-window start in "HH:MM" 24-hour local time.
+    /// The confidence sleep cycle runs during this window when ≥ 22 h have
+    /// elapsed since the last run.  Default: "22:00".
+    pub nightly_window_start: String,
+    /// Nightly quiet-window end in "HH:MM" 24-hour local time.  Default: "06:00".
+    pub nightly_window_end: String,
+    /// Maximum number of Active entries allowed in the working memory store.
+    /// When the count exceeds 90 % of this limit the confidence sleep cycle
+    /// triggers immediately.  Default: 2000.
+    pub capacity_limit: usize,
+    /// Episodic memories older than this many days without consolidation
+    /// transition to `NodeState::Archived`.  `0` disables archival.
+    /// Default: 30.
+    pub archival_age_days: u32,
 }
 
 impl Default for MemorySleepConfig {
@@ -740,6 +754,10 @@ impl Default for MemorySleepConfig {
         Self {
             hot_window_hours: 24,
             opinion_min_observations: 5,
+            nightly_window_start: "22:00".to_string(),
+            nightly_window_end: "06:00".to_string(),
+            capacity_limit: 2000,
+            archival_age_days: 30,
         }
     }
 }
