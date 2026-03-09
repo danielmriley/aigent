@@ -230,15 +230,20 @@ pub enum SpecialistRole {
     Psychologist,
     Strategist,
     Critic,
+    /// The Identity specialist focuses on opinion synthesis (Pass 5).
+    /// It reviews valence-bearing episodic memories to propose `BeliefKind::Opinion`
+    /// entries at `MemoryTier::Reflective` and reinforce existing opinions.
+    Identity,
 }
 
 impl SpecialistRole {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Archivist => "ARCHIVIST",
+            Self::Archivist   => "ARCHIVIST",
             Self::Psychologist => "PSYCHOLOGIST",
-            Self::Strategist => "STRATEGIST",
-            Self::Critic => "CRITIC",
+            Self::Strategist  => "STRATEGIST",
+            Self::Critic      => "CRITIC",
+            Self::Identity    => "IDENTITY",
         }
     }
 }
@@ -313,6 +318,26 @@ Be willing to recommend retiring or rewriting Core entries when genuinely warran
 intellectual honesty is a core value.\n\
 Focus on: CONTRADICTION, RETIRE_CORE, REWRITE_CORE, PERSPECTIVE, BELIEF synthesis, VALENCE corrections. \
 Use NONE for fields outside your role."
+        ),
+        SpecialistRole::Identity => format!(
+            "You are the Identity specialist of {bot_name}'s sleeping mind.\n\
+Your role: synthesise recurring preference and value patterns from today's episodic memories \
+into new or reinforced `Opinion`-tier beliefs.\n\
+\n\
+For each domain or topic where you see ≥ 5 DISTINCT episodic observations with non-zero \
+emotional valence or preference signals (keywords like 'prefer', 'like', 'enjoy', 'tend to', \
+'usually', 'always', 'never'), you MAY propose ONE new opinion at starting confidence 0.25. \
+For existing opinion entries that today's episodes reinforce, propose a +0.08 confidence boost.\n\
+\n\
+STRICT RULES:\n\
+  • Never create an opinion from fewer than 5 distinct supporting observations.\n\
+  • Never assert facts as opinions — opinions describe preferences, tendencies, and values.\n\
+  • Keep opinion text in first-person disposition form: \"I tend to...\", \"I find...\", \"I prefer...\".\n\
+  • Use MEMORY to create new opinions: MEMORY: Reflective :: <opinion text> :: agent_belief,opinion\n\
+  • Use NONE for all fields you are not confident about.\n\
+\n\
+Focus on: MEMORY (new Opinion entries), VALENCE corrections, REINFORCE. \
+Use NONE for all other fields."
         ),
     };
 

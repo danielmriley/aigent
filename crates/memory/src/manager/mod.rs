@@ -24,6 +24,7 @@ pub type EmbedFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<Vec<
 /// the heuristic-only (no LLM) consolidation path.
 pub type ConsolidationFn = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> + Send + Sync>;
 
+use aigent_config::{LearningConfig, MemorySleepConfig};
 use crate::consistency::{ConsistencyDecision, evaluate_core_update};
 use crate::event_log::{MemoryEventLog, MemoryLogEvent, MemoryRecordEvent};
 use crate::identity::IdentityKernel;
@@ -84,6 +85,12 @@ pub struct MemoryManager {
     /// Reads via `current_confidence()` are O(1).  The event log + redb
     /// checkpoint table are the durable backing store; this map is ephemeral.
     pub(crate) confidence_overrides: HashMap<Uuid, f32>,
+    /// Tunable learning-rate parameters loaded from `[memory.learning]` in
+    /// `config/default.toml`.  Defaults to `LearningConfig::default()`.
+    pub learning: LearningConfig,
+    /// Sleep-cycle tuning parameters loaded from `[memory.sleep]` in
+    /// `config/default.toml`.  Defaults to `MemorySleepConfig::default()`.
+    pub sleep_cfg: MemorySleepConfig,
 }
 
 impl Default for MemoryManager {
@@ -99,6 +106,8 @@ impl Default for MemoryManager {
             cached_identity_block: None,
             cached_beliefs_block: None,
             confidence_overrides: HashMap::new(),
+            learning: LearningConfig::default(),
+            sleep_cfg: MemorySleepConfig::default(),
         }
     }
 }
@@ -118,6 +127,8 @@ impl MemoryManager {
             cached_identity_block: None,
             cached_beliefs_block: None,
             confidence_overrides: HashMap::new(),
+            learning: LearningConfig::default(),
+            sleep_cfg: MemorySleepConfig::default(),
         };
 
         // Load all event types from the log — not just MemoryRecordEvents.
@@ -200,6 +211,18 @@ impl MemoryManager {
     /// summaries.  The daemon reads this from `config.memory.kv_tier_limit`.
     pub fn set_kv_tier_limit(&mut self, limit: usize) {
         self.kv_tier_limit = limit;
+    }
+
+    /// Replace the learning-rate parameters.  Call once after construction
+    /// with values read from `config.memory.learning`.
+    pub fn set_learning_config(&mut self, cfg: LearningConfig) {
+        self.learning = cfg;
+    }
+
+    /// Replace the sleep-cycle tuning parameters.  Call once after
+    /// construction with values read from `config.memory.sleep`.
+    pub fn set_sleep_config(&mut self, cfg: MemorySleepConfig) {
+        self.sleep_cfg = cfg;
     }
 
     /// Attach a redb-backed `MemoryIndex` for O(1) tier lookups.  Once set,
@@ -354,30 +377,32 @@ impl MemoryManager {
         }
 
         // Learning-rate table: initial confidence by BeliefKind × SourceKind.
+        // Values driven by `self.learning` (loaded from `[memory.learning]` in config).
+        let lc = &self.learning;
         let initial_confidence: f32 = match (&belief_kind, &sk) {
             // ── Empirical ─────────────────────────────────────────────────────
-            (BeliefKind::Empirical, SourceKind::ToolSuccess { .. })                                           => 0.45,
-            (BeliefKind::Empirical, SourceKind::ToolFailure { failure_class: FailureClass::Transient, .. })   => 0.20,
-            (BeliefKind::Empirical, SourceKind::ToolFailure { failure_class: FailureClass::Configuration, .. })=> 0.20,
-            (BeliefKind::Empirical, SourceKind::ToolFailure { failure_class: FailureClass::Architectural, .. })=> 0.30,
-            (BeliefKind::Empirical, _)                                                                        => 0.55,
+            (BeliefKind::Empirical, SourceKind::ToolSuccess { .. })                                           => lc.empirical_tool_success,
+            (BeliefKind::Empirical, SourceKind::ToolFailure { failure_class: FailureClass::Transient, .. })   => lc.empirical_tool_failure_transient,
+            (BeliefKind::Empirical, SourceKind::ToolFailure { failure_class: FailureClass::Configuration, .. })=> lc.empirical_tool_failure_transient,
+            (BeliefKind::Empirical, SourceKind::ToolFailure { failure_class: FailureClass::Architectural, .. })=> lc.empirical_tool_failure_arch,
+            (BeliefKind::Empirical, _)                                                                        => lc.empirical_human,
 
             // ── Procedural ────────────────────────────────────────────────────
-            (BeliefKind::Procedural, SourceKind::ToolSuccess { .. })                                           => 0.40,
-            (BeliefKind::Procedural, SourceKind::ToolFailure { failure_class: FailureClass::Transient, .. })   => 0.15,
-            (BeliefKind::Procedural, SourceKind::ToolFailure { failure_class: FailureClass::Configuration, .. })=> 0.15,
-            (BeliefKind::Procedural, SourceKind::ToolFailure { failure_class: FailureClass::Architectural, .. })=> 0.25,
-            (BeliefKind::Procedural, _)                                                                        => 0.55,
+            (BeliefKind::Procedural, SourceKind::ToolSuccess { .. })                                           => lc.procedural_tool_success,
+            (BeliefKind::Procedural, SourceKind::ToolFailure { failure_class: FailureClass::Transient, .. })   => lc.procedural_tool_failure_transient,
+            (BeliefKind::Procedural, SourceKind::ToolFailure { failure_class: FailureClass::Configuration, .. })=> lc.procedural_tool_failure_transient,
+            (BeliefKind::Procedural, SourceKind::ToolFailure { failure_class: FailureClass::Architectural, .. })=> lc.procedural_tool_failure_arch,
+            (BeliefKind::Procedural, _)                                                                        => lc.procedural_human,
 
             // ── SelfModel ─────────────────────────────────────────────────────
-            (BeliefKind::SelfModel, SourceKind::ToolSuccess { .. })                                           => 0.50,
-            (BeliefKind::SelfModel, SourceKind::ToolFailure { failure_class: FailureClass::Transient, .. })   => 0.10,
-            (BeliefKind::SelfModel, SourceKind::ToolFailure { failure_class: FailureClass::Configuration, .. })=> 0.10,
-            (BeliefKind::SelfModel, SourceKind::ToolFailure { failure_class: FailureClass::Architectural, .. })=> 0.30,
-            (BeliefKind::SelfModel, _)                                                                        => 0.50,
+            (BeliefKind::SelfModel, SourceKind::ToolSuccess { .. })                                           => lc.self_model_tool_success,
+            (BeliefKind::SelfModel, SourceKind::ToolFailure { failure_class: FailureClass::Transient, .. })   => lc.self_model_tool_failure_transient,
+            (BeliefKind::SelfModel, SourceKind::ToolFailure { failure_class: FailureClass::Configuration, .. })=> lc.self_model_tool_failure_transient,
+            (BeliefKind::SelfModel, SourceKind::ToolFailure { failure_class: FailureClass::Architectural, .. })=> lc.self_model_tool_failure_arch,
+            (BeliefKind::SelfModel, _)                                                                        => lc.self_model_human,
 
             // ── Opinion (only human sources reach here — tool blocked above) ──
-            (BeliefKind::Opinion, _) => 0.45,
+            (BeliefKind::Opinion, _) => lc.opinion_human,
         };
 
         let entry = self
@@ -936,23 +961,24 @@ impl MemoryManager {
 
         let source = ConfidenceSource::Tool { name: tool_name.to_string() };
 
+        let lc = self.learning.clone();
         for (id, belief_kind) in matching {
             if belief_kind == BeliefKind::Opinion {
                 continue;
             }
             let (delta, reason) = if success {
                 let d: f32 = match belief_kind {
-                    BeliefKind::Empirical  => 0.08,
-                    BeliefKind::Procedural => 0.10,
-                    BeliefKind::SelfModel  => 0.12,
+                    BeliefKind::Empirical  => lc.confirm_tool_empirical,
+                    BeliefKind::Procedural => lc.confirm_tool_procedural,
+                    BeliefKind::SelfModel  => lc.confirm_tool_self_model,
                     BeliefKind::Opinion    => unreachable!("filtered above"),
                 };
                 (d, ConfidenceReason::ToolConfirmation)
             } else {
                 let d: f32 = match failure_class {
-                    FailureClass::Transient      => -0.05,
-                    FailureClass::Configuration  => -0.08,
-                    FailureClass::Architectural  => -0.20,
+                    FailureClass::Transient      => -lc.contradict_tool_failure_transient,
+                    FailureClass::Configuration  => -lc.contradict_tool_failure_config,
+                    FailureClass::Architectural  => -lc.contradict_tool_failure_arch,
                 };
                 (d, ConfidenceReason::ToolContradiction)
             };
@@ -1761,6 +1787,233 @@ mod tests {
             .record(MemoryTier::Semantic, "second entry", "test")
             .await?;
         assert_eq!(manager.active_entry_count(), 2);
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 6 — Pass 3: contradiction detection
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Pass 3 must reduce confidence on a SelfModel belief that says the agent
+    /// cannot use a tool that actually succeeded today.
+    #[tokio::test]
+    async fn pass3_detects_self_model_contradiction() -> Result<()> {
+        use crate::schema::{BeliefKind, ConfidenceReason, ConfidenceSource};
+
+        let mut manager = MemoryManager::default();
+
+        // Record a SelfModel belief asserting inability to use web_search.
+        // SelfModel from "assistant-reply" starts at 0.50; we apply a small +0.10
+        // signal so it clears the `> 0.5` threshold used by Pass 3.
+        let belief_id = manager
+            .record_observation(
+                "I cannot use web_search due to access restrictions".to_string(),
+                "assistant-reply".to_string(),
+                MemoryTier::Semantic,
+                BeliefKind::SelfModel,
+                vec![],
+            )
+            .await?;
+        manager
+            .record_confidence_signal(
+                belief_id,
+                0.10,
+                ConfidenceReason::UserConfirmation,
+                ConfidenceSource::UserMessage,
+            )
+            .await?;
+
+        // Record a tool-success entry for web_search from today.
+        manager.record(MemoryTier::Episodic, "web search results", "tool-success:web_search").await?;
+
+        let confidence_before = manager.current_confidence(belief_id);
+        let count = manager.run_sleep_pass_3_contradiction().await?;
+
+        assert_eq!(count, 1, "exactly one contradiction should be detected");
+        let confidence_after = manager.current_confidence(belief_id);
+        assert!(
+            confidence_after < confidence_before,
+            "confidence must decrease after contradiction: before={confidence_before}, after={confidence_after}"
+        );
+        assert!(
+            (confidence_before - confidence_after - 0.35).abs() < 0.01,
+            "expected ~0.35 confidence drop, got delta={}",
+            confidence_before - confidence_after
+        );
+        Ok(())
+    }
+
+    /// Pass 3 must NOT touch beliefs that do not reference a successful tool.
+    #[tokio::test]
+    async fn pass3_ignores_unrelated_beliefs() -> Result<()> {
+        use crate::schema::{BeliefKind, ConfidenceReason, ConfidenceSource};
+
+        let mut manager = MemoryManager::default();
+
+        // Empirical belief about shell_exec — source "chat" gives 0.55 initial
+        // confidence, comfortably above the Pass 3 threshold of 0.5.
+        let belief_id = manager
+            .record_observation(
+                "I cannot use shell_exec in this environment".to_string(),
+                "chat".to_string(),
+                MemoryTier::Semantic,
+                BeliefKind::Empirical,
+                vec![],
+            )
+            .await?;
+        // No confidence boost needed — Empirical/chat starts at 0.55 > 0.5.
+
+        // Record tool-success for a *different* tool.
+        manager.record(MemoryTier::Episodic, "web search ok", "tool-success:web_search").await?;
+
+        let confidence_before = manager.current_confidence(belief_id);
+        let count = manager.run_sleep_pass_3_contradiction().await?;
+
+        assert_eq!(count, 0, "no contradiction should be detected for unrelated tools");
+        let confidence_after = manager.current_confidence(belief_id);
+        assert!(
+            (confidence_before - confidence_after).abs() < f32::EPSILON,
+            "confidence must not change for unrelated belief"
+        );
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 6 — Pass 4: confidence propagation
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Pass 4 propagates a confidence change at depth-1 with a 0.5× factor.
+    #[tokio::test]
+    async fn pass4_propagates_depth1_at_half_delta() -> Result<()> {
+        use crate::index::MemoryIndex;
+        use crate::schema::{BeliefKind, ConfidenceReason, ConfidenceSource};
+
+        let path = std::env::temp_dir()
+            .join(format!("aigent-p4-depth1-{}.jsonl", Uuid::new_v4()));
+        let idx_path = path.with_extension("index");
+        let mut manager = MemoryManager::with_event_log(&path).await?;
+        manager.set_index(MemoryIndex::open(&idx_path)?);
+
+        // Entry A (source that changes confidence).
+        let a = manager
+            .record_observation(
+                "Rust is memory safe".to_string(),
+                "chat".to_string(),
+                MemoryTier::Semantic,
+                BeliefKind::Empirical,
+                vec![],
+            )
+            .await?;
+        // Entry B (supported by A).
+        let b = manager
+            .record_observation(
+                "Rust prevents use-after-free".to_string(),
+                "chat".to_string(),
+                MemoryTier::Semantic,
+                BeliefKind::Empirical,
+                vec![],
+            )
+            .await?;
+
+        // Wire A → B (A supports B).
+        if let Some(idx) = manager.index.as_mut() {
+            idx.add_edge(&a, crate::schema::EdgeKind::Supports, &b)?;
+        }
+
+        // Snapshot *before* changing A's confidence.
+        let snapshot = manager.snapshot_confidences();
+        let b_before = manager.current_confidence(b);
+
+        // Apply a -0.20 delta to A (simulating Pass 1/3 decay/contradiction).
+        manager
+            .record_confidence_signal(
+                a,
+                -0.20,
+                ConfidenceReason::StaleDecay,
+                ConfidenceSource::SleepPipeline { pass: 1 },
+            )
+            .await?;
+
+        // Run Pass 4 with the pre-decay snapshot.
+        let count = manager.run_sleep_pass_4_propagation(&snapshot).await?;
+
+        assert!(count >= 1, "at least one propagation event expected");
+        let b_after = manager.current_confidence(b);
+        let expected_b_delta = -0.20_f32 * 0.50;
+        let actual_b_delta = b_after - b_before;
+        assert!(
+            (actual_b_delta - expected_b_delta).abs() < 0.01,
+            "depth-1 propagation: expected delta {expected_b_delta:.3}, got {actual_b_delta:.3}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&idx_path);
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 6 — Pass 5: opinion synthesis candidates helper
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Fewer than 5 distinct observations in a domain must produce no proposals.
+    #[tokio::test]
+    async fn pass5_fewer_than_min_observations_returns_empty() -> Result<()> {
+        use super::sleep_logic::{opinion_synthesis_candidates, MIN_OPINION_OBSERVATIONS};
+
+        // 4 Episodic entries in the same domain — below the MIN_OPINION_OBSERVATIONS gate.
+        let entries: Vec<MemoryEntry> = (0..4)
+            .map(|i| MemoryEntry {
+                id: Uuid::new_v4(),
+                tier: MemoryTier::Episodic,
+                content: format!("I really enjoy pair programming session {i}"),
+                source: "chat".to_string(),
+                confidence: 0.8,
+                valence: 0.8,
+                belief_kind: Default::default(),
+                tags: Vec::new(),
+                embedding: None,
+                tokens: Default::default(),
+                created_at: Utc::now(),
+                provenance_hash: "test".to_string(),
+            })
+            .collect();
+
+        let proposals = opinion_synthesis_candidates(&entries, MIN_OPINION_OBSERVATIONS, 10, 24);
+        assert!(
+            proposals.is_empty(),
+            "expected no proposals for <5 distinct observations, got: {proposals:?}"
+        );
+        Ok(())
+    }
+
+    /// Five or more distinct observations in a domain must produce at least one proposal.
+    #[tokio::test]
+    async fn pass5_proposes_opinion_at_min_threshold() -> Result<()> {
+        use super::sleep_logic::{opinion_synthesis_candidates, MIN_OPINION_OBSERVATIONS};
+
+        // 5 Episodic entries about "pair programming" — meets the gate.
+        let entries: Vec<MemoryEntry> = (0..5)
+            .map(|i| MemoryEntry {
+                id: Uuid::new_v4(),
+                tier: MemoryTier::Episodic,
+                content: format!("I really enjoy pair programming session {i} — great flow"),
+                source: "chat".to_string(),
+                confidence: 0.8,
+                valence: 0.9,
+                belief_kind: Default::default(),
+                tags: Vec::new(),
+                embedding: None,
+                tokens: Default::default(),
+                created_at: Utc::now(),
+                provenance_hash: "test".to_string(),
+            })
+            .collect();
+
+        let proposals = opinion_synthesis_candidates(&entries, MIN_OPINION_OBSERVATIONS, 10, 24);
+        assert!(
+            !proposals.is_empty(),
+            "expected at least one proposal for ≥5 distinct observations"
+        );
         Ok(())
     }
 }

@@ -9,6 +9,7 @@ default = []
 qdrant = ["dep:qdrant-client"]
 
 [dependencies]
+aigent-config = { path = "../config" }
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true

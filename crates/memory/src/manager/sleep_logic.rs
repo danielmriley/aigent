@@ -606,7 +606,7 @@ impl MemoryManager {
     /// be checked against the registry), then O(log n) per entry for the redb
     /// registry read and confidence signal write.
     pub async fn run_sleep_pass_1_decay(&mut self) -> Result<usize> {
-        let stale_cutoff: DateTime<Utc> = Utc::now() - chrono::Duration::hours(24);
+        let stale_cutoff: DateTime<Utc> = Utc::now() - chrono::Duration::hours(i64::from(self.sleep_cfg.hot_window_hours));
 
         // Snapshot (id, belief_kind, created_at) to release the &self.store borrow
         // before calling &mut self methods (record_confidence_signal, decay_node).
@@ -639,13 +639,14 @@ impl MemoryManager {
 
         let mut decayed_count = 0usize;
 
+        let lc = self.learning.clone();
         for (id, belief_kind) in stale {
-            // Decay rate is parameterised by semantic category.
+            // Decay rate is parameterised by semantic category (loaded from config).
             let delta: f32 = match belief_kind {
-                BeliefKind::Empirical  => -0.03,
-                BeliefKind::Procedural => -0.01,
-                BeliefKind::SelfModel  => -0.02,
-                BeliefKind::Opinion    => -0.005,
+                BeliefKind::Empirical  => -lc.decay_empirical,
+                BeliefKind::Procedural => -lc.decay_procedural,
+                BeliefKind::SelfModel  => -lc.decay_self_model,
+                BeliefKind::Opinion    => -lc.decay_opinion,
             };
 
             if let Err(e) = self
@@ -711,8 +712,8 @@ impl MemoryManager {
         &mut self,
         consolidation_fn: Option<&ConsolidationFn>,
     ) -> Result<usize> {
-        // Only operate on entries that have left the "hot" 24-hour window.
-        let hot_cutoff: DateTime<Utc> = Utc::now() - chrono::Duration::hours(24);
+        // Only operate on entries that have left the configured hot window.
+        let hot_cutoff: DateTime<Utc> = Utc::now() - chrono::Duration::hours(i64::from(self.sleep_cfg.hot_window_hours));
 
         // Step 1: snapshot Episodic candidates — releases the &self.store borrow
         // so we can call &mut self methods later without borrow-checker conflicts.
@@ -984,4 +985,479 @@ impl MemoryManager {
         Ok(consolidated_count)
     }
 
+    // ── Phase 6 — Sleep Pass 3: contradiction detection ───────────────────────
+
+    /// Detect contradictions between high-confidence `SelfModel` / `Empirical`
+    /// beliefs and recent tool-success evidence.
+    ///
+    /// **Algorithm:**
+    /// 1. Collect all `SelfModel` entries (plus `Empirical` entries if `check_empirical`
+    ///    is `true`) whose live confidence exceeds 0.5.
+    /// 2. Collect all store entries whose source string starts with
+    ///    `"tool-success:"` and were created within the last 24 hours — these
+    ///    represent confirmed positive tool invocations.
+    /// 3. For each belief entry, check whether its content contains *negation
+    ///    keywords* (`"cannot"`, `"can't"`, `"unable"`, `"not able"`,
+    ///    `"doesn't"`, `"does not"`, `"failed"`, `"no access"`) **and** the tool
+    ///    name extracted from a matching tool-success event.
+    /// 4. On a match: append a `ConfidenceUpdateEvent(−0.35)` and a
+    ///    `BeliefRelationshipEvent(Contradicts)` to the event log.
+    ///
+    /// Returns the number of contradictions detected.
+    ///
+    /// Complexity: O(n × m) where n = SelfModel entry count and
+    /// m = recent tool-success event count (both bounded to << 100).
+    pub async fn run_sleep_pass_3_contradiction(&mut self) -> Result<usize> {
+        let cutoff_24h = Utc::now() - chrono::Duration::hours(i64::from(self.sleep_cfg.hot_window_hours));
+
+        // Negation keywords used to identify negative capability claims.
+        const NEGATION_KEYWORDS: &[&str] = &[
+            "cannot", "can't", "unable", "not able",
+            "doesn't", "does not", "failed", "no access",
+        ];
+
+        // Snapshot all entries to avoid borrow-checker conflicts with &mut self.
+        #[derive(Clone)]
+        struct EntrySnapshot {
+            id: Uuid,
+            belief_kind: BeliefKind,
+            content: String,
+        }
+
+        // Snapshot self-model + empirical candidates (live confidence > 0.5).
+        let belief_candidates: Vec<EntrySnapshot> = self
+            .store
+            .all()
+            .iter()
+            .filter(|e| {
+                matches!(e.belief_kind, BeliefKind::SelfModel | BeliefKind::Empirical)
+                    && self.current_confidence(e.id) > 0.5
+            })
+            .map(|e| EntrySnapshot {
+                id: e.id,
+                belief_kind: e.belief_kind,
+                content: e.content.clone(),
+            })
+            .collect();
+
+        if belief_candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // Snapshot recent tool-success events (last 24 h).
+        // Source string format: "tool-success:<tool_name>"
+        let tool_successes: Vec<String> = self
+            .store
+            .all()
+            .iter()
+            .filter(|e| {
+                e.created_at >= cutoff_24h && e.source.starts_with("tool-success:")
+            })
+            .filter_map(|e| e.source.strip_prefix("tool-success:").map(|s| s.to_string()))
+            .collect();
+
+        if tool_successes.is_empty() {
+            return Ok(0);
+        }
+
+        let mut contradiction_count = 0usize;
+
+        for candidate in &belief_candidates {
+            let content_lc = candidate.content.to_ascii_lowercase();
+
+            // Check whether this belief is a negative assertion about any
+            // tool that succeeded today.
+            for tool_name in &tool_successes {
+                let tool_lc = tool_name.to_ascii_lowercase();
+
+                // The belief must reference the tool name.
+                if !content_lc.contains(tool_lc.as_str()) {
+                    continue;
+                }
+
+                // The belief must contain a negation keyword.
+                let has_negation = NEGATION_KEYWORDS
+                    .iter()
+                    .any(|kw| content_lc.contains(*kw));
+                if !has_negation {
+                    continue;
+                }
+
+                // Confirmed contradiction: negative belief + today's success.
+                info!(
+                    id = %candidate.id,
+                    tool = %tool_name,
+                    belief_kind = ?candidate.belief_kind,
+                    "Pass 3: contradiction detected"
+                );
+
+                if let Err(e) = self
+                    .record_confidence_signal(
+                        candidate.id,
+                        -self.learning.contradict_tool_success_vs_failure,
+                        ConfidenceReason::ToolSuccessContradiction,
+                        ConfidenceSource::SleepPipeline { pass: 3 },
+                    )
+                    .await
+                {
+                    warn!(error = ?e, id = %candidate.id, "Pass 3: record_confidence_signal failed");
+                    continue;
+                }
+
+                // Append a BeliefRelationshipEvent marking the contradiction.
+                if let Some(log) = &self.event_log {
+                    // Locate the most-recent tool-success entry for the edge target.
+                    let ts_entry_id = self
+                        .store
+                        .all()
+                        .iter()
+                        .filter(|e| {
+                            e.created_at >= cutoff_24h
+                                && e.source == format!("tool-success:{tool_name}")
+                        })
+                        .max_by_key(|e| e.created_at)
+                        .map(|e| e.id);
+
+                    if let Some(ts_id) = ts_entry_id {
+                        let _ = log
+                            .append_log_event(&MemoryLogEvent::BeliefRelationship(
+                                BeliefRelationshipEvent {
+                                    event_id: Uuid::new_v4(),
+                                    occurred_at: Utc::now(),
+                                    source_id: candidate.id,
+                                    target_id:  ts_id,
+                                    edge_kind: EdgeKind::Contradicts,
+                                    relationship_confidence: 0.35,
+                                },
+                            ))
+                            .await;
+                    }
+                }
+
+                contradiction_count += 1;
+                // One contradiction per belief per pass is enough – break inner loop.
+                break;
+            }
+        }
+
+        if contradiction_count > 0 {
+            info!(contradiction_count, "sleep pass 3 (contradiction detection) complete");
+        }
+        Ok(contradiction_count)
+    }
+
+    // ── Phase 6 — Sleep Pass 4: confidence propagation ───────────────────────
+
+    /// Propagate confidence changes from Passes 1–3 to directly supporting
+    /// beliefs via the `Supports` adjacency graph.
+    ///
+    /// The caller must supply a `pre_pass_snapshot` — a map of `Uuid → f32`
+    /// recording the live confidence of **every active entry before** Passes
+    /// 1–3 ran.  Entries whose confidence has not changed (delta ≈ 0) are
+    /// skipped to keep the propagation set minimal.
+    ///
+    /// **Propagation rules:**
+    /// - Depth 1 (direct supporter): `delta × 0.50`
+    /// - Depth 2 (supporter's supporter): `delta × 0.25`
+    /// - Depth 3+: no propagation
+    ///
+    /// **Deduplication:** each target entry is updated at most **once** per
+    /// pass (first-write wins using a `HashSet<Uuid>`) so chain overlap never
+    /// double-counts a delta.
+    ///
+    /// Returns the number of propagation events emitted.
+    ///
+    /// Complexity: O(n × log n) — O(n) changed entries × O(log n) per
+    /// forward-edge lookup in redb.
+    pub async fn run_sleep_pass_4_propagation(
+        &mut self,
+        pre_pass_snapshot: &std::collections::HashMap<Uuid, f32>,
+    ) -> Result<usize> {
+        let Some(idx) = &self.index else {
+            debug!("Pass 4: no index attached — propagation skipped");
+            return Ok(0);
+        };
+
+        // Compute deltas: entries whose confidence changed since the snapshot.
+        // We clone the snapshot keys so we can later call &mut self freely.
+        #[derive(Debug)]
+        struct Delta {
+            id: Uuid,
+            delta: f32,
+        }
+
+        let changed: Vec<Delta> = pre_pass_snapshot
+            .iter()
+            .filter_map(|(&id, &before)| {
+                let after = self.current_confidence(id);
+                let delta = after - before;
+                if delta.abs() < 0.001 {
+                    None
+                } else {
+                    Some(Delta { id, delta })
+                }
+            })
+            .collect();
+
+        if changed.is_empty() {
+            return Ok(0);
+        }
+
+        // Build depth-1 forward-edge lists from redb (O(log n) each).
+        // Collect as Vec to release the immutable borrow on self.index.
+        struct PropTask {
+            id: Uuid,
+            delta: f32,
+            depth: u8,
+        }
+
+        let mut tasks: Vec<PropTask> = Vec::new();
+        for d in &changed {
+            match idx.forward_edges(&d.id, EdgeKind::Supports) {
+                Ok(depth1_targets) => {
+                    for t in depth1_targets {
+                        tasks.push(PropTask { id: t, delta: d.delta * 0.50, depth: 1 });
+                    }
+                }
+                Err(e) => {
+                    warn!(error = ?e, id = %d.id, "Pass 4: forward_edges lookup failed");
+                }
+            }
+        }
+
+        // Build depth-2 tasks from the depth-1 targets (still on immutable borrow).
+        let depth1_ids: Vec<(Uuid, f32)> = tasks
+            .iter()
+            .map(|t| (t.id, t.delta))
+            .collect();
+
+        let idx2 = self.index.as_ref().unwrap(); // safe: checked above
+        for (d1_id, d1_delta) in &depth1_ids {
+            match idx2.forward_edges(d1_id, EdgeKind::Supports) {
+                Ok(depth2_targets) => {
+                    for t in depth2_targets {
+                        tasks.push(PropTask { id: t, delta: d1_delta * 0.50, depth: 2 });
+                    }
+                }
+                Err(e) => {
+                    warn!(error = ?e, id = %d1_id, "Pass 4: depth-2 forward_edges failed");
+                }
+            }
+        }
+
+        // Apply propagation signals; deduplicate by target ID (first write wins).
+        let mut propagated: HashSet<Uuid> = HashSet::new();
+        let mut event_count = 0usize;
+
+        for task in &tasks {
+            if !propagated.insert(task.id) {
+                continue; // already updated this entry in this pass
+            }
+            if let Err(e) = self
+                .record_confidence_signal(
+                    task.id,
+                    task.delta,
+                    ConfidenceReason::GraphPropagation { depth: task.depth },
+                    ConfidenceSource::SleepPipeline { pass: 4 },
+                )
+                .await
+            {
+                warn!(
+                    error = ?e, id = %task.id, depth = task.depth,
+                    "Pass 4: record_confidence_signal failed (non-fatal)"
+                );
+            } else {
+                event_count += 1;
+                debug!(
+                    id = %task.id,
+                    delta = task.delta,
+                    depth = task.depth,
+                    "Pass 4: propagation event emitted"
+                );
+            }
+        }
+
+        if event_count > 0 {
+            info!(event_count, "sleep pass 4 (confidence propagation) complete");
+        }
+        Ok(event_count)
+    }
+
+    /// Take a confidence snapshot before running sleep passes — used as the
+    /// `pre_pass_snapshot` argument to [`run_sleep_pass_4_propagation`].
+    ///
+    /// Returns a `HashMap<Uuid, f32>` of every current entry's live confidence.
+    /// O(n) over the in-memory store.
+    pub fn snapshot_confidences(&self) -> std::collections::HashMap<Uuid, f32> {
+        self.store
+            .all()
+            .iter()
+            .map(|e| (e.id, self.current_confidence(e.id)))
+            .collect()
+    }
+
+}
+
+// ── Phase 6 — Pass 5: opinion synthesis (impl block) ────────────────────────
+
+impl MemoryManager {
+    /// Sleep Pass 5 — Opinion Synthesis.
+    ///
+    /// Calls [`opinion_synthesis_candidates`] on the current store, then
+    /// writes each proposal as a new `BeliefKind::Opinion` entry at
+    /// `MemoryTier::Reflective` with confidence **0.25** and source
+    /// `"sleep:opinion-synthesis:pass5"`.
+    ///
+    /// `max_proposals` bounds how many new opinions are written in one
+    /// sleep cycle (default: 5 from the daemon scheduler).
+    ///
+    /// Complexity: O(n) over episodic entries for candidate analysis;
+    /// O(k) append-only writes for k ≤ max_proposals.
+    pub async fn run_sleep_pass_5_opinion_synthesis(
+        &mut self,
+        max_proposals: usize,
+    ) -> Result<usize> {
+        let min_obs = self.sleep_cfg.opinion_min_observations.max(MIN_OPINION_OBSERVATIONS);
+        let opinion_conf = self.learning.opinion_sleep_synthesis;
+        let hot_window = self.sleep_cfg.hot_window_hours;
+        let entries = self.store.all();
+        let proposals = opinion_synthesis_candidates(entries, min_obs, max_proposals, hot_window);
+
+        if proposals.is_empty() {
+            debug!("sleep pass 5: no opinion proposals generated");
+            return Ok(0);
+        }
+
+        let count = proposals.len();
+        for proposal in proposals {
+            self.record_inner_tagged(
+                crate::schema::MemoryTier::Reflective,
+                proposal,
+                "sleep:opinion-synthesis:pass5".to_string(),
+                vec!["agent_belief".to_string(), "opinion".to_string()],
+                Some(opinion_conf),
+                crate::schema::BeliefKind::Opinion,
+            )
+            .await?;
+        }
+
+        info!(written = count, "sleep pass 5 (opinion synthesis) complete");
+        Ok(count)
+    }
+}
+
+// ── Phase 6 — Pass 5: opinion synthesis helper ───────────────────────────────
+
+/// Minimum distinct episodic observations required to synthesise a new opinion.
+/// Enforced as a hard gate — calling code must not change this to a lower value
+/// without a design review.  See `impl_learning_system.md` Phase 6, Pass 5.
+pub const MIN_OPINION_OBSERVATIONS: usize = 5;
+
+/// Propose new `Opinion` entries from recent valence-bearing Episodic memories.
+///
+/// This is the **Pure analysis step** of Pass 5 — it reads memory and returns
+/// proposed opinion strings but does **not** write anything.  The caller is
+/// responsible for writing via `record_inner_tagged` at confidence 0.25.
+///
+/// **Algorithm:**
+/// 1. Collect all `MemoryTier::Episodic` entries from the last 24 h that have a
+///    non-zero valence **or** contain preference-signal keywords
+///    (`"prefer"`, `"like"`, `"enjoy"`, `"love"`, `"hate"`, `"dislike"`,
+///    `"find"`, `"tend to"`, `"usually"`).
+/// 2. Attempt lightweight domain classification: extract the first meaningful
+///    noun phrase (first 1-3 lowercase words, ignoring stop words) as a domain key.
+/// 3. Group entries by domain key.
+/// 4. For every domain that has ≥ `min_observations` **distinct** supporting
+///    entries (deduped by lowercased content), produce one proposed opinion
+///    string: a short synthesis describing the pattern.
+/// 5. Return up to `max_proposals` proposals.
+///
+/// Returns `Vec<String>` — each string is the text of a proposed `Opinion` entry.
+///
+/// Complexity: O(n) over episodic entries.
+pub fn opinion_synthesis_candidates(
+    entries: &[crate::schema::MemoryEntry],
+    min_observations: usize,
+    max_proposals: usize,
+    hot_window_hours: u32,
+) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+
+    // Hard gate enforced by assertion — callers must always pass the spec minimum.
+    assert!(
+        min_observations >= MIN_OPINION_OBSERVATIONS,
+        "opinion_synthesis_candidates: min_observations ({min_observations}) \
+         must be ≥ MIN_OPINION_OBSERVATIONS ({MIN_OPINION_OBSERVATIONS})"
+    );
+
+    let cutoff_24h = Utc::now() - chrono::Duration::hours(i64::from(hot_window_hours));
+
+    const PREFERENCE_KEYWORDS: &[&str] = &[
+        "prefer", "like", "enjoy", "love", "hate", "dislike",
+        "find ", "tend to", "usually", "always", "never ",
+    ];
+    const STOP_WORDS: &[&str] = &[
+        "i", "you", "it", "the", "a", "an", "is", "are", "was", "were",
+        "have", "has", "had", "do", "does", "did", "to", "in", "of",
+        "that", "this", "with", "for", "on", "at", "by", "from", "be",
+        "not", "but", "and", "or", "so",
+    ];
+
+    // Group entries by domain key.
+    // domain_key → Vec<lowercased content> for deduplication.
+    let mut domain_map: HashMap<String, Vec<String>> = HashMap::new();
+
+    for entry in entries {
+        if entry.tier != crate::schema::MemoryTier::Episodic {
+            continue;
+        }
+        if entry.created_at < cutoff_24h {
+            continue;
+        }
+        let content_lc = entry.content.to_ascii_lowercase();
+        let has_preference = PREFERENCE_KEYWORDS.iter().any(|kw| content_lc.contains(kw));
+        let has_valence = entry.valence.abs() > 0.01;
+        if !has_preference && !has_valence {
+            continue;
+        }
+
+        // Extract domain key: first non-stop word from the content.
+        let domain_key = content_lc
+            .split_whitespace()
+            .find(|w| !STOP_WORDS.contains(w))
+            .unwrap_or("general")
+            .chars()
+            .take(20)
+            .collect::<String>();
+
+        domain_map.entry(domain_key).or_default().push(content_lc);
+    }
+
+    let mut proposals: Vec<String> = Vec::new();
+
+    for (domain, observations) in &domain_map {
+        // Dedup by content to count *distinct* observations.
+        let distinct: HashSet<&String> = observations.iter().collect();
+        if distinct.len() < min_observations {
+            continue;
+        }
+
+        // Build a compact synthesis: describe the observed pattern.
+        let example = observations
+            .first()
+            .map(|s| s.chars().take(80).collect::<String>())
+            .unwrap_or_default();
+        let proposal = format!(
+            "Recurring preference pattern around '{domain}': \
+             {count} distinct observations (e.g. \"{example}\")",
+            count = distinct.len()
+        );
+        proposals.push(proposal);
+
+        if proposals.len() >= max_proposals {
+            break;
+        }
+    }
+
+    proposals
 }

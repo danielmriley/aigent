@@ -201,6 +201,8 @@ pub async fn run_unified_daemon(
 
     // Apply config-driven memory tuning.
     memory.set_kv_tier_limit(config.memory.kv_tier_limit);
+    memory.set_learning_config(config.memory.learning.clone());
+    memory.set_sleep_config(config.memory.sleep.clone());
 
     // Wire the redb-backed MemoryIndex for O(1) tier lookups and fast
     // deduplication.  Stored as a sibling to the JSONL event log so both

@@ -178,6 +178,13 @@ pub struct MemoryConfig {
     /// the nightly quiet window.  Default: 2000.
     #[serde(default = "default_sleep_capacity_limit")]
     pub sleep_capacity_limit: usize,
+    /// Learning rate parameters: initial confidence, confirmation/contradiction
+    /// deltas, stale decay rates, and tier rendering thresholds.
+    #[serde(default)]
+    pub learning: LearningConfig,
+    /// Sleep-cycle tuning: hot window duration and opinion synthesis gate.
+    #[serde(default)]
+    pub sleep: MemorySleepConfig,
 }
 
 impl Default for MemoryConfig {
@@ -205,6 +212,8 @@ impl Default for MemoryConfig {
             reflection_enabled: default_reflection_enabled(),
             store_reasoning_traces: false,
             sleep_capacity_limit: default_sleep_capacity_limit(),
+            learning: LearningConfig::default(),
+            sleep: MemorySleepConfig::default(),
         }
     }
 }
@@ -597,8 +606,145 @@ impl Default for InferenceConfig {
     }
 }
 
-// ── Subagents ─────────────────────────────────────────────────────────────────
+// ── Learning config ───────────────────────────────────────────────────────────
 
+/// Learning rate parameters for the confidence-based memory system.
+///
+/// All deltas listed under "Contradiction deltas" are stored as **positive**
+/// values and applied as negative signals by the caller.
+///
+/// Maps to `[memory.learning]` in `config/default.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearningConfig {
+    // ── Initial confidence by belief kind × source ─────────────────────────
+    pub empirical_tool_success: f32,
+    pub empirical_tool_failure_transient: f32,
+    pub empirical_tool_failure_arch: f32,
+    pub empirical_human: f32,
+    pub procedural_tool_success: f32,
+    pub procedural_tool_failure_transient: f32,
+    pub procedural_tool_failure_arch: f32,
+    pub procedural_human: f32,
+    pub self_model_tool_success: f32,
+    pub self_model_tool_failure_transient: f32,
+    pub self_model_tool_failure_arch: f32,
+    pub self_model_human: f32,
+    pub opinion_human: f32,
+    /// Initial confidence for opinions proposed by the sleep pipeline (Pass 5).
+    pub opinion_sleep_synthesis: f32,
+    // ── Confirmation deltas ────────────────────────────────────────────────
+    /// Tool confirmation delta for Empirical beliefs.
+    pub confirm_tool_empirical: f32,
+    /// Tool confirmation delta for Procedural beliefs.
+    pub confirm_tool_procedural: f32,
+    /// Tool confirmation delta for SelfModel beliefs.
+    pub confirm_tool_self_model: f32,
+    /// Confirmation from the same source type as the original belief.
+    pub confirm_same_source: f32,
+    /// Confirmation from a different source type (cross-source corroboration).
+    pub confirm_cross_source: f32,
+    /// Explicit user confirmation (e.g. "yes, that's right").
+    pub confirm_user_explicit: f32,
+    /// Confirmation via nightly sleep synthesis.
+    pub confirm_sleep_synthesis: f32,
+    // ── Contradiction deltas (positive values; applied as negatives) ───────
+    /// Tool success that directly contradicts a prior failure belief (Pass 3).
+    pub contradict_tool_success_vs_failure: f32,
+    /// Explicit user correction.
+    pub contradict_user_explicit: f32,
+    /// Tool returns a fact that contradicts an existing belief.
+    pub contradict_tool_fact: f32,
+    /// Tool failure — transient error (e.g. network timeout).
+    pub contradict_tool_failure_transient: f32,
+    /// Tool failure — configuration error (e.g. missing API key).
+    pub contradict_tool_failure_config: f32,
+    /// Tool failure — architectural limit (e.g. model has no access to tool).
+    pub contradict_tool_failure_arch: f32,
+    // ── Stale decay per nightly sleep cycle (negative; applied as-is) ─────
+    pub decay_empirical: f32,
+    pub decay_procedural: f32,
+    pub decay_self_model: f32,
+    pub decay_opinion: f32,
+    // ── Confidence tier rendering thresholds ───────────────────────────────
+    /// "You know that …" threshold.
+    pub tier_know_threshold: f32,
+    /// "You have come to believe …" threshold.
+    pub tier_believe_threshold: f32,
+    /// "From experience, you suspect …" threshold.
+    pub tier_suspect_threshold: f32,
+    /// "You once observed …" (below this: excluded from prompt).
+    pub tier_observed_threshold: f32,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            empirical_tool_success: 0.45,
+            empirical_tool_failure_transient: 0.20,
+            empirical_tool_failure_arch: 0.30,
+            empirical_human: 0.55,
+            procedural_tool_success: 0.40,
+            procedural_tool_failure_transient: 0.15,
+            procedural_tool_failure_arch: 0.25,
+            procedural_human: 0.55,
+            self_model_tool_success: 0.50,
+            self_model_tool_failure_transient: 0.10,
+            self_model_tool_failure_arch: 0.30,
+            self_model_human: 0.50,
+            opinion_human: 0.45,
+            opinion_sleep_synthesis: 0.25,
+            confirm_tool_empirical: 0.08,
+            confirm_tool_procedural: 0.10,
+            confirm_tool_self_model: 0.12,
+            confirm_same_source: 0.08,
+            confirm_cross_source: 0.15,
+            confirm_user_explicit: 0.20,
+            confirm_sleep_synthesis: 0.05,
+            contradict_tool_success_vs_failure: 0.35,
+            contradict_user_explicit: 0.35,
+            contradict_tool_fact: 0.15,
+            contradict_tool_failure_transient: 0.05,
+            contradict_tool_failure_config: 0.08,
+            contradict_tool_failure_arch: 0.20,
+            decay_empirical: 0.03,
+            decay_procedural: 0.01,
+            decay_self_model: 0.02,
+            decay_opinion: 0.005,
+            tier_know_threshold: 0.70,
+            tier_believe_threshold: 0.50,
+            tier_suspect_threshold: 0.35,
+            tier_observed_threshold: 0.10,
+        }
+    }
+}
+
+/// Sleep-cycle tuning parameters that do not already appear as flat fields on
+/// [`MemoryConfig`].
+///
+/// Maps to `[memory.sleep]` in `config/default.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemorySleepConfig {
+    /// How long (in hours) episodic memories stay in the "hot window" before
+    /// they become eligible for Pass 2 consolidation.  Default: 24.
+    pub hot_window_hours: u32,
+    /// Minimum distinct episodic observations required for Pass 5 to propose a
+    /// new Opinion entry.  The hard lower bound is 5 and this value may not be
+    /// set below it at runtime.  Default: 5.
+    pub opinion_min_observations: usize,
+}
+
+impl Default for MemorySleepConfig {
+    fn default() -> Self {
+        Self {
+            hot_window_hours: 24,
+            opinion_min_observations: 5,
+        }
+    }
+}
+
+// ── Subagents ─────────────────────────────────────────────────────────────────
 /// Configuration for the parallel subagent reasoning system.
 ///
 /// When enabled, complex queries are evaluated by multiple specialist agents
@@ -1133,6 +1279,71 @@ allow_system_read = false
     fn active_model_returns_ollama_for_default_provider() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.active_model(), &cfg.llm.ollama_model);
+    }
+
+    // ── Phase 7: LearningConfig / MemorySleepConfig defaults ─────────────
+
+    #[test]
+    fn learning_config_default_values_match_spec() {
+        let lc = LearningConfig::default();
+        // Initial confidence table
+        assert!((lc.empirical_tool_success - 0.45).abs() < f32::EPSILON);
+        assert!((lc.empirical_tool_failure_transient - 0.20).abs() < f32::EPSILON);
+        assert!((lc.empirical_tool_failure_arch - 0.30).abs() < f32::EPSILON);
+        assert!((lc.empirical_human - 0.55).abs() < f32::EPSILON);
+        assert!((lc.procedural_tool_success - 0.40).abs() < f32::EPSILON);
+        assert!((lc.procedural_tool_failure_transient - 0.15).abs() < f32::EPSILON);
+        assert!((lc.procedural_tool_failure_arch - 0.25).abs() < f32::EPSILON);
+        assert!((lc.procedural_human - 0.55).abs() < f32::EPSILON);
+        assert!((lc.self_model_tool_success - 0.50).abs() < f32::EPSILON);
+        assert!((lc.self_model_tool_failure_transient - 0.10).abs() < f32::EPSILON);
+        assert!((lc.self_model_tool_failure_arch - 0.30).abs() < f32::EPSILON);
+        assert!((lc.self_model_human - 0.50).abs() < f32::EPSILON);
+        assert!((lc.opinion_human - 0.45).abs() < f32::EPSILON);
+        assert!((lc.opinion_sleep_synthesis - 0.25).abs() < f32::EPSILON);
+        // Confirmation deltas
+        assert!((lc.confirm_tool_empirical - 0.08).abs() < f32::EPSILON);
+        assert!((lc.confirm_tool_procedural - 0.10).abs() < f32::EPSILON);
+        assert!((lc.confirm_tool_self_model - 0.12).abs() < f32::EPSILON);
+        // Contradiction deltas
+        assert!((lc.contradict_tool_success_vs_failure - 0.35).abs() < f32::EPSILON);
+        assert!((lc.contradict_tool_failure_transient - 0.05).abs() < f32::EPSILON);
+        assert!((lc.contradict_tool_failure_config - 0.08).abs() < f32::EPSILON);
+        assert!((lc.contradict_tool_failure_arch - 0.20).abs() < f32::EPSILON);
+        // Decay deltas
+        assert!((lc.decay_empirical - 0.03).abs() < f32::EPSILON);
+        assert!((lc.decay_procedural - 0.01).abs() < f32::EPSILON);
+        assert!((lc.decay_self_model - 0.02).abs() < f32::EPSILON);
+        assert!((lc.decay_opinion - 0.005).abs() < f32::EPSILON);
+        // Tier thresholds
+        assert!((lc.tier_know_threshold - 0.70).abs() < f32::EPSILON);
+        assert!((lc.tier_believe_threshold - 0.50).abs() < f32::EPSILON);
+        assert!((lc.tier_suspect_threshold - 0.35).abs() < f32::EPSILON);
+        assert!((lc.tier_observed_threshold - 0.10).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn memory_sleep_config_defaults() {
+        let sc = MemorySleepConfig::default();
+        assert_eq!(sc.hot_window_hours, 24);
+        assert_eq!(sc.opinion_min_observations, 5);
+    }
+
+    #[test]
+    fn default_toml_round_trips_learning_config() {
+        // Parse the real default.toml and ensure learning + sleep sections
+        // deserialise without error and produce the expected hot_window_hours.
+        let toml_str = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../config/default.toml"),
+        )
+        .expect("default.toml must exist");
+        let cfg: AppConfig = toml::from_str(&toml_str)
+            .expect("default.toml must deserialise cleanly");
+        assert_eq!(cfg.memory.sleep.hot_window_hours, 24);
+        assert_eq!(cfg.memory.sleep.opinion_min_observations, 5);
+        assert!((cfg.memory.learning.empirical_tool_success - 0.45).abs() < f32::EPSILON);
+        assert!((cfg.memory.learning.tier_know_threshold - 0.70).abs() < f32::EPSILON);
     }
 
 }
