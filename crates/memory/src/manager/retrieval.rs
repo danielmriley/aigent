@@ -79,6 +79,7 @@ impl MemoryManager {
                 },
                 score: 2.0,
                 rationale: "pinned: KV identity summary auto-injected from vault".to_string(),
+                live_confidence: 1.0,
             },
         );
     }
