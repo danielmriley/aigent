@@ -635,7 +635,7 @@ pub(super) fn spawn_confidence_sleep_task(
                     default_quiet_end,
                 );
                 let count = s.memory.active_entry_count();
-                let cap = s.runtime.config.memory.sleep_capacity_limit;
+                let cap = s.runtime.config.memory.sleep.capacity_limit;
                 let last = s.last_confidence_sleep_at;
                 (tz, qs, qe, count, cap, last)
             };

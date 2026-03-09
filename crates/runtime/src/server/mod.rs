@@ -115,6 +115,13 @@ impl DaemonState {
     }
 }
 
+/// Parse an "HH:MM" string and return the hour component as `u32`.
+/// Returns `None` if the string is empty or does not match the expected format.
+fn parse_hh_mm_hour(s: &str) -> Option<u32> {
+    let h = s.split(':').next()?;
+    h.parse().ok()
+}
+
 fn build_execution_policy(config: &AppConfig) -> ExecutionPolicy {
     let workspace_root = PathBuf::from(&config.agent.workspace_path);
     ExecutionPolicy {
@@ -355,8 +362,12 @@ pub async fn run_unified_daemon(
     }
 
     // Extract sleep scheduling config before `config` is moved into the runtime.
-    let sleep_quiet_start = config.memory.night_sleep_start_hour as u32;
-    let sleep_quiet_end = config.memory.night_sleep_end_hour as u32;
+    // Prefer the nested `[memory.sleep]` fields (Phase 7); fall back to the flat
+    // `night_sleep_start/end_hour` fields for backward compat with older configs.
+    let sleep_quiet_start = parse_hh_mm_hour(&config.memory.sleep.nightly_window_start)
+        .unwrap_or(config.memory.night_sleep_start_hour as u32);
+    let sleep_quiet_end = parse_hh_mm_hour(&config.memory.sleep.nightly_window_end)
+        .unwrap_or(config.memory.night_sleep_end_hour as u32);
     let sleep_interval_hours: u64 = std::env::var("AIGENT_SLEEP_INTERVAL_HOURS")
         .ok()
         .and_then(|v| v.parse().ok())
