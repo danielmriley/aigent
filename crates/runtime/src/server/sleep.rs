@@ -592,6 +592,131 @@ pub(super) fn spawn_vault_watcher_task(
 
 // ── Profile-based quiet window helpers ───────────────────────────────────────
 
+/// Task D — Confidence-learning sleep (Pass 1 stale-decay + Pass 2 episodic
+/// consolidation).
+///
+/// Triggers on **any** of three conditions (checked every 5 minutes):
+///   1. **Nightly window**: within the quiet window AND ≥ 22 h since last run.
+///   2. **Capacity pressure**: active entry count > 90 % of `sleep_capacity_limit`.
+///   3. **Safety net**: ≥ 48 h since last run (ensures the cycle runs at least
+///      once every two days even if the quiet window is misconfigured).
+///
+/// The LLM consolidation callback is built on-demand from `AgentRuntime.llm`
+/// so the memory crate stays free of any `aigent-llm` dependency.
+pub(super) fn spawn_confidence_sleep_task(
+    state: Arc<Mutex<DaemonState>>,
+    shutdown_tx: &watch::Sender<bool>,
+    default_quiet_start: u32,
+    default_quiet_end: u32,
+    default_tz: Tz,
+) {
+    let mut rx = shutdown_tx.subscribe();
+    tokio::spawn(async move {
+        let min_gap = Duration::from_secs(22 * 60 * 60);
+        let safety_net_gap = Duration::from_secs(48 * 60 * 60);
+        let poll_interval = Duration::from_secs(5 * 60);
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                changed = rx.changed() => {
+                    if changed.is_ok() && *rx.borrow() { break; }
+                    continue;
+                }
+            }
+
+            // Resolve quiet-window, capacity, and last-run timestamp.
+            let (sleep_tz, quiet_start, quiet_end, count, capacity, last_ran) = {
+                let s = state.lock().await;
+                let tz = profile_tz(&s.memory, default_tz);
+                let (qs, qe) = profile_quiet_window(
+                    &s.memory,
+                    default_quiet_start,
+                    default_quiet_end,
+                );
+                let count = s.memory.active_entry_count();
+                let cap = s.runtime.config.memory.sleep_capacity_limit;
+                let last = s.last_confidence_sleep_at;
+                (tz, qs, qe, count, cap, last)
+            };
+
+            // Safety net: run if > 48 h since last cycle (regardless of window).
+            let safety_net = last_ran.is_none_or(|t| t.elapsed() >= safety_net_gap);
+            // Capacity trigger: > 90 % full.
+            let capacity_trigger = capacity > 0 && count > (capacity * 9 / 10);
+            // Nightly window trigger: inside quiet window AND ≥ 22 h gap.
+            let in_window =
+                is_in_window(chrono::Utc::now(), sleep_tz, quiet_start, quiet_end);
+            let nightly_due =
+                in_window && last_ran.is_none_or(|t| t.elapsed() >= min_gap);
+
+            if !safety_net && !capacity_trigger && !nightly_due {
+                continue;
+            }
+
+            let trigger = if safety_net {
+                "safety-net"
+            } else if capacity_trigger {
+                "capacity-pressure"
+            } else {
+                "nightly-window"
+            };
+            info!(trigger, "confidence sleep cycle: starting");
+
+            // Build a ConsolidationFn that delegates to the daemon's LlmRouter.
+            // Clone the lightweight config values so the closure is 'static.
+            let consolidation_fn: aigent_memory::ConsolidationFn = {
+                let s = state.lock().await;
+                let llm = s.runtime.llm.clone();
+                let ollama = s.runtime.config.llm.ollama_model.clone();
+                let openrouter = s.runtime.config.llm.openrouter_model.clone();
+                let primary =
+                    aigent_llm::Provider::from(s.runtime.config.llm.provider.as_str());
+                std::sync::Arc::new(move |prompt: String| {
+                    let llm2 = llm.clone();
+                    let om = ollama.clone();
+                    let or_ = openrouter.clone();
+                    Box::pin(async move {
+                        let (_, text) =
+                            llm2.chat_with_fallback(primary, &om, &or_, &prompt).await?;
+                        Ok(text)
+                    })
+                })
+            };
+
+            // Run Pass 1 and Pass 2 — hold the lock across both passes so no
+            // concurrent writer can interleave between them.
+            {
+                let mut s = state.lock().await;
+                match s.memory.run_sleep_pass_1_decay().await {
+                    Ok(decayed) if decayed > 0 => {
+                        info!(decayed, "confidence sleep: Pass 1 (stale decay) complete");
+                    }
+                    Ok(_) => info!("confidence sleep: Pass 1 complete (nothing to decay)"),
+                    Err(ref e) => warn!(?e, "confidence sleep: Pass 1 failed"),
+                }
+                match s
+                    .memory
+                    .run_sleep_pass_2_consolidation(Some(&consolidation_fn))
+                    .await
+                {
+                    Ok(consolidated) if consolidated > 0 => {
+                        info!(consolidated, "confidence sleep: Pass 2 (consolidation) complete");
+                    }
+                    Ok(_) => info!("confidence sleep: Pass 2 complete (nothing to consolidate)"),
+                    Err(ref e) => warn!(?e, "confidence sleep: Pass 2 failed"),
+                }
+                s.last_confidence_sleep_at = Some(std::time::Instant::now());
+            }
+
+            info!(trigger, "confidence sleep cycle: complete");
+        }
+    });
+}
+
+
+// ── Profile-based quiet window helpers ───────────────────────────────────────
+
 /// Read the user's IANA timezone from `UserProfile` entries, falling back to
 /// `default_tz` if nothing is found or the value doesn't parse.
 ///

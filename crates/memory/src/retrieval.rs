@@ -10,6 +10,7 @@ use std::collections::HashSet;
 
 use chrono::Utc;
 use tracing::trace;
+use uuid::Uuid;
 
 use crate::schema::{MemoryEntry, MemoryTier};
 
@@ -42,6 +43,11 @@ pub fn assemble_context_with_provenance(
     query: &str,
     limit: usize,
     query_embedding: Option<Vec<f32>>,
+    // Optional live-confidence resolver.  When `Some`, the returned `f32` is
+    // used in place of `entry.confidence` so dynamic confidence updates from
+    // `record_confidence_signal` are reflected in retrieval ranking.  When
+    // `None` (e.g. in tests), `entry.confidence` is used as-is.
+    confidence_fn: Option<&dyn Fn(Uuid) -> f32>,
 ) -> Vec<RankedMemoryContext> {
     // Build a reference iterator: Core first, then non-Core candidates.
     // Deduplicate by ID without allocating a second Vec.
@@ -63,7 +69,8 @@ pub fn assemble_context_with_provenance(
         .into_iter()
         .map(|entry| {
             let embedding_sim = cosine_similarity_if_available(entry, query_emb_slice);
-            let ctx = score_entry_ref(entry, &query_terms, now, embedding_sim);
+            let live_conf = confidence_fn.map_or(entry.confidence, |f| f(entry.id));
+            let ctx = score_entry_ref(entry, &query_terms, now, embedding_sim, live_conf);
             (entry, ctx.score, ctx.rationale)
         })
         .collect();
@@ -95,11 +102,14 @@ pub(crate) fn score_entry_ref(
     query_terms: &HashSet<String>,
     now: chrono::DateTime<Utc>,
     embedding_cos_sim: Option<f32>,
+    // Live confidence value — supply from `MemoryManager::current_confidence`
+    // for dynamic scoring, or `entry.confidence` for static fallback.
+    live_confidence: f32,
 ) -> ScoreOnly {
     let tier_score = tier_priority(entry.tier);
     let recency = recency_score(now, entry.created_at);
     let lexical = lexical_relevance_score(&entry.tokens, query_terms);
-    let confidence = entry.confidence.clamp(0.0, 1.0);
+    let confidence = live_confidence.clamp(0.0, 1.0);
 
     let score = if let Some(emb) = embedding_cos_sim {
         (tier_score * 0.35) + (recency * 0.20) + (lexical * 0.25) + (emb * 0.15) + (confidence * 0.05)
@@ -232,6 +242,7 @@ mod tests {
             source: "test".to_string(),
             confidence: 0.8,
             valence: 0.0,
+            belief_kind: Default::default(),
             tags: Vec::new(),
             embedding: None,
             tokens: super::tokenize(content),
@@ -251,6 +262,7 @@ mod tests {
             "what is your name",
             2,
             None,
+            None,
         );
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(core.id));
@@ -267,7 +279,7 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "some other fact", 1);
 
         let ranked =
-            assemble_context_with_provenance(&[&episodic, &profile], &[], "", 2, None);
+            assemble_context_with_provenance(&[&episodic, &profile], &[], "", 2, None, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(profile.id));
         Ok(())
@@ -288,6 +300,7 @@ mod tests {
             "create milestone project plan",
             2,
             None,
+            None,
         );
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(relevant.id));
@@ -304,7 +317,7 @@ mod tests {
         let episodic = sample_entry(MemoryTier::Episodic, "user mentioned project X briefly", 1);
 
         let ranked =
-            assemble_context_with_provenance(&[&reflective, &episodic], &[], "", 2, None);
+            assemble_context_with_provenance(&[&reflective, &episodic], &[], "", 2, None, None);
 
         assert_eq!(ranked.first().map(|item| item.entry.id), Some(reflective.id));
         Ok(())
@@ -330,6 +343,7 @@ mod tests {
             "rust async",
             2,
             query_embedding,
+            None,
         );
 
         assert_eq!(

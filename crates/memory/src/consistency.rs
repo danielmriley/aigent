@@ -197,6 +197,7 @@ mod tests {
             source: source.to_string(),
             confidence: 0.9,
             valence: 0.0,
+            belief_kind: Default::default(),
             created_at: Utc::now(),
             provenance_hash: "hash".to_string(),
             tags: vec![],

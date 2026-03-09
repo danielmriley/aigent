@@ -732,6 +732,7 @@ mod tests {
             source: source.to_string(),
             confidence: 0.8,
             valence: 0.1,
+            belief_kind: Default::default(),
             tags: Vec::new(),
             embedding: None,
             tokens: Default::default(),

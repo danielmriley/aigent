@@ -172,6 +172,12 @@ pub struct MemoryConfig {
     /// Default: `false` (off by default to save memory writes on every turn).
     #[serde(default)]
     pub store_reasoning_traces: bool,
+    /// Maximum number of Active entries allowed in the working memory store.
+    /// When the count exceeds 90% of this limit the confidence sleep cycle
+    /// triggers immediately (capacity pressure trigger) instead of waiting for
+    /// the nightly quiet window.  Default: 2000.
+    #[serde(default = "default_sleep_capacity_limit")]
+    pub sleep_capacity_limit: usize,
 }
 
 impl Default for MemoryConfig {
@@ -198,12 +204,17 @@ impl Default for MemoryConfig {
             proactive_cooldown_minutes: 5,
             reflection_enabled: default_reflection_enabled(),
             store_reasoning_traces: false,
+            sleep_capacity_limit: default_sleep_capacity_limit(),
         }
     }
 }
 
 fn default_reflection_enabled() -> bool {
     true
+}
+
+fn default_sleep_capacity_limit() -> usize {
+    2000
 }
 
 // ── Tools config ─────────────────────────────────────────────────────────────
