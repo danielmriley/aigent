@@ -6,7 +6,7 @@ use chrono::{Local, Utc};
 use tracing::info;
 use uuid::Uuid;
 
-use aigent_config::AppConfig;
+use aigent_config::{AppConfig, LearningConfig};
 use aigent_memory::{BeliefKind, MemoryStats, retrieval::RankedMemoryContext};
 
 use crate::truncate::truncate_for_prompt;
@@ -32,7 +32,7 @@ pub fn build_chat_prompt(inputs: &PromptInputs<'_>) -> String {
     let context_block = if inputs.chat_only {
         String::new()
     } else {
-        build_context_block(inputs.context_items, &inputs.stats)
+        build_context_block(inputs.context_items, &inputs.stats, &config.memory.learning)
     };
     let mut relational_block = if inputs.chat_only {
         String::new()
@@ -253,7 +253,7 @@ fn build_follow_up_block(follow_ups: &[(Uuid, String)], user_name: Option<&str>)
     )
 }
 
-fn build_context_block(context: &[RankedMemoryContext], stats: &MemoryStats) -> String {
+fn build_context_block(context: &[RankedMemoryContext], stats: &MemoryStats, lc: &LearningConfig) -> String {
     let memory_header = format!(
         "[Memory: total={} core={} profile={} reflective={} semantic={} episodic={} \
          — use these counts; do not re-count below]",
@@ -272,7 +272,7 @@ fn build_context_block(context: &[RankedMemoryContext], stats: &MemoryStats) -> 
     let items: Vec<String> = context
         .iter()
         .filter_map(|item| {
-            let rendered = render_memory_item(item)?;
+            let rendered = render_memory_item(item, lc)?;
             Some(format!(
                 "- [{:?}] score={:.2} src={} :: {}",
                 item.entry.tier,
@@ -294,48 +294,48 @@ fn build_context_block(context: &[RankedMemoryContext], stats: &MemoryStats) -> 
 /// its live confidence value and belief kind.
 ///
 /// Returns `None` when the entry should be **excluded** from the system prompt
-/// (confidence ≤ 0.10, or Opinion with confidence < 0.35).
+/// (confidence ≤ `tier_observed_threshold`, or Opinion with confidence < `tier_suspect_threshold`).
 ///
-/// Confidence-tier thresholds (Phase 7 will move these to `config/default.toml`):
-/// | Confidence   | Empirical/Procedural/SelfModel rendering          |
+/// Confidence-tier thresholds are driven by `lc` (loaded from `[memory.learning]` in config):
+/// | Confidence                  | Empirical/Procedural/SelfModel rendering          |
 /// |---|---|
-/// | ≥ 0.70       | "You know that …"                                 |
-/// | 0.50 – 0.69  | "You have come to believe that …"                 |
-/// | 0.35 – 0.49  | "From experience, you suspect that …"             |
-/// | 0.10 – 0.34  | "You once observed that … (treat with skepticism)" |
-/// | ≤ 0.10       | Not injected                                       |
+/// | ≥ tier_know_threshold       | "You know that …"                                 |
+/// | ≥ tier_believe_threshold    | "You have come to believe that …"                 |
+/// | ≥ tier_suspect_threshold    | "From experience, you suspect that …"             |
+/// | > tier_observed_threshold   | "You once observed that … (treat with skepticism)" |
+/// | ≤ tier_observed_threshold   | Not injected                                       |
 ///
-/// Opinion entries use dispositional language and are excluded below 0.35.
-fn render_memory_item(item: &RankedMemoryContext) -> Option<String> {
+/// Opinion entries use dispositional language and are excluded below `tier_suspect_threshold`.
+fn render_memory_item(item: &RankedMemoryContext, lc: &LearningConfig) -> Option<String> {
     let conf = item.live_confidence.clamp(0.0, 1.0);
     let content = truncate_for_prompt(&item.entry.content, 4096);
 
     match item.entry.belief_kind {
         BeliefKind::Opinion => {
-            if conf >= 0.70 {
+            if conf >= lc.tier_know_threshold {
                 Some(format!("You tend to prefer {content}"))
-            } else if conf >= 0.35 {
+            } else if conf >= lc.tier_suspect_threshold {
                 Some(format!("You have noticed a tendency to {content}"))
             } else {
-                // < 0.35 (including the ≤ 0.10 floor): exclude Opinions entirely.
+                // < tier_suspect_threshold (including the floor): exclude Opinions entirely.
                 None
             }
         }
         // Empirical, Procedural, SelfModel — epistemic language calibrated to confidence.
         _ => {
-            if conf >= 0.70 {
+            if conf >= lc.tier_know_threshold {
                 Some(format!("You know that {content}"))
-            } else if conf >= 0.50 {
+            } else if conf >= lc.tier_believe_threshold {
                 Some(format!("You have come to believe that {content}"))
-            } else if conf >= 0.35 {
+            } else if conf >= lc.tier_suspect_threshold {
                 Some(format!("From experience, you suspect that {content}"))
-            } else if conf > 0.10 {
+            } else if conf > lc.tier_observed_threshold {
                 Some(format!(
                     "You once observed that {content}, \
                      but this has not been confirmed. Treat it with skepticism."
                 ))
             } else {
-                // ≤ 0.10: excluded from system prompt entirely.
+                // ≤ tier_observed_threshold: excluded from system prompt entirely.
                 None
             }
         }
@@ -823,7 +823,7 @@ mod confidence_tier_rendering {
     #[test]
     fn empirical_high_confidence_renders_as_know_that() {
         let item = make_item("Rust uses a borrow checker.", BeliefKind::Empirical, 0.75);
-        let rendered = render_memory_item(&item).expect("should render");
+        let rendered = render_memory_item(&item, &LearningConfig::default()).expect("should render");
         assert!(
             rendered.starts_with("You know that"),
             "expected 'You know that…' prefix, got: {rendered}"
@@ -834,7 +834,7 @@ mod confidence_tier_rendering {
     fn low_confidence_entry_excluded_from_prompt() {
         let item = make_item("Maybe the API is broken.", BeliefKind::Empirical, 0.09);
         assert!(
-            render_memory_item(&item).is_none(),
+            render_memory_item(&item, &LearningConfig::default()).is_none(),
             "confidence ≤ 0.10 should be excluded (None)"
         );
     }
@@ -842,7 +842,7 @@ mod confidence_tier_rendering {
     #[test]
     fn opinion_high_confidence_renders_as_dispositional() {
         let item = make_item("async Rust over threads.", BeliefKind::Opinion, 0.80);
-        let rendered = render_memory_item(&item).expect("should render");
+        let rendered = render_memory_item(&item, &LearningConfig::default()).expect("should render");
         assert!(
             rendered.starts_with("You tend to prefer"),
             "expected 'You tend to prefer…' prefix for Opinion, got: {rendered}"
@@ -853,7 +853,7 @@ mod confidence_tier_rendering {
     fn opinion_below_threshold_excluded() {
         let item = make_item("short variable names.", BeliefKind::Opinion, 0.30);
         assert!(
-            render_memory_item(&item).is_none(),
+            render_memory_item(&item, &LearningConfig::default()).is_none(),
             "Opinion < 0.35 should be excluded (None)"
         );
     }
@@ -861,7 +861,7 @@ mod confidence_tier_rendering {
     #[test]
     fn belief_range_renders_have_come_to_believe() {
         let item = make_item("this codebase uses hexagonal architecture.", BeliefKind::Empirical, 0.55);
-        let rendered = render_memory_item(&item).expect("should render");
+        let rendered = render_memory_item(&item, &LearningConfig::default()).expect("should render");
         assert!(
             rendered.starts_with("You have come to believe that"),
             "expected 'You have come to believe that…' prefix, got: {rendered}"
@@ -871,7 +871,7 @@ mod confidence_tier_rendering {
     #[test]
     fn suspect_range_renders_from_experience() {
         let item = make_item("the upstream API throttles at 100 req/min.", BeliefKind::Empirical, 0.42);
-        let rendered = render_memory_item(&item).expect("should render");
+        let rendered = render_memory_item(&item, &LearningConfig::default()).expect("should render");
         assert!(
             rendered.starts_with("From experience, you suspect that"),
             "expected 'From experience, you suspect…' prefix, got: {rendered}"
@@ -881,7 +881,7 @@ mod confidence_tier_rendering {
     #[test]
     fn low_confidence_skeptical_rendering() {
         let item = make_item("the CI runs on Fridays.", BeliefKind::Empirical, 0.20);
-        let rendered = render_memory_item(&item).expect("should render");
+        let rendered = render_memory_item(&item, &LearningConfig::default()).expect("should render");
         assert!(
             rendered.starts_with("You once observed that"),
             "expected 'You once observed that…' prefix, got: {rendered}"

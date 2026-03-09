@@ -684,10 +684,15 @@ pub(super) fn spawn_confidence_sleep_task(
                 })
             };
 
-            // Run Pass 1 and Pass 2 — hold the lock across both passes so no
+            // Run Passes 1–4 — hold the lock across all passes so no
             // concurrent writer can interleave between them.
             {
                 let mut s = state.lock().await;
+
+                // Snapshot confidences before any pass so Pass 4 can compute
+                // the net delta from Passes 1–3.
+                let pre_pass_snapshot = s.memory.snapshot_confidences();
+
                 match s.memory.run_sleep_pass_1_decay().await {
                     Ok(decayed) if decayed > 0 => {
                         info!(decayed, "confidence sleep: Pass 1 (stale decay) complete");
@@ -705,6 +710,33 @@ pub(super) fn spawn_confidence_sleep_task(
                     }
                     Ok(_) => info!("confidence sleep: Pass 2 complete (nothing to consolidate)"),
                     Err(ref e) => warn!(?e, "confidence sleep: Pass 2 failed"),
+                }
+                match s.memory.run_sleep_pass_3_contradiction().await {
+                    Ok(contradictions) if contradictions > 0 => {
+                        info!(contradictions, "confidence sleep: Pass 3 (contradiction) complete");
+                    }
+                    Ok(_) => info!("confidence sleep: Pass 3 complete (no contradictions)"),
+                    Err(ref e) => warn!(?e, "confidence sleep: Pass 3 failed"),
+                }
+                match s
+                    .memory
+                    .run_sleep_pass_4_propagation(&pre_pass_snapshot)
+                    .await
+                {
+                    Ok(propagated) if propagated > 0 => {
+                        info!(propagated, "confidence sleep: Pass 4 (propagation) complete");
+                    }
+                    Ok(_) => info!("confidence sleep: Pass 4 complete (nothing to propagate)"),
+                    Err(ref e) => warn!(?e, "confidence sleep: Pass 4 failed"),
+                }
+                // Pass 5 heuristic: write opinion candidates that the multi-agent
+                // Identity specialist cannot cover (daemon runs without LLM context).
+                match s.memory.run_sleep_pass_5_opinion_synthesis(5).await {
+                    Ok(written) if written > 0 => {
+                        info!(written, "confidence sleep: Pass 5 (opinion synthesis) complete");
+                    }
+                    Ok(_) => debug!("confidence sleep: Pass 5 complete (no opinions proposed)"),
+                    Err(ref e) => warn!(?e, "confidence sleep: Pass 5 failed"),
                 }
                 s.last_confidence_sleep_at = Some(std::time::Instant::now());
             }

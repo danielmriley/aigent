@@ -177,7 +177,7 @@ impl AgentRuntime {
                 "multi-agent sleep: processing batch"
             );
             let _ = progress.send(format!(
-                "Batch {}/{}: consulting 4 specialist agents in parallel…",
+                "Batch {}/{}: consulting 5 specialist agents in parallel…",
                 batch_idx + 1,
                 batches.len()
             ));
@@ -197,26 +197,30 @@ impl AgentRuntime {
                 specialist_prompt(SpecialistRole::Strategist, batch, &identity_snap, bot_name, user_name);
             let critic_prompt =
                 specialist_prompt(SpecialistRole::Critic, batch, &identity_snap, bot_name, user_name);
+            let identity_prompt =
+                specialist_prompt(SpecialistRole::Identity, batch, &identity_snap, bot_name, user_name);
 
-            // Run all 4 specialists in parallel.
-            let (arch_reply, psych_reply, strat_reply, critic_reply) = tokio::join!(
+            // Run all 5 specialists in parallel.
+            let (arch_reply, psych_reply, strat_reply, critic_reply, identity_reply) = tokio::join!(
                 self.sleep_llm_call(primary, &arch_prompt, "Archivist"),
                 self.sleep_llm_call(primary, &psych_prompt, "Psychologist"),
                 self.sleep_llm_call(primary, &strat_prompt, "Strategist"),
                 self.sleep_llm_call(primary, &critic_prompt, "Critic"),
+                self.sleep_llm_call(primary, &identity_prompt, "Identity"),
             );
 
             // Collect available replies — degrade gracefully to a partial team
             // rather than discarding all successful results when one specialist
-            // fails.  Only fall back to single-agent when ALL four fail.
-            let mut specialist_reports: Vec<(SpecialistRole, String)> = Vec::with_capacity(4);
-            if let Some(r) = arch_reply   { specialist_reports.push((SpecialistRole::Archivist,    r)); }
-            if let Some(r) = psych_reply  { specialist_reports.push((SpecialistRole::Psychologist, r)); }
-            if let Some(r) = strat_reply  { specialist_reports.push((SpecialistRole::Strategist,   r)); }
-            if let Some(r) = critic_reply { specialist_reports.push((SpecialistRole::Critic,        r)); }
+            // fails.  Only fall back to single-agent when ALL five fail.
+            let mut specialist_reports: Vec<(SpecialistRole, String)> = Vec::with_capacity(5);
+            if let Some(r) = arch_reply     { specialist_reports.push((SpecialistRole::Archivist,    r)); }
+            if let Some(r) = psych_reply    { specialist_reports.push((SpecialistRole::Psychologist, r)); }
+            if let Some(r) = strat_reply    { specialist_reports.push((SpecialistRole::Strategist,   r)); }
+            if let Some(r) = critic_reply   { specialist_reports.push((SpecialistRole::Critic,        r)); }
+            if let Some(r) = identity_reply { specialist_reports.push((SpecialistRole::Identity,      r)); }
 
             if specialist_reports.is_empty() {
-                // All 4 failed — single-agent fallback for this batch.
+                // All 5 failed — single-agent fallback for this batch.
                 warn!(
                     batch = batch_idx + 1,
                     "multi-agent sleep: all specialists failed — using single-agent fallback for this batch"
@@ -247,7 +251,7 @@ impl AgentRuntime {
                 continue;
             }
 
-            if specialist_reports.len() < 4 {
+            if specialist_reports.len() < 5 {
                 warn!(
                     batch = batch_idx + 1,
                     succeeded = specialist_reports.len(),
