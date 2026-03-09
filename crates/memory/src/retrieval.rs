@@ -20,6 +20,10 @@ pub struct RankedMemoryContext {
     pub entry: MemoryEntry,
     pub score: f32,
     pub rationale: String,
+    /// Live (dynamically updated) confidence for this entry at ranking time.
+    /// Used by the prompt builder for calibrated epistemic language.
+    /// Equals `entry.confidence` when no `confidence_fn` is provided.
+    pub live_confidence: f32,
 }
 
 /// Build a ranked, deduplicated context window for LLM prompt injection.
@@ -65,17 +69,17 @@ pub fn assemble_context_with_provenance(
     let now = Utc::now();
 
     // Score every candidate by reference — no clones yet.
-    let mut ranked: Vec<(&MemoryEntry, f32, String)> = combined
+    let mut ranked: Vec<(&MemoryEntry, f32, String, f32)> = combined
         .into_iter()
         .map(|entry| {
             let embedding_sim = cosine_similarity_if_available(entry, query_emb_slice);
             let live_conf = confidence_fn.map_or(entry.confidence, |f| f(entry.id));
             let ctx = score_entry_ref(entry, &query_terms, now, embedding_sim, live_conf);
-            (entry, ctx.score, ctx.rationale)
+            (entry, ctx.score, ctx.rationale, live_conf)
         })
         .collect();
 
-    ranked.sort_by(|(_, ls, _), (_, rs, _)| {
+    ranked.sort_by(|(_, ls, _, _), (_, rs, _, _)| {
         rs.total_cmp(ls)
     });
 
@@ -83,10 +87,11 @@ pub fn assemble_context_with_provenance(
     ranked
         .into_iter()
         .take(limit)
-        .map(|(entry, score, rationale)| RankedMemoryContext {
+        .map(|(entry, score, rationale, live_confidence)| RankedMemoryContext {
             entry: entry.clone(),
             score,
             rationale,
+            live_confidence,
         })
         .collect()
 }

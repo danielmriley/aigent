@@ -7,7 +7,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use aigent_config::AppConfig;
-use aigent_memory::{MemoryStats, retrieval::RankedMemoryContext};
+use aigent_memory::{BeliefKind, MemoryStats, retrieval::RankedMemoryContext};
 
 use crate::truncate::truncate_for_prompt;
 use crate::{ConversationTurn, PromptInputs};
@@ -269,21 +269,77 @@ fn build_context_block(context: &[RankedMemoryContext], stats: &MemoryStats) -> 
         return format!("{memory_header}\n(no relevant memories retrieved)");
     }
 
-    let items = context
+    let items: Vec<String> = context
         .iter()
-        .map(|item| {
-            format!(
+        .filter_map(|item| {
+            let rendered = render_memory_item(item)?;
+            Some(format!(
                 "- [{:?}] score={:.2} src={} :: {}",
                 item.entry.tier,
                 item.score,
                 item.entry.source,
-                truncate_for_prompt(&item.entry.content, 4096),
-            )
+                rendered,
+            ))
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
 
-    format!("{memory_header}\n{items}")
+    if items.is_empty() {
+        return format!("{memory_header}\n(no relevant memories retrieved)");
+    }
+
+    format!("{memory_header}\n{}", items.join("\n"))
+}
+
+/// Render a memory item's content with calibrated epistemic language based on
+/// its live confidence value and belief kind.
+///
+/// Returns `None` when the entry should be **excluded** from the system prompt
+/// (confidence ≤ 0.10, or Opinion with confidence < 0.35).
+///
+/// Confidence-tier thresholds (Phase 7 will move these to `config/default.toml`):
+/// | Confidence   | Empirical/Procedural/SelfModel rendering          |
+/// |---|---|
+/// | ≥ 0.70       | "You know that …"                                 |
+/// | 0.50 – 0.69  | "You have come to believe that …"                 |
+/// | 0.35 – 0.49  | "From experience, you suspect that …"             |
+/// | 0.10 – 0.34  | "You once observed that … (treat with skepticism)" |
+/// | ≤ 0.10       | Not injected                                       |
+///
+/// Opinion entries use dispositional language and are excluded below 0.35.
+fn render_memory_item(item: &RankedMemoryContext) -> Option<String> {
+    let conf = item.live_confidence.clamp(0.0, 1.0);
+    let content = truncate_for_prompt(&item.entry.content, 4096);
+
+    match item.entry.belief_kind {
+        BeliefKind::Opinion => {
+            if conf >= 0.70 {
+                Some(format!("You tend to prefer {content}"))
+            } else if conf >= 0.35 {
+                Some(format!("You have noticed a tendency to {content}"))
+            } else {
+                // < 0.35 (including the ≤ 0.10 floor): exclude Opinions entirely.
+                None
+            }
+        }
+        // Empirical, Procedural, SelfModel — epistemic language calibrated to confidence.
+        _ => {
+            if conf >= 0.70 {
+                Some(format!("You know that {content}"))
+            } else if conf >= 0.50 {
+                Some(format!("You have come to believe that {content}"))
+            } else if conf >= 0.35 {
+                Some(format!("From experience, you suspect that {content}"))
+            } else if conf > 0.10 {
+                Some(format!(
+                    "You once observed that {content}, \
+                     but this has not been confirmed. Treat it with skepticism."
+                ))
+            } else {
+                // ≤ 0.10: excluded from system prompt entirely.
+                None
+            }
+        }
+    }
 }
 
 fn proactive_directive(relational_block: &str) -> &'static str {
@@ -731,5 +787,105 @@ mod summary_tests {
         let summary_pos = prompt.find("PRIOR CONVERSATION SUMMARY").unwrap();
         let conv_pos = prompt.find("RECENT CONVERSATION:\n").unwrap();
         assert!(summary_pos < conv_pos, "summary should precede the RECENT CONVERSATION section");
+    }
+}
+
+#[cfg(test)]
+mod confidence_tier_rendering {
+    use super::*;
+    use std::collections::HashSet;
+    use chrono::Utc;
+    use uuid::Uuid;
+    use aigent_memory::{BeliefKind, MemoryEntry, MemoryTier, retrieval::RankedMemoryContext};
+
+    fn make_item(content: &str, belief_kind: BeliefKind, live_confidence: f32) -> RankedMemoryContext {
+        RankedMemoryContext {
+            entry: MemoryEntry {
+                id: Uuid::new_v4(),
+                tier: MemoryTier::Episodic,
+                content: content.to_string(),
+                source: "test".to_string(),
+                confidence: live_confidence,
+                valence: 0.0,
+                created_at: Utc::now(),
+                provenance_hash: "test".to_string(),
+                belief_kind,
+                tags: vec![],
+                embedding: None,
+                tokens: HashSet::new(),
+            },
+            score: 0.5,
+            rationale: "test".to_string(),
+            live_confidence,
+        }
+    }
+
+    #[test]
+    fn empirical_high_confidence_renders_as_know_that() {
+        let item = make_item("Rust uses a borrow checker.", BeliefKind::Empirical, 0.75);
+        let rendered = render_memory_item(&item).expect("should render");
+        assert!(
+            rendered.starts_with("You know that"),
+            "expected 'You know that…' prefix, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn low_confidence_entry_excluded_from_prompt() {
+        let item = make_item("Maybe the API is broken.", BeliefKind::Empirical, 0.09);
+        assert!(
+            render_memory_item(&item).is_none(),
+            "confidence ≤ 0.10 should be excluded (None)"
+        );
+    }
+
+    #[test]
+    fn opinion_high_confidence_renders_as_dispositional() {
+        let item = make_item("async Rust over threads.", BeliefKind::Opinion, 0.80);
+        let rendered = render_memory_item(&item).expect("should render");
+        assert!(
+            rendered.starts_with("You tend to prefer"),
+            "expected 'You tend to prefer…' prefix for Opinion, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn opinion_below_threshold_excluded() {
+        let item = make_item("short variable names.", BeliefKind::Opinion, 0.30);
+        assert!(
+            render_memory_item(&item).is_none(),
+            "Opinion < 0.35 should be excluded (None)"
+        );
+    }
+
+    #[test]
+    fn belief_range_renders_have_come_to_believe() {
+        let item = make_item("this codebase uses hexagonal architecture.", BeliefKind::Empirical, 0.55);
+        let rendered = render_memory_item(&item).expect("should render");
+        assert!(
+            rendered.starts_with("You have come to believe that"),
+            "expected 'You have come to believe that…' prefix, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn suspect_range_renders_from_experience() {
+        let item = make_item("the upstream API throttles at 100 req/min.", BeliefKind::Empirical, 0.42);
+        let rendered = render_memory_item(&item).expect("should render");
+        assert!(
+            rendered.starts_with("From experience, you suspect that"),
+            "expected 'From experience, you suspect…' prefix, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn low_confidence_skeptical_rendering() {
+        let item = make_item("the CI runs on Fridays.", BeliefKind::Empirical, 0.20);
+        let rendered = render_memory_item(&item).expect("should render");
+        assert!(
+            rendered.starts_with("You once observed that"),
+            "expected 'You once observed that…' prefix, got: {rendered}"
+        );
+        assert!(rendered.contains("skepticism"), "should mention skepticism");
     }
 }
