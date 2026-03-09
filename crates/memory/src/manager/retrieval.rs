@@ -44,7 +44,11 @@ impl MemoryManager {
                 non_core.push(entry);
             }
         }
-        let mut ranked = assemble_context_with_provenance(&non_core, &core_entries, query, limit, query_embedding);
+        // Pass a live-confidence resolver so entries ranked here reflect dynamic
+        // confidence deltas from `record_confidence_signal`, not just the initial
+        // anchor stored at record time.  O(1) per entry via the in-memory cache.
+        let cf: &dyn Fn(Uuid) -> f32 = &|id: Uuid| self.current_confidence(id);
+        let mut ranked = assemble_context_with_provenance(&non_core, &core_entries, query, limit, query_embedding, Some(cf));
         self.prepend_kv_identity_block(&mut ranked);
         ranked
     }
@@ -67,6 +71,7 @@ impl MemoryManager {
                     valence: 0.0,
                     created_at: Utc::now(),
                     provenance_hash: "kv_summary".to_string(),
+                    belief_kind: Default::default(),
                     tags: vec!["identity".to_string(), "auto_injected".to_string()],
                     embedding: None,
                     // Pinned synthetic entry — not scored lexically, skip tokenisation.

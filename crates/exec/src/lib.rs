@@ -6,7 +6,10 @@ pub mod sandbox;
 pub mod wasm;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,27 @@ use tracing::{info, warn};
 
 use aigent_config::{ApprovalMode, ToolPolicyOverride};
 use aigent_tools::{SecurityLevel, ToolMetadata, ToolOutput, ToolRegistry};
+
+// ── Tool Outcome Callback ─────────────────────────────────────────────────────
+
+/// Callback invoked after every tool execution — success or failure.
+///
+/// Receives `(tool_name, success, output)`.  Implementations in higher-level
+/// crates (e.g. `aigent-agent`) use this to run lexical matching against the
+/// in-memory belief store and emit `ConfidenceUpdateEvent` records for any
+/// beliefs whose content overlaps with the tool name or output.
+///
+/// The callback is fire-and-forget from the executor's perspective: errors are
+/// logged by the callback impl; the tool result is returned to the caller
+/// regardless of callback outcome.
+///
+/// Uses the same `Arc<dyn Fn(...) -> Pin<Box<dyn Future<...>>>` pattern as
+/// `EmbedFn` in `aigent-memory` so it can be stored without boxing overhead.
+pub type ToolOutcomeCallbackFn = Arc<
+    dyn Fn(String, bool, String) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
 
 // ── Execution Policy ─────────────────────────────────────────────────────────
 
@@ -135,6 +159,14 @@ pub struct ToolExecutor {
     approval_tx: Option<ApprovalSender>,
     /// Per-tool invocation counter for rate-limiting within a session.
     call_counts: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Optional post-execution callback for confidence signal emission.
+    ///
+    /// When set, this is called after every tool execution (success or failure)
+    /// with `(tool_name, success, output_text)`.  The callback is responsible
+    /// for lexical matching against the belief store and emitting
+    /// `ConfidenceUpdateEvent` records — this crate does not depend on
+    /// `aigent-memory` directly.
+    outcome_callback: Option<ToolOutcomeCallbackFn>,
 }
 
 impl ToolExecutor {
@@ -143,6 +175,7 @@ impl ToolExecutor {
             policy,
             approval_tx: None,
             call_counts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            outcome_callback: None,
         }
     }
 
@@ -150,6 +183,26 @@ impl ToolExecutor {
     pub fn with_approval(mut self, tx: ApprovalSender) -> Self {
         self.approval_tx = Some(tx);
         self
+    }
+
+    /// Attach a post-execution callback for confidence signal emission.
+    ///
+    /// The callback is called after every tool execution with
+    /// `(tool_name, success, output_text)`.  Wire this from `aigent-agent`
+    /// where both the executor and memory manager are available.
+    pub fn with_outcome_callback(mut self, cb: ToolOutcomeCallbackFn) -> Self {
+        self.outcome_callback = Some(cb);
+        self
+    }
+
+    /// Set the outcome callback in-place (for post-construction wiring).
+    ///
+    /// Unlike [`with_outcome_callback`] this takes `&mut self` so it can be
+    /// called on an already-constructed executor (e.g. via `Arc::get_mut`
+    /// in the daemon startup path where the callback depends on state built
+    /// after the executor).
+    pub fn set_outcome_callback(&mut self, cb: ToolOutcomeCallbackFn) {
+        self.outcome_callback = Some(cb);
     }
 
     /// Reset per-tool call counters.  Call this when starting a new
@@ -231,6 +284,10 @@ impl ToolExecutor {
                     warn!(?err, tool = tool_name, "git auto-commit failed (non-fatal)");
                 }
             }
+            // Fire post-execution callback for confidence signal emission.
+            if let Some(cb) = &self.outcome_callback {
+                cb(tool_name.to_string(), result.success, result.output.clone()).await;
+            }
             return Ok(result);
         }
 
@@ -252,6 +309,11 @@ impl ToolExecutor {
             {
                 warn!(?err, tool = tool_name, "git auto-commit failed (non-fatal)");
             }
+        }
+
+        // Fire post-execution callback for confidence signal emission.
+        if let Some(cb) = &self.outcome_callback {
+            cb(tool_name.to_string(), result.success, result.output.clone()).await;
         }
 
         Ok(result)

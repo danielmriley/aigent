@@ -16,10 +16,18 @@ pub mod vector_store;
 pub mod vault;
 
 pub use identity::IdentityKernel;
-pub use index::{IndexCacheStats, IndexedEntry, MemoryIndex};
-pub use manager::{EmbedFn, MemoryManager, MemoryStats};
+pub use event_log::{MemoryLogEvent, MemoryRecordEvent};
+pub use index::{
+    ConfidenceCheckpoint, IndexCacheStats, IndexedEntry, MemoryIndex, NodeRegistryEntry,
+    NodeState,
+};
+pub use manager::{ConsolidationFn, EmbedFn, MemoryManager, MemoryStats};
 pub use multi_sleep::{SpecialistRole, batch_memories, merge_insights};
-pub use schema::{MemoryEntry, MemoryTier, SourceKind, truncate_str};
+pub use schema::{
+    BeliefConsolidatedEvent, BeliefKind, BeliefRelationshipEvent, ConfidenceReason,
+    ConfidenceSource, ConfidenceUpdateEvent, EdgeKind, FailureClass, MemoryEntry, MemoryTier,
+    SourceKind, truncate_str,
+};
 pub use sleep::{AgenticSleepInsights, SleepSummary, parse_agentic_insights};
 pub use vector_store::{FlatVectorStore, VectorBackend, VectorMatch, cosine_similarity};
 pub use vault::{

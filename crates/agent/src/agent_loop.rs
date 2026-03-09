@@ -429,6 +429,68 @@ mod tests {
         assert_eq!(args["note"], "");
     }
 
+    // ── Phase 3c integration: tool outcome callback → confidence update ────
+
+    /// End-to-end test: a `ToolOutcomeCallbackFn` wired to
+    /// `emit_tool_outcome_confidence` correctly feeds a successful tool
+    /// result back into the confidence model, raising the cached confidence
+    /// for any Active belief that lexically mentions the tool name.
+    #[tokio::test]
+    async fn tool_outcome_callback_emits_confidence_signal() -> anyhow::Result<()> {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use aigent_exec::ToolOutcomeCallbackFn;
+        use aigent_memory::{BeliefKind, MemoryManager, MemoryTier};
+
+        let path = std::env::temp_dir()
+            .join(format!("aigent-callback-{}.jsonl", uuid::Uuid::new_v4()));
+
+        let mut manager = MemoryManager::with_event_log(&path).await?;
+
+        // Pre-record a SelfModel belief that lexically mentions "read_file".
+        let belief_id = manager
+            .record_observation(
+                "I can use read_file to read any file in the workspace",
+                "agent",
+                MemoryTier::Procedural,
+                BeliefKind::SelfModel,
+                vec![],
+            )
+            .await?;
+
+        // SelfModel with a non-tool source starts at 0.50 confidence.
+        let initial_conf = manager.current_confidence(belief_id);
+
+        let mem = Arc::new(Mutex::new(manager));
+
+        // Build the callback with the same closure pattern used in
+        // runtime/server/mod.rs so this test exercises the real wiring path.
+        let cb_mem = mem.clone();
+        let cb: ToolOutcomeCallbackFn = Arc::new(move |tool_name, success, output| {
+            let m = cb_mem.clone();
+            Box::pin(async move {
+                let mut guard = m.lock().await;
+                guard
+                    .emit_tool_outcome_confidence(&tool_name, success, &output)
+                    .await;
+            })
+        });
+
+        // Simulate a successful tool execution firing the callback.
+        cb("read_file".to_string(), true, "hello world".to_string()).await;
+
+        // SelfModel + success → delta = +0.12, so new confidence = 0.62.
+        let new_conf = mem.lock().await.current_confidence(belief_id);
+        assert!(
+            new_conf > initial_conf,
+            "confidence should increase after successful read_file callback: \
+             initial={initial_conf} final={new_conf}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
     // ── ReflectionOutput / ProactiveOutput serde ───────────────────────────
 
     #[test]

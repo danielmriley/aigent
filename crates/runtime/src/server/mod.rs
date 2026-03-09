@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tracing::{info, warn};
 
 use aigent_config::AppConfig;
-use aigent_exec::{ExecutionPolicy, ToolExecutor};
+use aigent_exec::{ExecutionPolicy, ToolExecutor, ToolOutcomeCallbackFn};
 use aigent_memory::{EmbedFn, MemoryManager};
 use aigent_tools::ToolRegistry;
 
@@ -72,6 +72,9 @@ struct DaemonState {
     last_multi_agent_sleep_at: Option<std::time::Instant>,
     /// Instant of the last successful passive distillation run.
     last_passive_sleep_at: Option<std::time::Instant>,
+    /// Instant of the last successful confidence-learning sleep cycle run
+    /// (Pass 1 stale-decay + Pass 2 episodic consolidation).
+    last_confidence_sleep_at: Option<std::time::Instant>,
     /// Total proactive messages sent since daemon start.
     proactive_total_sent: u64,
     /// Timestamp of the last proactive message sent.
@@ -421,6 +424,7 @@ pub async fn run_unified_daemon(
         event_tx,
         last_multi_agent_sleep_at,
         last_passive_sleep_at: None,
+        last_confidence_sleep_at: None,
         proactive_total_sent: 0,
         last_proactive_at: None,
         proactive_handle: None,
@@ -476,6 +480,36 @@ pub async fn run_unified_daemon(
         let write_tool = aigent_tools::WriteMemoryTool { write_fn: memory_write_fn };
         state.lock().await.tool_registry.register(Box::new(write_tool));
         info!("registered write_memory tool with live daemon memory handle");
+    }
+
+    // ── Wire tool-outcome confidence callback ─────────────────────────────────
+    // After all state is constructed but before the first connection arrives,
+    // attach the callback that feeds tool results back into the confidence model.
+    // `Arc::get_mut` succeeds here because the executor Arc is owned solely by
+    // `DaemonState` at this point (no connections have been accepted yet).
+    {
+        let cb_state = state.clone();
+        let outcome_cb: ToolOutcomeCallbackFn = Arc::new(
+            move |tool_name, success, output| {
+                let st = cb_state.clone();
+                Box::pin(async move {
+                    let mut s = st.lock().await;
+                    s.memory
+                        .emit_tool_outcome_confidence(&tool_name, success, &output)
+                        .await;
+                })
+            },
+        );
+        let mut s = state.lock().await;
+        if let Some(exe) = Arc::get_mut(&mut s.tool_executor) {
+            exe.set_outcome_callback(outcome_cb);
+            info!("tool-outcome confidence callback registered");
+        } else {
+            warn!(
+                "could not register tool-outcome confidence callback: \
+                 executor Arc has multiple owners at startup"
+            );
+        }
     }
 
     let listener = UnixListener::bind(&socket_path)?;
@@ -565,6 +599,7 @@ pub async fn run_unified_daemon(
         sleep_quiet_end,
         sleep_tz,
     );
+    sleep::spawn_confidence_sleep_task(state.clone(), &shutdown_tx, sleep_quiet_start, sleep_quiet_end, sleep_tz);
     if proactive_interval_minutes > 0 {
         let handle = sleep::spawn_proactive_task(
             state.clone(),

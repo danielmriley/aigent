@@ -6,13 +6,47 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::schema::MemoryEntry;
+use crate::schema::{
+    BeliefConsolidatedEvent, BeliefRelationshipEvent, ConfidenceUpdateEvent, MemoryEntry,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryRecordEvent {
     pub event_id: Uuid,
     pub occurred_at: DateTime<Utc>,
     pub entry: MemoryEntry,
+}
+
+/// Top-level discriminated union written to the JSONL event log.
+///
+/// The tag field `"kind"` distinguishes event types so new variants can be
+/// added without breaking readers of old logs.  Lines without a `"kind"` field
+/// (all pre-Phase-1 records) are treated as `RecordEntry` for backward compat.
+///
+/// **Append-only invariant**: once written, no event is mutated.  All state
+/// changes are expressed as new events (`ConfidenceUpdate`, `BeliefConsolidated`,
+/// `BeliefRelationship`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MemoryLogEvent {
+    /// A new belief was recorded (the original pre-Phase-1 event type).
+    RecordEntry(MemoryRecordEvent),
+    /// A belief's confidence was updated.
+    ConfidenceUpdate(ConfidenceUpdateEvent),
+    /// N episodic beliefs were consolidated into one higher-tier belief.
+    BeliefConsolidated(BeliefConsolidatedEvent),
+    /// A directed relationship between two beliefs was identified.
+    BeliefRelationship(BeliefRelationshipEvent),
+}
+
+impl MemoryLogEvent {
+    /// Extract the inner [`MemoryRecordEvent`] if this is a `RecordEntry` variant.
+    pub fn as_record(&self) -> Option<&MemoryRecordEvent> {
+        match self {
+            Self::RecordEntry(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +61,26 @@ impl MemoryEventLog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Append any [`MemoryLogEvent`] variant to the log (confidence updates,
+    /// consolidation events, relationship events).  Use [`append`] for the
+    /// common case of a new belief record.
+    pub async fn append_log_event(&self, event: &MemoryLogEvent) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await?;
+        let line = serde_json::to_string(event)?;
+        file.write_all(line.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok(())
     }
 
     pub async fn append(&self, event: &MemoryRecordEvent) -> Result<()> {
@@ -128,7 +182,32 @@ impl MemoryEventLog {
         Ok(())
     }
 
+    /// Load only the `RecordEntry` events (beliefs) from the log — backward
+    /// compatible with pre-Phase-1 logs that contain bare `MemoryRecordEvent`
+    /// JSON without a `"kind"` discriminator field.
+    ///
+    /// New `ConfidenceUpdate`, `BeliefConsolidated`, and `BeliefRelationship`
+    /// lines are silently skipped here.  Use [`load_all_events`] when all
+    /// event types are needed (e.g. confidence replay, graph rebuilding).
     pub async fn load(&self) -> Result<Vec<MemoryRecordEvent>> {
+        let all = self.load_all_events().await?;
+        Ok(all
+            .into_iter()
+            .filter_map(|e| match e {
+                MemoryLogEvent::RecordEntry(r) => Some(r),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Load all events from the log, returning the full typed [`MemoryLogEvent`]
+    /// stream.  Each line is parsed with a two-pass strategy for backward compat:
+    ///
+    /// 1. Try `MemoryLogEvent` (tagged with `"kind"` field) — new format.
+    /// 2. Fall back to bare `MemoryRecordEvent` (no `"kind"` field) — old format,
+    ///    wrapped into `MemoryLogEvent::RecordEntry`.
+    /// 3. Corrupt lines are saved to the `.corrupt` sidecar and skipped.
+    pub async fn load_all_events(&self) -> Result<Vec<MemoryLogEvent>> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
         if !tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
@@ -148,28 +227,33 @@ impl MemoryEventLog {
                 continue;
             }
 
-            match serde_json::from_str::<MemoryRecordEvent>(&line) {
-                Ok(event) => events.push(event),
-                Err(err) => {
-                    corrupt_count += 1;
-                    tracing::warn!(
-                        line = line_idx,
-                        error = %err,
-                        path = %self.path.display(),
-                        "corrupt JSONL record — skipping line (original preserved in .corrupt file)"
-                    );
-                    // Append the bad line to a sidecar file for forensics.
-                    let corrupt_path = self.path.with_extension("jsonl.corrupt");
-                    if let Ok(mut bad) = tokio::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&corrupt_path)
-                        .await
-                    {
-                        use tokio::io::AsyncWriteExt;
-                        let _ = bad.write_all(format!("{line}\n").as_bytes()).await;
-                    }
-                }
+            // Pass 1: try the new tagged format.
+            if let Ok(event) = serde_json::from_str::<MemoryLogEvent>(&line) {
+                events.push(event);
+                continue;
+            }
+            // Pass 2: try the old bare MemoryRecordEvent format (no "kind" field).
+            if let Ok(record) = serde_json::from_str::<MemoryRecordEvent>(&line) {
+                events.push(MemoryLogEvent::RecordEntry(record));
+                continue;
+            }
+
+            // Neither parse succeeded — treat as corrupt.
+            corrupt_count += 1;
+            tracing::warn!(
+                line = line_idx,
+                path = %self.path.display(),
+                "corrupt JSONL record — skipping line (original preserved in .corrupt file)"
+            );
+            let corrupt_path = self.path.with_extension("jsonl.corrupt");
+            if let Ok(mut bad) = tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&corrupt_path)
+                .await
+            {
+                use tokio::io::AsyncWriteExt;
+                let _ = bad.write_all(format!("{line}\n").as_bytes()).await;
             }
         }
 
@@ -204,6 +288,7 @@ mod tests {
                 source: "test".to_string(),
                 confidence: 0.8,
                 valence: 0.0,
+                belief_kind: Default::default(),
                 created_at: Utc::now(),
                 provenance_hash: "test-hash".to_string(),
                 tags: vec!["tag1".to_string()],
