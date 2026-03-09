@@ -259,6 +259,18 @@ fn build_chat_lines(
                     Span::styled("  \u{1f4ad} ", prefix_style),
                     Span::styled(thought.to_string(), body_style),
                 ]));
+            } else if let Some(status) = msg.content.strip_prefix("[SubAgent]: ") {
+                // Sub-agent pipeline progress — rendered with 🤖 bot emoji.
+                let prefix_style = Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD);
+                let body_style = Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::ITALIC);
+                lines.push(Line::from(vec![
+                    Span::styled("  \u{1f916} ", prefix_style),
+                    Span::styled(status.to_string(), body_style),
+                ]));
             } else {
                 let sys_style = Style::default()
                     .fg(theme.muted)

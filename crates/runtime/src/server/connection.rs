@@ -198,6 +198,7 @@ pub(super) async fn handle_connection(
                         ThinkerEvent::ToolCallStart(info) => crate::BackendEvent::ToolCallStart(info),
                         ThinkerEvent::ToolCallEnd(result) => crate::BackendEvent::ToolCallEnd(result),
                         ThinkerEvent::AgentThought(thought) => crate::BackendEvent::AgentThought(thought),
+                        ThinkerEvent::SubAgentProgress(msg) => crate::BackendEvent::SubAgentProgress(msg),
                     };
                     let _ = event_tx_clone.send(backend_evt);
                 };

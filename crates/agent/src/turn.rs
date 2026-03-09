@@ -34,7 +34,7 @@ use aigent_llm::{ChatMessage, LlmRouter, Provider};
 use aigent_tools::ToolRegistry;
 use aigent_thinker::{EventSink, ToolLoopResult, ThinkerEvent, run_external_thinking_loop};
 
-use crate::subagents::SubagentManager;
+use crate::subagents::{SubagentManager, needs_specialists};
 
 /// All inputs required to execute a single agent turn.
 ///
@@ -89,10 +89,21 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
     //
     // The captain still runs the full external thinking loop afterwards —
     // sub-agents are read-only advisors, not decision makers.
-    if input.config.subagents.enabled && input.messages.len() >= 2 {
-        let user_message = input.messages.last()
-            .and_then(|m| m.content.as_deref())
-            .unwrap_or("");
+    //
+    // Pure social exchanges (greetings, acks, closings) skip the pipeline
+    // so that "Hello!" gets an instant captain response.  The router errs
+    // toward running specialists: false positives cost a few extra seconds;
+    // false negatives produce shallower answers on questions that deserved
+    // deeper analysis.
+    let subagent_user_msg = input.messages.last()
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("");
+
+    if input.config.subagents.enabled
+        && input.messages.len() >= 2
+        && needs_specialists(subagent_user_msg)
+    {
+        let user_message = subagent_user_msg;
         let system_text = input.messages.first()
             .and_then(|m| m.content.as_deref())
             .unwrap_or("");
@@ -111,12 +122,23 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
             input.config.subagents.openrouter_model.as_str()
         };
 
+        // Notify the TUI that specialists are being spawned.
+        if let Some(sink) = &input.event_sink {
+            sink(ThinkerEvent::SubAgentProgress(
+                "Spawning specialist agents (Researcher, Planner, Critic)\u{2026}".to_string(),
+            ));
+        }
+
         let subagent_start = std::time::Instant::now();
         let manager = SubagentManager::new(
             input.llm,
             &input.config.subagents,
             subagent_ollama,
             subagent_openrouter,
+            Arc::clone(&input.registry),
+            Arc::clone(&input.executor),
+            step_timeout,
+            tool_timeout,
         );
 
         let team_results = manager
@@ -126,6 +148,13 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
         let debate_block = SubagentManager::format_debate_block(&team_results);
 
         if !debate_block.is_empty() {
+            // Notify the TUI that specialists are ready.
+            if let Some(sink) = &input.event_sink {
+                sink(ThinkerEvent::SubAgentProgress(format!(
+                    "Specialists ready ({}/3 succeeded)",
+                    team_results.len()
+                )));
+            }
             // Insert just before the final user message so the captain
             // sees the debate as pre-turn context.
             let insert_pos = input.messages.len().saturating_sub(1);
@@ -142,6 +171,12 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
                 "subagents: debate block injected into captain context"
             );
         } else {
+            if let Some(sink) = &input.event_sink {
+                sink(ThinkerEvent::SubAgentProgress(
+                    "Specialists returned no usable analysis — proceeding without debate."
+                        .to_string(),
+                ));
+            }
             info!("subagents: all specialists failed or returned empty — proceeding without debate");
         }
     }

@@ -423,6 +423,17 @@ impl ToolRegistry {
         self.tools.write().unwrap().push(entry);
     }
 
+    /// Register a tool from a pre-existing `Arc` handle.
+    ///
+    /// Used when cloning a subset of an existing registry (e.g. the read-only
+    /// sub-registry for sub-agents) without re-boxing the tool.  The spec is
+    /// fetched via vtable dispatch once at registration time, same as
+    /// [`register_with_source`].
+    pub fn register_with_source_arc(&self, tool: Arc<dyn Tool>, source: ToolSource) {
+        let spec = tool.spec();
+        self.tools.write().unwrap().push(ToolEntry { spec, tool, source });
+    }
+
     /// Unregister all tools with the given name.
     ///
     /// Returns `true` if at least one tool was removed.

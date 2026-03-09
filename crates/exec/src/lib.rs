@@ -748,6 +748,26 @@ pub fn default_registry(
     registry
 }
 
+/// Build a registry containing only read-only tools from an existing registry.
+///
+/// Used by the sub-agent pipeline so specialists can call grounding tools
+/// (web search, file reads, datetime) but cannot write files, run shell
+/// commands, or mutate any state.
+///
+/// O(n) scan over the source registry — called once per turn when subagents
+/// are enabled, not in a hot path.
+pub fn read_only_registry(source: &aigent_tools::ToolRegistry) -> aigent_tools::ToolRegistry {
+    let ro = aigent_tools::ToolRegistry::default();
+    for info in source.list_tools() {
+        if info.spec.metadata.read_only {
+            if let Some((tool_arc, _)) = source.get_with_metadata(&info.spec.name) {
+                ro.register_with_source_arc(tool_arc, info.source);
+            }
+        }
+    }
+    ro
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

@@ -43,6 +43,10 @@ pub enum BackendEvent {
     /// these as dim grey "[Thinking]: …" lines so the user sees the model's
     /// chain-of-thought without filling the chat with long monologues.
     AgentThought(String),
+    /// Progress update from the parallel sub-agent pipeline (spawn / complete).
+    /// The TUI renders these as "🤖 …" chat bubbles distinct from the captain's
+    /// thought bubbles, so the user sees that specialists are working.
+    SubAgentProgress(String),
 
     // ── ReAct state machine events ─────────────────────────────────
     /// Emitted when the ReAct loop transitions to a new phase.
