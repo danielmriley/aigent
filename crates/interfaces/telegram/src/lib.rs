@@ -254,10 +254,11 @@ async fn handle_telegram_input(
                 // they normally arrive via the background broadcast channel.
                 debug!(len = content.len(), "telegram: unexpected proactive message on request stream");
             }
-            // ReAct / swarm events — not relevant for Telegram.
+            // ReAct / swarm / sub-agent events — not relevant for Telegram.
             BackendEvent::ReactPhaseChanged { .. }
             | BackendEvent::SubAgentSpawned { .. }
             | BackendEvent::SubAgentCompleted { .. }
+            | BackendEvent::SubAgentProgress(_)
             | BackendEvent::ConfigUpdated { .. }
             | BackendEvent::AgentThought(_) => {}
         }

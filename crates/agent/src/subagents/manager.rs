@@ -1,274 +1,251 @@
-//! Subagent manager — orchestrates parallel specialist LLM calls.
+//! Subagent manager — orchestrates parallel specialist thinking loops.
 //!
-//! Follows the same `tokio::join!` pattern used by the multi-agent sleep
-//! pipeline in `crates/agent/src/runtime/sleep.rs`.
+//! Each specialist runs a **bounded external thinking loop** (max 3 rounds by
+//! default) over a **read-only subset of the tool registry**.  This lets them
+//! ground their analysis in live data (current date, web search, file reads)
+//! before their `final_answer` is assembled into the captain's debate block.
+//!
+//! Safety guarantee: the read-only sub-registry is built from tools whose
+//! `metadata.read_only == true`, so specialists can never write files, run
+//! shell commands, or mutate any persistent state.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::timeout;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use aigent_config::SubagentsConfig;
-use aigent_llm::{LlmRouter, Provider};
+use aigent_exec::ToolExecutor;
+use aigent_llm::{ChatMessage, LlmRouter, Provider};
+use aigent_thinker::{build_external_thinking_block, run_external_thinking_loop};
+use aigent_tools::ToolRegistry;
 
-use super::prompts::{build_subagent_prompt, truncate_context};
-use super::types::{SubagentAnalysis, SubagentRole};
+use super::prompts::truncate_context;
+use super::types::SubagentRole;
 
-/// Maximum characters of the system prompt to include in each subagent's
-/// context.  Keeps parallel calls fast on smaller context windows.
+/// Maximum characters of the captain's system prompt to snapshot into each
+/// specialist's context.  Keeps parallel calls fast on smaller context windows.
 const SUBAGENT_CONTEXT_LIMIT: usize = 4_000;
 
-/// Maximum output tokens per subagent call.  Keeps responses short (bullet
-/// lists, not essays) and reduces Ollama queue time when requests serialise.
-const SUBAGENT_MAX_TOKENS: u32 = 300;
-
-/// Orchestrates parallel subagent specialist calls and collects their
-/// structured analyses.
+/// Orchestrates parallel specialist thinking loops and collects their
+/// free-form analysis texts.
 pub struct SubagentManager<'a> {
     llm: &'a LlmRouter,
     config: &'a SubagentsConfig,
     ollama_model: &'a str,
     openrouter_model: &'a str,
+    /// Full daemon tool registry — will be filtered to read-only subset.
+    registry: Arc<ToolRegistry>,
+    /// Shared executor (applies `ExecutionPolicy` before every tool call).
+    executor: Arc<ToolExecutor>,
+    /// Per-LLM-call timeout (mirrors captain's `step_timeout`).
+    step_timeout: Duration,
+    /// Per-tool-call timeout (mirrors captain's `tool_timeout`).
+    tool_timeout: Duration,
 }
 
 impl<'a> SubagentManager<'a> {
+    #[allow(clippy::too_many_arguments)] // all args are logically distinct; grouping would add noise
     pub fn new(
         llm: &'a LlmRouter,
         config: &'a SubagentsConfig,
         ollama_model: &'a str,
         openrouter_model: &'a str,
+        registry: Arc<ToolRegistry>,
+        executor: Arc<ToolExecutor>,
+        step_timeout: Duration,
+        tool_timeout: Duration,
     ) -> Self {
         Self {
             llm,
             config,
             ollama_model,
             openrouter_model,
+            registry,
+            executor,
+            step_timeout,
+            tool_timeout,
         }
     }
 
-    /// Run all specialist subagents in parallel and return their analyses.
+    /// Run all three specialist thinking loops in parallel and return their
+    /// `final_answer` texts.
     ///
-    /// The `system_prompt` is the already-built Captain system prompt
-    /// (memory context, identity, etc.) — subagents receive a truncated
-    /// snapshot of it as read-only context.
+    /// The `system_prompt` is the already-built captain system prompt
+    /// (memory context, identity, etc.).  Specialists receive a truncated
+    /// snapshot of it as read-only context alongside a read-only tool subset.
     pub async fn run_parallel_team(
         &self,
         primary: Provider,
         user_message: &str,
         system_prompt: &str,
-    ) -> Vec<(SubagentRole, SubagentAnalysis)> {
-        let context = truncate_context(system_prompt, SUBAGENT_CONTEXT_LIMIT);
+    ) -> Vec<(SubagentRole, String)> {
+        // Build a read-only sub-registry once and share it across all three
+        // specialists via Arc — no clones of the underlying tool state.
+        let ro_registry = Arc::new(aigent_exec::read_only_registry(&self.registry));
+        let tool_specs = ro_registry.list_specs();
 
-        let researcher_prompt = build_subagent_prompt(
+        let researcher_sys = self.build_specialist_system_prompt(
             SubagentRole::Researcher,
-            &self.config.researcher_prompt,
-            user_message,
-            &context,
+            system_prompt,
+            &tool_specs,
         );
-        let planner_prompt = build_subagent_prompt(
+        let planner_sys = self.build_specialist_system_prompt(
             SubagentRole::Planner,
-            &self.config.planner_prompt,
-            user_message,
-            &context,
+            system_prompt,
+            &tool_specs,
         );
-        let critic_prompt = build_subagent_prompt(
+        let critic_sys = self.build_specialist_system_prompt(
             SubagentRole::Critic,
-            &self.config.critic_prompt,
-            user_message,
-            &context,
+            system_prompt,
+            &tool_specs,
         );
 
-        info!("subagents: launching 3 specialists in parallel");
+        let max_rounds = if self.config.max_rounds == 0 {
+            3
+        } else {
+            self.config.max_rounds
+        };
 
-        let (researcher_reply, planner_reply, critic_reply) = tokio::join!(
-            self.subagent_llm_call(primary, &researcher_prompt, "Researcher"),
-            self.subagent_llm_call(primary, &planner_prompt, "Planner"),
-            self.subagent_llm_call(primary, &critic_prompt, "Critic"),
+        info!("subagents: launching 3 specialist thinking loops in parallel");
+
+        let (researcher_result, planner_result, critic_result) = tokio::join!(
+            self.run_specialist_loop(primary, researcher_sys, user_message, &ro_registry, "Researcher", max_rounds),
+            self.run_specialist_loop(primary, planner_sys,   user_message, &ro_registry, "Planner",    max_rounds),
+            self.run_specialist_loop(primary, critic_sys,    user_message, &ro_registry, "Critic",     max_rounds),
         );
 
         let mut results = Vec::with_capacity(3);
-
-        if let Some(reply) = researcher_reply {
-            debug!(len = reply.len(), "subagents: Researcher reply received");
-            results.push((SubagentRole::Researcher, parse_analysis("Researcher", &reply)));
+        if let Some(text) = researcher_result {
+            results.push((SubagentRole::Researcher, text));
         }
-        if let Some(reply) = planner_reply {
-            debug!(len = reply.len(), "subagents: Planner reply received");
-            results.push((SubagentRole::Planner, parse_analysis("Planner", &reply)));
+        if let Some(text) = planner_result {
+            results.push((SubagentRole::Planner, text));
         }
-        if let Some(reply) = critic_reply {
-            debug!(len = reply.len(), "subagents: Critic reply received");
-            results.push((SubagentRole::Critic, parse_analysis("Critic", &reply)));
+        if let Some(text) = critic_result {
+            results.push((SubagentRole::Critic, text));
         }
 
-        info!(
-            succeeded = results.len(),
-            "subagents: parallel team complete"
-        );
+        info!(succeeded = results.len(), "subagents: parallel team complete");
         results
     }
 
-    /// Format the team's analyses into a context block that the Captain
-    /// can consume as part of its message history.
-    pub fn format_debate_block(results: &[(SubagentRole, SubagentAnalysis)]) -> String {
+    /// Format the team's free-form analyses into the `<subagent_debate>` block
+    /// that the captain consumes as pre-turn context.
+    pub fn format_debate_block(results: &[(SubagentRole, String)]) -> String {
         if results.is_empty() {
             return String::new();
         }
-
         let mut block = String::from("<subagent_debate>\n");
-
         for (role, analysis) in results {
-            block.push_str(&format!("=== {} ===\n", role.label()));
-
-            if !analysis.key_facts.is_empty() {
-                block.push_str("KEY FACTS:\n");
-                for fact in &analysis.key_facts {
-                    block.push_str(&format!("- {fact}\n"));
-                }
-            }
-            if !analysis.proposed_actions.is_empty() {
-                block.push_str("PROPOSED ACTIONS:\n");
-                for action in &analysis.proposed_actions {
-                    block.push_str(&format!("- {action}\n"));
-                }
-            }
-            if !analysis.potential_pitfalls.is_empty() {
-                block.push_str("POTENTIAL PITFALLS:\n");
-                for pitfall in &analysis.potential_pitfalls {
-                    block.push_str(&format!("- {pitfall}\n"));
-                }
-            }
-            block.push('\n');
+            block.push_str(&format!("=== {} ===\n{}\n\n", role.label(), analysis.trim()));
         }
-
         block.push_str("</subagent_debate>");
+        debug!(content = %block, "subagents: debate block sent to captain");
         block
     }
 
-    /// Per-subagent timeout — 90 seconds should be generous for a small
-    /// local model.  If Ollama serialises the requests (NUM_PARALLEL=1),
-    /// the third call may hit the timeout; that's fine — the team degrades
-    /// gracefully with fewer results.
+    /// Per-specialist outer timeout — 90 seconds covers multiple inner rounds
+    /// on a small local model.  The team degrades gracefully if one specialist
+    /// times out (same pattern as the multi-agent sleep pipeline).
     const CALL_TIMEOUT: Duration = Duration::from_secs(90);
 
-    /// Single subagent LLM call with logging and timeout.  Returns `None`
-    /// on failure so the team degrades gracefully (same pattern as
-    /// `sleep_llm_call`).
-    async fn subagent_llm_call(
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    /// Build the system prompt for a single specialist.
+    ///
+    /// Includes: role directive, truncated captain context snapshot, and the
+    /// external-thinking JSON format block so the specialist can make tool
+    /// calls and produce a `final_answer`.
+    fn build_specialist_system_prompt(
+        &self,
+        role: SubagentRole,
+        captain_system: &str,
+        tool_specs: &[aigent_tools::ToolSpec],
+    ) -> String {
+        let context = truncate_context(captain_system, SUBAGENT_CONTEXT_LIMIT);
+        let ext_think_block = build_external_thinking_block(tool_specs);
+        let role_directive = match role {
+            SubagentRole::Researcher => &self.config.researcher_prompt,
+            SubagentRole::Planner => &self.config.planner_prompt,
+            SubagentRole::Critic => &self.config.critic_prompt,
+        };
+        format!(
+            "=== {role} SPECIALIST ===\n\
+{role_directive}\n\n\
+You have access to tools. Use them to ground your analysis in real data before \
+producing your final_answer. Your final_answer will be shown to the captain agent \
+as expert pre-turn research — be concise and factual.\n\n\
+CAPTAIN CONTEXT (truncated):\n{context}\n\n\
+{ext_think_block}"
+        )
+    }
+
+    /// Run one specialist's bounded thinking loop.
+    ///
+    /// Returns the `final_answer` content, or `None` on LLM failure / timeout.
+    /// `tool_executions` are silently dropped — sub-agents have no side effects.
+    async fn run_specialist_loop(
         &self,
         primary: Provider,
-        prompt: &str,
+        system_prompt: String,
+        user_message: &str,
+        ro_registry: &Arc<ToolRegistry>,
         role_label: &str,
+        max_rounds: usize,
     ) -> Option<String> {
-        let fut = self.llm.chat_with_fallback_limited(
+        let mut messages = vec![
+            ChatMessage::system(system_prompt),
+            ChatMessage::user(user_message.to_string()),
+        ];
+
+        // Drain channel: sub-agents stream to nowhere — we only want final_answer.
+        let (drain_tx, mut drain_rx) = mpsc::channel::<String>(64);
+        tokio::spawn(async move {
+            while drain_rx.recv().await.is_some() {}
+        });
+
+        let fut = run_external_thinking_loop(
+            self.llm,
             primary,
             self.ollama_model,
             self.openrouter_model,
-            prompt,
-            SUBAGENT_MAX_TOKENS,
+            &mut messages,
+            ro_registry,
+            &self.executor,
+            drain_tx,
+            None, // no event_sink — sub-agents are silent to the TUI
+            self.step_timeout,
+            self.tool_timeout,
+            max_rounds,
         );
 
-        match timeout(Self::CALL_TIMEOUT, fut).await {
-            Ok(Ok((_provider, reply))) => {
-                info!(
+        match tokio::time::timeout(Self::CALL_TIMEOUT, fut).await {
+            Ok(Ok(result)) => {
+                let content = result.content.trim().to_string();
+                debug!(
                     role = role_label,
-                    reply_len = reply.len(),
-                    "subagent: specialist reply received"
+                    len = content.len(),
+                    "subagent: thinking loop complete"
                 );
-                Some(reply)
+                debug!(role = role_label, content = %content, "subagent: final answer");
+                if content.is_empty() {
+                    None
+                } else {
+                    Some(content)
+                }
             }
             Ok(Err(err)) => {
-                warn!(?err, role = role_label, "subagent: LLM call failed");
+                warn!(?err, role = role_label, "subagent: thinking loop failed");
                 None
             }
-            Err(_elapsed) => {
-                warn!(
-                    role = role_label,
-                    timeout_secs = Self::CALL_TIMEOUT.as_secs(),
-                    "subagent: LLM call timed out"
-                );
+            Err(_) => {
+                warn!(role = role_label, "subagent: thinking loop timed out");
                 None
             }
         }
     }
-}
-
-/// Parse a subagent's raw text reply into a [`SubagentAnalysis`].
-///
-/// Looks for `KEY_FACTS:`, `PROPOSED_ACTIONS:`, and `POTENTIAL_PITFALLS:`
-/// section headers, collecting bullet lines (`- ...`) under each.
-/// Unrecognised lines are silently ignored — this mirrors the best-effort
-/// parsing approach used by `parse_agentic_insights` in the sleep pipeline.
-fn parse_analysis(role: &str, raw: &str) -> SubagentAnalysis {
-    let mut analysis = SubagentAnalysis {
-        role: role.to_string(),
-        ..Default::default()
-    };
-
-    #[derive(PartialEq)]
-    enum Section {
-        None,
-        KeyFacts,
-        ProposedActions,
-        PotentialPitfalls,
-    }
-
-    let mut current = Section::None;
-
-    for line in raw.lines() {
-        let trimmed = line.trim();
-
-        if matches_header(trimmed, "KEY_FACTS") || matches_header(trimmed, "KEY FACTS") {
-            current = Section::KeyFacts;
-            continue;
-        }
-        if matches_header(trimmed, "PROPOSED_ACTIONS") || matches_header(trimmed, "PROPOSED ACTIONS") {
-            current = Section::ProposedActions;
-            continue;
-        }
-        if matches_header(trimmed, "POTENTIAL_PITFALLS") || matches_header(trimmed, "POTENTIAL PITFALLS") {
-            current = Section::PotentialPitfalls;
-            continue;
-        }
-
-        // Collect bullet items under the current section.
-        if let Some(item) = trimmed.strip_prefix("- ") {
-            let item = item.trim();
-            if item.is_empty() || item.eq_ignore_ascii_case("NONE") {
-                continue;
-            }
-            match current {
-                Section::KeyFacts => analysis.key_facts.push(item.to_string()),
-                Section::ProposedActions => analysis.proposed_actions.push(item.to_string()),
-                Section::PotentialPitfalls => analysis.potential_pitfalls.push(item.to_string()),
-                Section::None => {}
-            }
-        }
-    }
-
-    debug!(
-        role,
-        facts = analysis.key_facts.len(),
-        actions = analysis.proposed_actions.len(),
-        pitfalls = analysis.potential_pitfalls.len(),
-        "subagent: parsed analysis"
-    );
-    analysis
-}
-
-/// Check if `line` is a section header for `header` (e.g. "KEY_FACTS").
-///
-/// Accepts any of these forms (case-insensitive; `_` and ` ` are equivalent):
-/// - `KEY_FACTS`, `KEY FACTS`, `Key Facts`, `## Key Facts`, `**KEY_FACTS:**`
-fn matches_header(line: &str, header: &str) -> bool {
-    // Strip common markdown decorations then normalise: uppercase + underscores→spaces.
-    let stripped = line.trim_start_matches('*').trim_start_matches('#').trim();
-    let norm = |s: &str| s.replace('_', " ").to_ascii_uppercase();
-    let s = norm(stripped);
-    let h = norm(header);
-    s == h
-        || s.starts_with(&format!("{h}:"))
-        || s.starts_with(&format!("{h} :"))
 }
 
 #[cfg(test)]
@@ -276,80 +253,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_well_formed_analysis() {
-        let raw = "\
-KEY_FACTS:
-- The user wants to refactor the config module
-- There are 14 config structs currently
-
-PROPOSED_ACTIONS:
-- Split config into sub-modules by domain
-- Add validation on load
-
-POTENTIAL_PITFALLS:
-- Breaking existing TOML files
-- Migration complexity
-";
-        let analysis = parse_analysis("Researcher", raw);
-        assert_eq!(analysis.key_facts.len(), 2);
-        assert_eq!(analysis.proposed_actions.len(), 2);
-        assert_eq!(analysis.potential_pitfalls.len(), 2);
-        assert_eq!(analysis.role, "Researcher");
+    fn format_debate_block_empty_returns_empty() {
+        assert_eq!(SubagentManager::format_debate_block(&[]), "");
     }
 
     #[test]
-    fn parse_with_none_items() {
-        let raw = "\
-KEY_FACTS:
-- NONE
-
-PROPOSED_ACTIONS:
-- Write tests first
-
-POTENTIAL_PITFALLS:
-- NONE
-";
-        let analysis = parse_analysis("Critic", raw);
-        assert_eq!(analysis.key_facts.len(), 0);
-        assert_eq!(analysis.proposed_actions.len(), 1);
-        assert_eq!(analysis.potential_pitfalls.len(), 0);
-    }
-
-    #[test]
-    fn parse_empty_input() {
-        let analysis = parse_analysis("Planner", "");
-        assert!(analysis.key_facts.is_empty());
-        assert!(analysis.proposed_actions.is_empty());
-        assert!(analysis.potential_pitfalls.is_empty());
-    }
-
-    #[test]
-    fn format_debate_block_round_trip() {
+    fn format_debate_block_contains_role_and_content() {
         let results = vec![
-            (
-                SubagentRole::Researcher,
-                SubagentAnalysis {
-                    role: "Researcher".to_string(),
-                    key_facts: vec!["fact1".to_string()],
-                    proposed_actions: vec![],
-                    potential_pitfalls: vec![],
-                },
-            ),
-            (
-                SubagentRole::Critic,
-                SubagentAnalysis {
-                    role: "Critic".to_string(),
-                    key_facts: vec![],
-                    proposed_actions: vec![],
-                    potential_pitfalls: vec!["risk1".to_string()],
-                },
-            ),
+            (SubagentRole::Researcher, "Today is 2026-03-08.".to_string()),
+            (SubagentRole::Critic, "No pitfalls identified.".to_string()),
         ];
         let block = SubagentManager::format_debate_block(&results);
         assert!(block.contains("<subagent_debate>"));
         assert!(block.contains("</subagent_debate>"));
         assert!(block.contains("=== Researcher ==="));
-        assert!(block.contains("fact1"));
-        assert!(block.contains("risk1"));
+        assert!(block.contains("Today is 2026-03-08."));
+        assert!(block.contains("=== Critic ==="));
+        assert!(block.contains("No pitfalls identified."));
     }
 }

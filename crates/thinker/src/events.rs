@@ -33,4 +33,8 @@ pub enum ThinkerEvent {
     /// Emitted by the external thinking loop so the UI can display
     /// a "💭 thinking…" line without exposing raw JSON.
     AgentThought(String),
+    /// Progress update from the parallel sub-agent pipeline.
+    /// Emitted before specialists are spawned and after they finish.
+    /// The TUI renders these as "🤖 …" chat bubbles.
+    SubAgentProgress(String),
 }

@@ -724,7 +724,16 @@ impl App {
                     content: format!("[Thinking]: {thought}"),
                     rendered_md: None,
                 });
-                self.state.status = "thinking…".to_string();
+                self.state.status = "thinking\u{2026}".to_string();
+                self.chat.auto_follow = true;
+            }
+            BackendEvent::SubAgentProgress(msg) => {
+                self.state.messages.push(Message {
+                    role: "system".to_string(),
+                    content: format!("[SubAgent]: {msg}"),
+                    rendered_md: None,
+                });
+                self.state.status = format!("\u{1f916} {msg}");
                 self.chat.auto_follow = true;
             }
             BackendEvent::ConfigUpdated { model, provider } => {

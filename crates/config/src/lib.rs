@@ -620,6 +620,17 @@ pub struct SubagentsConfig {
     pub planner_prompt: String,
     /// Critic role system prompt.
     pub critic_prompt: String,
+
+    /// Maximum tool-call rounds each specialist may take in its thinking loop.
+    ///
+    /// Keep this low (2–3) — specialists are pre-turn advisors, not full agents.
+    /// 0 means "use default (3)".
+    #[serde(default = "default_subagent_max_rounds")]
+    pub max_rounds: usize,
+}
+
+fn default_subagent_max_rounds() -> usize {
+    3
 }
 
 impl Default for SubagentsConfig {
@@ -631,6 +642,7 @@ impl Default for SubagentsConfig {
             researcher_prompt: "You are a meticulous researcher. Examine the conversation history and memory context deeply. Identify key facts, missing information, and relevant background knowledge that could help answer the user's request. Output your findings as structured analysis.".to_string(),
             planner_prompt: "You are a strategic planner. Given the conversation and context, devise a clear step-by-step plan for how to best respond to or accomplish the user's request. Consider which tools might be needed and in what order. Output your plan as structured analysis.".to_string(),
             critic_prompt: "You are a rigorous critic. Examine the conversation for potential pitfalls: hallucination risks, incorrect assumptions, edge cases, security concerns, and logical gaps. Challenge the obvious approach. Output your critique as structured analysis.".to_string(),
+            max_rounds: default_subagent_max_rounds(),
         }
     }
 }

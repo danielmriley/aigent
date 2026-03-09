@@ -29,15 +29,3 @@ impl fmt::Display for SubagentRole {
         f.write_str(self.label())
     }
 }
-
-/// Structured analysis returned by a single subagent.
-///
-/// The subagent is instructed to output these fields in a parseable format.
-/// Parsing is best-effort: missing sections default to empty vecs.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SubagentAnalysis {
-    pub role: String,
-    pub key_facts: Vec<String>,
-    pub proposed_actions: Vec<String>,
-    pub potential_pitfalls: Vec<String>,
-}
