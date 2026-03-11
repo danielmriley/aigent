@@ -88,14 +88,16 @@ impl AgentRuntime {
         }
     }
 
-    /// Call the LLM with logging. Returns `None` on failure so callers can
-    /// degrade gracefully to a single-agent fallback.
+    /// Call the LLM with logging and per-call timing.
+    /// Returns `None` on failure so callers can degrade gracefully to a
+    /// single-agent fallback.
     async fn sleep_llm_call(
         &self,
         primary: Provider,
         prompt: &str,
         role_label: &str,
     ) -> Option<String> {
+        let t0 = std::time::Instant::now();
         match self
             .llm
             .chat_with_fallback(
@@ -110,12 +112,18 @@ impl AgentRuntime {
                 info!(
                     role = role_label,
                     reply_len = reply.len(),
+                    elapsed_secs = t0.elapsed().as_secs(),
                     "multi-agent sleep: specialist reply received"
                 );
                 Some(reply)
             }
             Err(err) => {
-                warn!(?err, role = role_label, "multi-agent sleep: LLM call failed");
+                warn!(
+                    ?err,
+                    role = role_label,
+                    elapsed_secs = t0.elapsed().as_secs(),
+                    "multi-agent sleep: LLM call failed"
+                );
                 None
             }
         }
@@ -168,8 +176,10 @@ impl AgentRuntime {
 
         let mut all_batch_insights = Vec::new();
         let mut any_batch_succeeded = false;
+        let pipeline_start = std::time::Instant::now();
 
         for (batch_idx, batch) in batches.iter().enumerate() {
+            let batch_start = std::time::Instant::now();
             info!(
                 batch = batch_idx + 1,
                 total = batches.len(),
@@ -201,12 +211,18 @@ impl AgentRuntime {
                 specialist_prompt(SpecialistRole::Identity, batch, &identity_snap, bot_name, user_name);
 
             // Run all 5 specialists in parallel.
+            let specialists_start = std::time::Instant::now();
             let (arch_reply, psych_reply, strat_reply, critic_reply, identity_reply) = tokio::join!(
                 self.sleep_llm_call(primary, &arch_prompt, "Archivist"),
                 self.sleep_llm_call(primary, &psych_prompt, "Psychologist"),
                 self.sleep_llm_call(primary, &strat_prompt, "Strategist"),
                 self.sleep_llm_call(primary, &critic_prompt, "Critic"),
                 self.sleep_llm_call(primary, &identity_prompt, "Identity"),
+            );
+            info!(
+                batch = batch_idx + 1,
+                specialists_elapsed_secs = specialists_start.elapsed().as_secs(),
+                "multi-agent sleep: parallel specialists phase complete"
             );
 
             // Collect available replies — degrade gracefully to a partial team
@@ -328,6 +344,7 @@ impl AgentRuntime {
                         batch = batch_idx + 1,
                         learned = insights.learned_about_user.len(),
                         follow_ups = insights.follow_ups.len(),
+                        batch_elapsed_secs = batch_start.elapsed().as_secs(),
                         "multi-agent sleep: batch synthesis complete"
                     );
                     all_batch_insights.push(insights);
@@ -336,6 +353,7 @@ impl AgentRuntime {
                 None => {
                     warn!(
                         batch = batch_idx + 1,
+                        batch_elapsed_secs = batch_start.elapsed().as_secs(),
                         "multi-agent sleep: synthesis call failed — merging available specialist insights directly"
                     );
                     // Merge whatever specialist insights we have as a degraded fallback.
@@ -358,7 +376,8 @@ impl AgentRuntime {
             follow_ups = final_insights.follow_ups.len(),
             reflections = final_insights.reflective_thoughts.len(),
             profile_updates = final_insights.user_profile_updates.len(),
-            "multi-agent sleep: insights generated — ready to apply"
+            pipeline_elapsed_secs = pipeline_start.elapsed().as_secs(),
+            "multi-agent sleep: all batches complete — insights ready to apply"
         );
         let _ = progress.send(format!(
             "Insights generated — {} learned, {} reflections — ready to apply.",

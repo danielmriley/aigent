@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use chrono::Local;
 
 use aigent_config::AppConfig;
-use aigent_memory::{MemoryManager, MemoryTier};
+use aigent_memory::{BeliefNode, MemoryManager, MemoryTier};
 use aigent_memory::event_log::MemoryEventLog;
 
 use crate::CliMemoryLayer;
@@ -352,6 +352,82 @@ pub(crate) fn memory_layer_label(layer: CliMemoryLayer) -> &'static str {
         CliMemoryLayer::Semantic => "semantic",
         CliMemoryLayer::Procedural => "procedural",
         CliMemoryLayer::Core => "core",
+    }
+}
+
+pub(crate) fn run_memory_beliefs(
+    memory: &MemoryManager,
+    kind: Option<String>,
+    tier: Option<String>,
+    max_conf: Option<f32>,
+    limit: usize,
+) {
+    let mut nodes: Vec<BeliefNode> = memory.active_beliefs_with_edges();
+
+    // Apply filters.
+    if let Some(ref k) = kind {
+        let k_lower = k.to_lowercase();
+        nodes.retain(|n| format!("{:?}", n.belief_kind).to_lowercase().contains(&k_lower));
+    }
+    if let Some(ref t) = tier {
+        let t_lower = t.to_lowercase();
+        nodes.retain(|n| format!("{:?}", n.tier).to_lowercase().contains(&t_lower));
+    }
+    if let Some(max) = max_conf {
+        nodes.retain(|n| n.current_confidence <= max);
+    }
+
+    // Sort: ascending confidence (struggling beliefs first), then by total edge
+    // count descending (well-connected beliefs surface above isolated ones at
+    // the same confidence level).
+    nodes.sort_by(|a, b| {
+        a.current_confidence
+            .partial_cmp(&b.current_confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ea = a.forward_edges + a.reverse_edges;
+                let eb = b.forward_edges + b.reverse_edges;
+                eb.cmp(&ea)
+            })
+    });
+
+    nodes.truncate(limit);
+
+    let count = nodes.len();
+    println!("Active Beliefs (Showing {count})");
+    println!("{}", "-".repeat(93));
+    println!(
+        "{:<12} {:<12} {:<6}  {:<8}  {:<7}  [Content]",
+        "[Tier]", "[Kind]", "[Conf]", "(Δ)", "[Edges]"
+    );
+
+    for node in &nodes {
+        let delta = node.current_confidence - node.initial_confidence;
+        let delta_str = if delta >= 0.0 {
+            format!("+{:.2}", delta)
+        } else {
+            format!("{:.2}", delta)
+        };
+        // Truncate long content for terminal readability.
+        let content_preview = if node.content.len() > 60 {
+            format!("{}…", &node.content[..59])
+        } else {
+            node.content.clone()
+        };
+        println!(
+            "{:<12} {:<12} {:<6.2}  {:<8}  F:{:<2} R:{:<2}  {}",
+            format!("{:?}", node.tier),
+            format!("{:?}", node.belief_kind),
+            node.current_confidence,
+            format!("({delta_str})"),
+            node.forward_edges,
+            node.reverse_edges,
+            content_preview,
+        );
+    }
+
+    if count == 0 {
+        println!("(no beliefs match the current filters)");
     }
 }
 

@@ -12,13 +12,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Local;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use aigent_config::SubagentsConfig;
 use aigent_exec::ToolExecutor;
 use aigent_llm::{ChatMessage, LlmRouter, Provider};
-use aigent_thinker::{build_external_thinking_block, run_external_thinking_loop};
+use aigent_thinker::{build_external_thinking_block, run_external_thinking_loop, TurnChunk};
 use aigent_tools::ToolRegistry;
 
 use super::prompts::truncate_context;
@@ -155,15 +156,25 @@ impl<'a> SubagentManager<'a> {
 
     /// Build the system prompt for a single specialist.
     ///
-    /// Includes: role directive, truncated captain context snapshot, and the
-    /// external-thinking JSON format block so the specialist can make tool
-    /// calls and produce a `final_answer`.
+    /// Includes: live datetime (injected first, always visible regardless of
+    /// context truncation), role directive, truncated captain context snapshot,
+    /// and the external-thinking JSON format block so the specialist can make
+    /// tool calls and produce a `final_answer`.
     fn build_specialist_system_prompt(
         &self,
         role: SubagentRole,
         captain_system: &str,
         tool_specs: &[aigent_tools::ToolSpec],
     ) -> String {
+        // Inject the real wall-clock datetime here unconditionally so every
+        // specialist always has correct temporal grounding — independent of
+        // how much of the captain context survives truncation.  Without this,
+        // CURRENT_DATETIME is buried late in the captain prompt and gets
+        // cut off by SUBAGENT_CONTEXT_LIMIT, causing the specialist to fall
+        // back on its training-cutoff date.
+        let current_datetime = Local::now()
+            .format("%Y-%m-%d %H:%M %Z")
+            .to_string();
         let context = truncate_context(captain_system, SUBAGENT_CONTEXT_LIMIT);
         let ext_think_block = build_external_thinking_block(tool_specs);
         let role_directive = match role {
@@ -172,7 +183,10 @@ impl<'a> SubagentManager<'a> {
             SubagentRole::Critic => &self.config.critic_prompt,
         };
         format!(
-            "=== {role} SPECIALIST ===\n\
+            "CURRENT DATETIME: {current_datetime}\n\
+For ANY question about \"today\", \"current date/time\", or recency — use the \
+CURRENT DATETIME above. NEVER use your training cutoff date.\n\n\
+=== {role} SPECIALIST ===\n\
 {role_directive}\n\n\
 You have access to tools. Use them to ground your analysis in real data before \
 producing your final_answer. Your final_answer will be shown to the captain agent \
@@ -201,7 +215,7 @@ CAPTAIN CONTEXT (truncated):\n{context}\n\n\
         ];
 
         // Drain channel: sub-agents stream to nowhere — we only want final_answer.
-        let (drain_tx, mut drain_rx) = mpsc::channel::<String>(64);
+        let (drain_tx, mut drain_rx) = mpsc::channel::<TurnChunk>(64);
         tokio::spawn(async move {
             while drain_rx.recv().await.is_some() {}
         });

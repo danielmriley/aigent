@@ -21,7 +21,7 @@ pub use index::{
     ConfidenceCheckpoint, IndexCacheStats, IndexedEntry, MemoryIndex, NodeRegistryEntry,
     NodeState,
 };
-pub use manager::{ConsolidationFn, EmbedFn, MemoryManager, MemoryStats};
+pub use manager::{ConsolidationFn, EmbedFn, MemoryManager, MemoryStats, BeliefNode};
 pub use multi_sleep::{SpecialistRole, batch_memories, merge_insights};
 pub use schema::{
     BeliefConsolidatedEvent, BeliefKind, BeliefRelationshipEvent, ConfidenceReason,

@@ -193,20 +193,37 @@ fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
         .unwrap_or("")
         .to_string();
 
+    // ── Provider / infrastructure errors ─────────────────────────────────
+    // Ollama (and some OpenRouter proxies) return {"error":"..."} when the
+    // model cannot run at all (e.g. insufficient memory, model not found).
+    // These are not JSON-formatting mistakes — retrying with a correction
+    // prompt will never help.  Surface them with a recognisable prefix so
+    // the ext_loop can bail immediately instead of burning retries.
+    if let Some(err_val) = obj.get("error") {
+        if let Some(msg) = err_val.as_str() {
+            return Err(format!("provider_error: {msg}"));
+        }
+    }
+
     // ── Canonical "type" field present ────────────────────────────────────
     match step_type {
         "final_answer" => {
-            // Models commonly use 'content', 'response', or 'answer' instead of
-            // 'final_answer' as the value key (e.g. qwen3.5:4b uses 'content'
-            // after tool calls and 'answer' after web searches).
-            let answer = obj
+            // Models use various key names; some (Researcher) return a rich
+            // JSON object under "data", others use "message" (Critic).
+            // If the value is not a plain string, serialise it back to JSON
+            // so the captain sees the full payload rather than an empty answer.
+            let answer_val = obj
                 .get("final_answer")
                 .or_else(|| obj.get("content"))
                 .or_else(|| obj.get("answer"))
                 .or_else(|| obj.get("response"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+                .or_else(|| obj.get("data"))
+                .or_else(|| obj.get("message"));
+            let answer = match answer_val {
+                Some(v) if v.is_string() => v.as_str().unwrap_or("").to_string(),
+                Some(v) => v.to_string(), // object/array — re-serialise as JSON
+                None => String::new(),
+            };
             return Ok(AgentStep::FinalAnswer { thought, answer });
         }
         "tool_call" => {
@@ -318,6 +335,19 @@ fn parse_agent_step(raw: &str) -> Result<AgentStep, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_error_surfaces_as_distinct_error() {
+        let mut buf = JsonStreamBuffer::new();
+        buf.feed(r#"{"error":"model requires more system memory (3.8 GiB) than is available (3.4 GiB)"}"#);
+        let result = buf.take_parsed().expect("should have a result");
+        let err = result.expect_err("provider error should be Err");
+        assert!(
+            err.starts_with("provider_error:"),
+            "expected 'provider_error:' prefix, got: {err}"
+        );
+        assert!(err.contains("3.8 GiB"), "error message should be preserved: {err}");
+    }
 
     #[test]
     fn final_answer_single_chunk() {

@@ -90,6 +90,12 @@ pub struct LlmConfig {
     /// Base URL for the Ollama API.  Overridden at runtime by the
     /// `OLLAMA_BASE_URL` environment variable when set.
     pub ollama_base_url: String,
+    /// How many concurrent inference slots Ollama has available.
+    /// Set this to match `OLLAMA_NUM_PARALLEL` in your Ollama service
+    /// configuration.  When `None`, the daemon falls back to reading the
+    /// `OLLAMA_NUM_PARALLEL` environment variable from its own process.
+    /// Sub-agent parallel execution requires ≥ 3 (recommend 4–5).
+    pub ollama_num_parallel: Option<u32>,
 }
 
 impl Default for LlmConfig {
@@ -100,6 +106,7 @@ impl Default for LlmConfig {
             openrouter_model: "openai/gpt-4o-mini".to_string(),
             ollama_local_first: true,
             ollama_base_url: "http://localhost:11434".to_string(),
+            ollama_num_parallel: None,
         }
     }
 }
@@ -747,6 +754,11 @@ pub struct MemorySleepConfig {
     /// transition to `NodeState::Archived`.  `0` disables archival.
     /// Default: 30.
     pub archival_age_days: u32,
+    /// Hard timeout in minutes for the nightly multi-agent LLM consolidation
+    /// pipeline.  With 5 specialists × N batches + synthesis, a full cycle on
+    /// local Ollama hardware typically takes 25–45 minutes.  Set to 0 to
+    /// disable the cap entirely (not recommended).  Default: 60.
+    pub multi_agent_timeout_mins: u64,
 }
 
 impl Default for MemorySleepConfig {
@@ -758,6 +770,7 @@ impl Default for MemorySleepConfig {
             nightly_window_end: "06:00".to_string(),
             capacity_limit: 2000,
             archival_age_days: 30,
+            multi_agent_timeout_mins: 60,
         }
     }
 }

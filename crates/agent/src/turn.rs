@@ -32,7 +32,7 @@ use aigent_config::AppConfig;
 use aigent_exec::ToolExecutor;
 use aigent_llm::{ChatMessage, LlmRouter, Provider};
 use aigent_tools::ToolRegistry;
-use aigent_thinker::{EventSink, ToolLoopResult, ThinkerEvent, run_external_thinking_loop};
+use aigent_thinker::{EventSink, ToolLoopResult, ThinkerEvent, TurnChunk, run_external_thinking_loop};
 
 use crate::subagents::{SubagentManager, needs_specialists};
 
@@ -57,12 +57,17 @@ pub struct AgentTurnInput<'a> {
     pub registry: Arc<ToolRegistry>,
     /// Tool executor shared with the daemon.
     pub executor: Arc<ToolExecutor>,
-    /// Channel that receives streaming text tokens.
+    /// Channel that receives streaming chunks from the thinking loop.
+    ///
+    /// Carries [`TurnChunk::Token`] (clean response text) and
+    /// [`TurnChunk::Thought`] (chain-of-thought, surfaced as `AgentThought`).
+    /// Using a single ordered channel guarantees the thought is always
+    /// delivered before the corresponding answer token.
     ///
     /// For user-facing turns, wire this to the client write-half.
     /// For silent background turns (proactive, cron), pass a draining
-    /// channel that discards the tokens.
-    pub token_tx: mpsc::Sender<String>,
+    /// channel that discards all chunks.
+    pub token_tx: mpsc::Sender<TurnChunk>,
     /// Optional sink for structured thinker events (thoughts, tool calls).
     ///
     /// The runtime bridges these into [`crate::BackendEvent`] for the TUI.
@@ -148,6 +153,17 @@ pub async fn run_agent_turn(input: AgentTurnInput<'_>) -> Result<ToolLoopResult>
         let debate_block = SubagentManager::format_debate_block(&team_results);
 
         if !debate_block.is_empty() {
+            // Emit each specialist's answer as a SubAgentProgress event so
+            // the TUI shows them like captain think blocks.
+            if let Some(sink) = &input.event_sink {
+                for (role, answer) in &team_results {
+                    sink(ThinkerEvent::SubAgentProgress(format!(
+                        "[{}]: {}",
+                        role.label(),
+                        answer.trim()
+                    )));
+                }
+            }
             // Notify the TUI that specialists are ready.
             if let Some(sink) = &input.event_sink {
                 sink(ThinkerEvent::SubAgentProgress(format!(

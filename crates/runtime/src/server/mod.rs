@@ -584,17 +584,30 @@ pub async fn run_unified_daemon(
             )
         };
         if subagents_enabled && provider_name.eq_ignore_ascii_case("ollama") {
-            let parallel = std::env::var("OLLAMA_NUM_PARALLEL")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0);
+            // Prefer the explicit config value; fall back to this process's env
+            // var (useful during development).  The Ollama service sets
+            // OLLAMA_NUM_PARALLEL in its own systemd environment — that env var
+            // is NOT inherited by the aigent daemon, so checking only the env
+            // var produces false-positive warnings when Ollama is properly
+            // configured via its service file.
+            let cfg_parallel = {
+                let st = state.lock().await;
+                st.runtime.config.llm.ollama_num_parallel
+            };
+            let parallel = cfg_parallel.unwrap_or_else(|| {
+                std::env::var("OLLAMA_NUM_PARALLEL")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0)
+            });
             if parallel < 3 {
                 warn!(
                     current = parallel,
                     recommended = 3,
-                    "subagents are enabled but OLLAMA_NUM_PARALLEL is not set to ≥ 3; \
-                     parallel specialist calls will queue and degrade to serial. \
-                     Set OLLAMA_NUM_PARALLEL=4 in your Ollama environment."
+                    "subagents are enabled but Ollama parallel slots appear to be < 3; \
+                     parallel specialist calls may queue and degrade to serial. \
+                     Set ollama_num_parallel in config/default.toml (or \
+                     OLLAMA_NUM_PARALLEL in your Ollama service environment)."
                 );
             }
         }

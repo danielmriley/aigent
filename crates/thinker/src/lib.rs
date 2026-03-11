@@ -27,3 +27,18 @@ pub use ext_loop::run_external_thinking_loop;
 pub use json_stream::{AgentStep, JsonStreamBuffer};
 pub use prompt::build_external_thinking_block;
 pub use tool_loop::{EventSink, ToolExecution, ToolLoopResult, build_tools_json};
+
+/// A typed chunk delivered over `token_tx` from the external thinking loop
+/// to the caller (connection/sleep/subagents).
+///
+/// Using a single ordered channel for both variants guarantees that a
+/// `Thought` emitted in the `final_answer` step always arrives before the
+/// corresponding `Token` answer — eliminating the race that previously caused
+/// the 💭 thought bubble to appear *after* the response in the TUI.
+#[derive(Debug)]
+pub enum TurnChunk {
+    /// A clean response token to stream to the user.
+    Token(String),
+    /// The model's chain-of-thought, to be surfaced as an `AgentThought` event.
+    Thought(String),
+}

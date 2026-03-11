@@ -141,6 +141,7 @@ fn evaluate_core(identity: &IdentityKernel, entry: &MemoryEntry) -> ConsistencyD
 fn evaluate_user_profile(entry: &MemoryEntry) -> ConsistencyDecision {
     let trusted = entry.source.starts_with("user-profile:")
         || entry.source_kind().is_sleep()
+        || entry.source.starts_with("userprofile:")  // written by record_user_profile_keyed
         || entry.source.starts_with("onboarding")
         || entry.source.starts_with("user-input");
 
@@ -165,6 +166,8 @@ fn evaluate_reflective(entry: &MemoryEntry) -> ConsistencyDecision {
         || entry.source_kind().is_sleep()
         || entry.source.starts_with("onboarding")
         || matches!(entry.source_kind(), SourceKind::AssistantReply)
+        || matches!(entry.source_kind(), SourceKind::VaultEdit)  // human vault edits
+        || matches!(entry.source_kind(), SourceKind::FollowUp)   // sleep follow-ups
         || entry.source.starts_with("agentic-sleep");
 
     if !trusted {

@@ -26,6 +26,7 @@ use chrono::{DateTime, Utc};
 use lru::LruCache;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::event_log::MemoryEventLog;
@@ -238,8 +239,27 @@ impl MemoryIndex {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let db = Database::create(&path)
-            .with_context(|| format!("opening redb index at {}", path.display()))?;
+        let db = match Database::create(&path) {
+            Ok(db) => db,
+            Err(err) => {
+                // The index file may be corrupt or from an incompatible redb
+                // version.  Delete it and re-create a fresh empty index; it
+                // will be repopulated on the next write.  The event log is the
+                // source of truth, so no data is lost.
+                warn!(
+                    ?err,
+                    path = %path.display(),
+                    "redb index failed to open — deleting and recreating (will \
+                     repopulate from event log on next write)"
+                );
+                if path.exists() {
+                    std::fs::remove_file(&path)
+                        .with_context(|| format!("removing corrupt redb index at {}", path.display()))?;
+                }
+                Database::create(&path)
+                    .with_context(|| format!("recreating redb index at {}", path.display()))?
+            }
+        };
 
         // Ensure all tables exist (idempotent — redb creates them if absent).
         {

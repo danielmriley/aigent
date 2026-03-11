@@ -266,6 +266,52 @@ impl DaemonClient {
         bail!("daemon did not return an Ack for DeduplicateMemory")
     }
 
+    /// Seed synthetic memory entries into the daemon for testing.
+    /// Returns the confirmation message from the daemon.
+    pub async fn seed_memories(
+        &self,
+        entries: Vec<crate::commands::SeedEntry>,
+    ) -> Result<String> {
+        let events = self
+            .request_events(ClientCommand::SeedMemories { entries })
+            .await?;
+        for event in events {
+            if let ServerEvent::Ack(msg) = event {
+                return Ok(msg);
+            }
+        }
+        bail!("daemon did not return an Ack for SeedMemories")
+    }
+
+    /// Trigger the full nightly multi-agent sleep cycle immediately, bypassing
+    /// all scheduling guards.  Streams progress lines to `on_progress` and
+    /// returns the final completion message.
+    pub async fn run_multi_agent_sleep_cycle_with_progress(
+        &self,
+        on_progress: impl Fn(&str),
+    ) -> Result<String> {
+        let stream = UnixStream::connect(&self.socket_path).await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let request = serde_json::to_string(&ClientCommand::RunMultiAgentSleepCycle)?;
+        write_half.write_all(request.as_bytes()).await?;
+        write_half.write_all(b"\n").await?;
+        write_half.flush().await?;
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                bail!("daemon closed connection during multi-agent sleep cycle");
+            }
+            match serde_json::from_str::<ServerEvent>(line.trim())? {
+                ServerEvent::StatusLine(msg) => on_progress(&msg),
+                ServerEvent::Ack(msg) => return Ok(msg),
+                _ => {}
+            }
+        }
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<aigent_tools::ToolSpec>> {
         let events = self.request_events(ClientCommand::ListTools).await?;
         for event in events {

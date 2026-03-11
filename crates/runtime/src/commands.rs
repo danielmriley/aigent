@@ -50,6 +50,23 @@ pub enum ClientCommand {
     GetSleepStatus,
     /// Run content-level deduplication across all memory tiers.
     DeduplicateMemory,
+    /// Inject a batch of synthetic memory entries directly into the daemon's
+    /// MemoryManager.  Designed for accelerated sleep-cycle testing: seed
+    /// episodic observations with preference language, then immediately call
+    /// `RunMultiAgentSleepCycle` to observe opinion formation.
+    SeedMemories { entries: Vec<SeedEntry> },
+}
+
+/// A single synthetic memory entry used by [`ClientCommand::SeedMemories`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedEntry {
+    /// The memory content text.
+    pub content: String,
+    /// Target tier: "episodic" (default), "semantic", "reflective",
+    /// "procedural", "user_profile", or "core".
+    pub tier: String,
+    /// Source label recorded on the entry.  Defaults to `"test-seed"` when empty.
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
