@@ -11,6 +11,7 @@ use tracing::{info, warn};
 
 use aigent_config::AppConfig;
 use aigent_memory::MemoryTier;
+use aigent_thinker::TurnChunk;
 
 use crate::{BackendEvent, ClientCommand, ConversationTurn, ServerEvent};
 
@@ -72,22 +73,29 @@ pub(super) async fn handle_connection(
             )
             .await?;
 
-            let (chunk_tx, mut chunk_rx) = mpsc::channel::<String>(128);
+            let (chunk_tx, mut chunk_rx) = mpsc::channel::<TurnChunk>(128);
             let writer = Arc::new(Mutex::new(write_half));
             let writer_clone = writer.clone();
             let event_tx_stream = if is_external { Some(event_tx.clone()) } else { None };
             let streamer = tokio::spawn(async move {
                 while let Some(chunk) = chunk_rx.recv().await {
+                    let backend_evt = match chunk {
+                        // Chain-of-thought from final_answer — emitted through
+                        // the same ordered channel as the answer token so the TUI
+                        // always renders the 💭 thought bubble before the response.
+                        TurnChunk::Thought(thought) => BackendEvent::AgentThought(thought),
+                        TurnChunk::Token(text) => BackendEvent::Token(text),
+                    };
                     {
                         let mut guard = writer_clone.lock().await;
                         let _ = send_event(
                             &mut guard,
-                            ServerEvent::Backend(BackendEvent::Token(chunk.clone())),
+                            ServerEvent::Backend(backend_evt.clone()),
                         )
                         .await;
                     }
                     if let Some(ref tx) = event_tx_stream {
-                        let _ = tx.send(BackendEvent::Token(chunk));
+                        let _ = tx.send(backend_evt);
                     }
                 }
             });
@@ -813,6 +821,31 @@ pub(super) async fn handle_connection(
                     .await?;
                 }
             }
+        }
+        ClientCommand::SeedMemories { entries } => {
+            let mut s = state.lock().await;
+            let mut count = 0usize;
+            for entry in &entries {
+                let tier = match entry.tier.to_lowercase().as_str() {
+                    "semantic"                           => aigent_memory::MemoryTier::Semantic,
+                    "procedural"                         => aigent_memory::MemoryTier::Procedural,
+                    "reflective"                         => aigent_memory::MemoryTier::Reflective,
+                    "user_profile" | "userprofile"
+                    | "user-profile"                     => aigent_memory::MemoryTier::UserProfile,
+                    "core"                               => aigent_memory::MemoryTier::Core,
+                    _                                    => aigent_memory::MemoryTier::Episodic,
+                };
+                let source = if entry.source.is_empty() { "test-seed" } else { entry.source.as_str() };
+                if s.memory.record(tier, &entry.content, source).await.is_ok() {
+                    count += 1;
+                }
+            }
+            let _ = s.memory.flush_all();
+            send_event(
+                &mut write_half,
+                ServerEvent::Ack(format!("seeded {count} memories")),
+            )
+            .await?;
         }
     }
 

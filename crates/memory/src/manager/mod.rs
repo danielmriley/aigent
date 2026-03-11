@@ -40,6 +40,25 @@ mod sleep_logic;
 mod vault_sync;
 
 
+/// Snapshot of a single active belief as seen by the CLI inspection command.
+///
+/// Constructed by [`MemoryManager::active_beliefs_with_edges`]; owns no
+/// locks and carries no redb references so it is safe to send across thread
+/// boundaries.
+#[derive(Debug, Clone)]
+pub struct BeliefNode {
+    pub id: Uuid,
+    pub content: String,
+    pub belief_kind: BeliefKind,
+    pub tier: MemoryTier,
+    pub initial_confidence: f32,
+    pub current_confidence: f32,
+    /// Number of outgoing `Supports` edges originating from this entry.
+    pub forward_edges: usize,
+    /// Number of incoming `Supports` edges pointing *at* this entry.
+    pub reverse_edges: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStats {
     pub total: usize,
@@ -276,6 +295,47 @@ impl MemoryManager {
             s.vault_files = check_vault_checksums(vault_path);
         }
         s
+    }
+
+    /// Return a snapshot of every active belief together with its current
+    /// computed confidence and `Supports`-edge counts from the redb index.
+    ///
+    /// Complexity: O(n) over the working store; each edge lookup is O(log n)
+    /// through the redb-backed index (LRU-cached).  When no index is attached
+    /// the edge counts default to 0 without any extra work.
+    pub fn active_beliefs_with_edges(&self) -> Vec<BeliefNode> {
+        self.store
+            .all()
+            .iter()
+            .map(|entry| {
+                let current_confidence = self.current_confidence(entry.id);
+                let (forward_edges, reverse_edges) = self
+                    .index
+                    .as_ref()
+                    .map(|idx| {
+                        let fwd = idx
+                            .forward_edges(&entry.id, EdgeKind::Supports)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        let rev = idx
+                            .reverse_edges(&entry.id, EdgeKind::Supports)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        (fwd, rev)
+                    })
+                    .unwrap_or((0, 0));
+                BeliefNode {
+                    id: entry.id,
+                    content: entry.content.clone(),
+                    belief_kind: entry.belief_kind,
+                    tier: entry.tier,
+                    initial_confidence: entry.confidence,
+                    current_confidence,
+                    forward_edges,
+                    reverse_edges,
+                }
+            })
+            .collect()
     }
 
     pub fn recent_promotions(&self, limit: usize) -> Vec<&MemoryEntry> {
@@ -2014,6 +2074,96 @@ mod tests {
             !proposals.is_empty(),
             "expected at least one proposal for ≥5 distinct observations"
         );
+        Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // BeliefNode / active_beliefs_with_edges
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `active_beliefs_with_edges` returns correct deltas and edge counts.
+    ///
+    /// Seeds two entries: one that receives a positive confidence signal and
+    /// one that is left at its initial value.  Verifies that delta = current -
+    /// initial and that without a redb index edge counts default to zero.
+    #[tokio::test]
+    async fn active_beliefs_with_edges_delta_and_defaults() -> Result<()> {
+        use crate::schema::{BeliefKind, ConfidenceReason, ConfidenceSource};
+
+        let mut manager = MemoryManager::default();
+
+        // Entry A: gets a confidence boost after recording.
+        let id_a = manager
+            .record_observation(
+                "Rust closures capture by reference by default".to_string(),
+                "tool:success:read_file".to_string(),
+                MemoryTier::Semantic,
+                BeliefKind::Empirical,
+                vec![],
+            )
+            .await?;
+        let initial_a = manager
+            .store
+            .get(id_a)
+            .map(|e| e.confidence)
+            .unwrap_or(0.0);
+        manager
+            .record_confidence_signal(
+                id_a,
+                0.15,
+                ConfidenceReason::ToolConfirmation,
+                ConfidenceSource::Tool { name: "read_file".to_string() },
+            )
+            .await?;
+
+        // Entry B: left untouched.
+        let id_b = manager
+            .record_observation(
+                "Daniel prefers concise commit messages".to_string(),
+                "chat".to_string(),
+                MemoryTier::Procedural,
+                BeliefKind::Procedural,
+                vec![],
+            )
+            .await?;
+        let initial_b = manager
+            .store
+            .get(id_b)
+            .map(|e| e.confidence)
+            .unwrap_or(0.0);
+
+        let nodes = manager.active_beliefs_with_edges();
+        assert_eq!(nodes.len(), 2, "expected exactly two belief nodes");
+
+        let node_a = nodes.iter().find(|n| n.id == id_a).expect("entry A missing");
+        let node_b = nodes.iter().find(|n| n.id == id_b).expect("entry B missing");
+
+        // Entry A must have a positive delta.
+        let delta_a = node_a.current_confidence - node_a.initial_confidence;
+        assert!(
+            delta_a > 0.0,
+            "entry A delta should be positive after ToolSuccess signal, got {delta_a}"
+        );
+        // initial_confidence on the node matches what was recorded.
+        assert_eq!(node_a.initial_confidence, initial_a);
+
+        // Entry B delta is zero (no signal applied).
+        let delta_b = node_b.current_confidence - node_b.initial_confidence;
+        assert_eq!(
+            node_b.initial_confidence, initial_b,
+            "entry B initial_confidence mismatch"
+        );
+        assert!(
+            delta_b.abs() < f32::EPSILON,
+            "entry B had no signal; delta should be ~0, got {delta_b}"
+        );
+
+        // Without a redb index, edge counts default to 0.
+        assert_eq!(node_a.forward_edges, 0);
+        assert_eq!(node_a.reverse_edges, 0);
+        assert_eq!(node_b.forward_edges, 0);
+        assert_eq!(node_b.reverse_edges, 0);
+
         Ok(())
     }
 }

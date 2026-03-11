@@ -403,6 +403,9 @@ impl SourceKind {
             }
             _ if s.starts_with("assistant-reply") => Self::AssistantReply,
             _ if s.starts_with("sleep:")          => Self::SleepOther(s.to_string()),
+            // `"human-edit"` is written by the vault watcher when a human edits
+            // a vault file — semantically identical to a vault edit.
+            "human-edit"                           => Self::VaultEdit,
             _                                      => Self::Other(s.to_string()),
         }
     }

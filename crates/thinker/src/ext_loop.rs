@@ -41,6 +41,7 @@ use aigent_tools::ToolRegistry;
 use crate::events::{ThinkerEvent, ToolCallInfo, ToolResult as ToolResultEvent};
 use crate::json_stream::{AgentStep, JsonStreamBuffer};
 use crate::tool_loop::{EventSink, ToolExecution, ToolLoopResult};
+use crate::TurnChunk;
 
 /// Truncate `s` to at most `max_chars` Unicode scalar values, preserving
 /// UTF-8 validity.  Returns a `&str` slice — no allocation.
@@ -66,7 +67,7 @@ pub async fn run_external_thinking_loop(
     messages: &mut Vec<ChatMessage>,
     tool_registry: &ToolRegistry,
     tool_executor: &ToolExecutor,
-    user_token_tx: mpsc::Sender<String>,
+    user_token_tx: mpsc::Sender<TurnChunk>,
     event_sink: Option<&EventSink>,
     step_timeout: Duration,
     tool_timeout: Duration,
@@ -167,7 +168,7 @@ pub async fn run_external_thinking_loop(
         if full_text.trim().is_empty() {
             warn!(round, "ext_loop: LLM returned empty/whitespace-only response");
             let fallback = "I experienced a sudden processing failure and returned an empty response. Please try again.".to_string();
-            let _ = user_token_tx.send(fallback.clone()).await;
+            let _ = user_token_tx.send(TurnChunk::Token(fallback.clone())).await;
             return Ok(ToolLoopResult {
                 provider: final_provider,
                 content: fallback,
@@ -187,13 +188,22 @@ pub async fn run_external_thinking_loop(
                 s
             }
             Some(Err(e)) => {
+                // Provider/infrastructure errors (e.g. Ollama out-of-memory,
+                // model not found).  These are not JSON-formatting issues —
+                // retrying with a correction prompt will never succeed.
+                if e.starts_with("provider_error:") {
+                    let msg = e.trim_start_matches("provider_error:").trim();
+                    warn!(round, error = %msg, "LLM provider error — aborting ext_loop");
+                    bail!("LLM provider error: {}", msg);
+                }
+
                 malformed_retries += 1;
                 warn!(round, error = %e, malformed_retries, "failed to parse agent step");
 
                 if malformed_retries > MAX_MALFORMED_RETRIES {
                     warn!(round, "malformed JSON retry cap reached — returning fallback");
                     let fallback = "I was unable to produce a valid structured response. Please try again.".to_string();
-                    let _ = user_token_tx.send(fallback.clone()).await;
+                    let _ = user_token_tx.send(TurnChunk::Token(fallback.clone())).await;
                     return Ok(ToolLoopResult {
                         provider: final_provider,
                         content: fallback,
@@ -232,7 +242,7 @@ pub async fn run_external_thinking_loop(
                 } else {
                     full_text.clone()
                 };
-                let _ = user_token_tx.send(fallback.clone()).await;
+                let _ = user_token_tx.send(TurnChunk::Token(fallback.clone())).await;
                 return Ok(ToolLoopResult {
                     provider: final_provider,
                     content: fallback,
@@ -247,12 +257,15 @@ pub async fn run_external_thinking_loop(
             AgentStep::FinalAnswer { thought, answer } => {
                 info!(round, thought_len = thought.len(), answer_len = answer.len(), "ext_loop: final_answer");
 
-                // Collect and emit the model's chain-of-thought.
+                // Collect the model's chain-of-thought.
                 if !thought.is_empty() {
                     reasoning_traces.push(thought.clone());
-                    if let Some(sink) = event_sink {
-                        sink(ThinkerEvent::AgentThought(thought));
-                    }
+                    // Route the thought through the SAME ordered channel as the
+                    // answer token — this is the only path that guarantees the
+                    // 💭 thought bubble is displayed *before* the response.
+                    // (Broadcasting via event_sink here would race against the
+                    // Token on a separate delivery path.)
+                    let _ = user_token_tx.send(TurnChunk::Thought(thought)).await;
                 }
 
                 // If the model emitted a valid final_answer JSON but left the
@@ -265,8 +278,10 @@ pub async fn run_external_thinking_loop(
                     answer
                 };
 
-                // Stream the clean answer to the user (no raw JSON).
-                let _ = user_token_tx.send(answer.clone()).await;
+                // Stream the clean answer to the user (no raw JSON).  This
+                // is sent after the Thought above — same channel, guaranteed
+                // FIFO, so the TUI always renders them in the right order.
+                let _ = user_token_tx.send(TurnChunk::Token(answer.clone())).await;
 
                 // Record the assistant's full reply for conversation history.
                 messages.push(ChatMessage::assistant(&full_text));
@@ -531,7 +546,7 @@ pub async fn run_external_thinking_loop(
          but I have gathered some tool data in the background. Please try again \
          or rephrase your question.".to_string()
     };
-    let _ = user_token_tx.send(fallback.clone()).await;
+    let _ = user_token_tx.send(TurnChunk::Token(fallback.clone())).await;
 
     Ok(ToolLoopResult {
         provider: final_provider,

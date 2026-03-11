@@ -444,6 +444,11 @@ fn build_narrative_md(
         "*Last consolidated: {}*\n",
         now.format("%Y-%m-%dT%H:%M:%SZ")
     ));
+    // Append a checksum comment over the content built so far so that the
+    // vault watcher can distinguish daemon-written files from genuine human
+    // edits without a separate sidecar file.
+    let checksum = sha256_of(&md);
+    md.push_str(&format!("\n<!-- aigent-checksum: sha256:{checksum} -->"));
     md
 }
 
@@ -655,8 +660,27 @@ pub struct VaultEditEvent {
 ///
 /// `MEMORY.md` has no checksum line, so it always returns `false` (fire).
 fn is_daemon_written(content: &str, filename: &str) -> bool {
+    if filename.ends_with(".md") {
+        // Check for the aigent-checksum HTML comment appended by build_narrative_md.
+        let stored_hex = content
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("<!-- aigent-checksum: sha256:"))
+            .and_then(|l| l.strip_prefix("<!-- aigent-checksum: sha256:"))
+            .and_then(|l| l.strip_suffix(" -->"))
+            .map(str::trim);
+        let Some(stored_hex) = stored_hex else {
+            return false; // no checksum → unknown origin → fire to be safe
+        };
+        // Strip the checksum line before recomputing to avoid circularity.
+        // The separating '\n' is included in the prefix we strip.
+        let body_end = content
+            .rfind("\n<!-- aigent-checksum:")
+            .unwrap_or(content.len());
+        return stored_hex == sha256_of(&content[..body_end]).as_str();
+    }
     if !filename.ends_with(".yaml") {
-        return false; // MEMORY.md – always treat as potential human edit
+        return false;
     }
     // Extract stored checksum.
     let stored_hex = content

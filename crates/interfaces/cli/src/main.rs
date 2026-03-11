@@ -1,6 +1,7 @@
 mod daemon;
 mod interactive;
 mod memory_cmds;
+mod sleep_cmds;
 
 use std::fs;
 use std::io;
@@ -78,6 +79,12 @@ enum Commands {
         #[command(subcommand)]
         command: HistoryCommands,
     },
+    /// Sleep cycle control and accelerated-learning test tools.
+    #[command(about = "Sleep cycle control and accelerated-learning test tools")]
+    Sleep {
+        #[command(subcommand)]
+        command: SleepCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -92,6 +99,34 @@ enum HistoryCommands {
     },
     /// Show the path to today's history file.
     Path,
+}
+
+#[derive(Debug, Subcommand)]
+enum SleepCommands {
+    /// Force-trigger the nightly multi-agent sleep cycle immediately.
+    /// Bypasses all time/quiet-window guards.
+    Run,
+    /// Show sleep schedule, last-run times, and quiet-window status.
+    Status,
+    /// Seed synthetic episodic memories about a topic to accelerate testing.
+    ///
+    /// Injects N observations containing clear preference language so the
+    /// Identity specialist can detect and form an opinion after one `run`.
+    Seed {
+        /// The topic or theme to build memories around.
+        /// Example: "Rust programming", "test-driven development"
+        #[arg(value_name = "THEME")]
+        theme: String,
+        /// Number of memories to inject (1–10, default 7).
+        #[arg(long, default_value_t = 7)]
+        count: usize,
+        /// Valence direction of the seeded memories.
+        #[arg(long, value_enum, default_value = "positive")]
+        valence: sleep_cmds::SeedValence,
+        /// Immediately run the full multi-agent sleep cycle after seeding.
+        #[arg(long)]
+        run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -136,6 +171,20 @@ enum MemoryCommands {
     Proactive {
         #[command(subcommand)]
         command: ProactiveCommands,
+    },
+    /// Inspect active beliefs, their confidence levels, and graph connections.
+    Beliefs {
+        /// Filter by belief kind (empirical, procedural, self-model, opinion).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by memory tier (episodic, semantic, reflective, core).
+        #[arg(long)]
+        tier: Option<String>,
+        /// Show only beliefs with a current confidence at or below this threshold.
+        #[arg(long)]
+        max_confidence: Option<f32>,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
     },
 }
 
@@ -182,8 +231,11 @@ async fn fetch_available_models() -> aigent_ui::onboard::AvailableModels {
 ///
 /// - `RUST_LOG` env var, if set, **always** takes precedence.
 /// - Otherwise, `debug.log_level` from config is used.
-/// - When `debug.log_to_file` is `true`, an additional file layer writes to
-///   `.aigent/runtime/debug.log` (truncated on each startup).
+/// - When `debug.log_to_file` is `true` **and** this is the daemon subprocess
+///   (`AIGENT_DAEMON_PROCESS=1`), an additional file layer appends to
+///   `.aigent/runtime/debug.log`.  The parent CLI process never writes to the
+///   file — it exits too quickly to produce useful output and two concurrent
+///   `O_TRUNC` opens on the same inode would corrupt the file with null bytes.
 fn init_tracing(debug: &DebugConfig) {
     // Honour RUST_LOG if explicitly set; otherwise use config level.
     let filter = if std::env::var("RUST_LOG").is_ok() {
@@ -196,11 +248,20 @@ fn init_tracing(debug: &DebugConfig) {
         .with_target(false)
         .with_thread_ids(false);
 
-    if debug.log_to_file {
+    // Only attach the file layer inside the actual daemon subprocess.
+    // The parent CLI process exits after spawning the daemon, so writing a
+    // file log there adds no value and races with the daemon's own open.
+    let is_daemon = std::env::var("AIGENT_DAEMON_PROCESS").ok().as_deref() == Some("1");
+
+    if debug.log_to_file && is_daemon {
         let log_dir = Path::new(".aigent").join("runtime");
         let _ = fs::create_dir_all(&log_dir);
-        let log_file = fs::File::create(log_dir.join("debug.log"))
-            .expect("failed to create debug.log");
+        // Append so previous runs are preserved across daemon restarts.
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("debug.log"))
+            .expect("failed to open debug.log");
         let file_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_ansi(false)
@@ -350,6 +411,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            MemoryCommands::Beliefs { kind, tier, max_confidence, limit } => {
+                let memory = MemoryManager::with_event_log(memory_log_path).await?;
+                memory_cmds::run_memory_beliefs(&memory, kind, tier, max_confidence, limit.max(1));
+            }
         },
         Commands::Tool { command } => {
             let client = DaemonClient::new(&config.daemon.socket_path);
@@ -482,6 +547,20 @@ async fn main() -> Result<()> {
                 println!("{}", p.display());
             }
         },
+        Commands::Sleep { command } => {
+            let socket = &config.daemon.socket_path;
+            match command {
+                SleepCommands::Run => {
+                    sleep_cmds::run_sleep_run(socket).await?;
+                }
+                SleepCommands::Status => {
+                    sleep_cmds::run_sleep_status(socket).await?;
+                }
+                SleepCommands::Seed { theme, count, valence, run } => {
+                    sleep_cmds::run_sleep_seed(socket, &theme, count, valence, run).await?;
+                }
+            }
+        }
     }
 
     Ok(())

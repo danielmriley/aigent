@@ -229,8 +229,14 @@ pub(super) fn spawn_nightly_consolidation(
             // via the reqwest client; this caps the whole multi-agent run).
             let llm_start = std::time::Instant::now();
             let (noop_tx, _) = mpsc::unbounded_channel::<String>();
+            let timeout_mins = rt_clone.config.memory.sleep.multi_agent_timeout_mins;
+            let timeout_duration = if timeout_mins == 0 {
+                Duration::from_secs(u64::MAX / 2) // effectively unlimited
+            } else {
+                Duration::from_secs(timeout_mins * 60)
+            };
             let gen_result = match tokio::time::timeout(
-                Duration::from_secs(10 * 60), // 10 min hard cap
+                timeout_duration,
                 rt_clone.generate_multi_agent_sleep_insights(
                     &memories_snapshot,
                     &identity_snapshot,
@@ -243,7 +249,8 @@ pub(super) fn spawn_nightly_consolidation(
                 Err(_elapsed) => {
                     warn!(
                         elapsed_secs = llm_start.elapsed().as_secs(),
-                        "nightly consolidation: timed out after 10 minutes"
+                        timeout_mins,
+                        "nightly consolidation: timed out — increase memory.sleep.multi_agent_timeout_mins if needed"
                     );
                     Err(crate::AgentError::Sleep(anyhow::anyhow!("nightly consolidation timed out")))
                 }
@@ -448,7 +455,7 @@ pub(super) fn spawn_proactive_task(
             messages.push(aigent_llm::ChatMessage::user(proactive_user_msg));
 
             // Create a sink channel — proactive tokens are NOT shown to the user.
-            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<String>(64);
+            let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel::<aigent_thinker::TurnChunk>(64);
             tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
 
             // Run the unified agent turn (silent — no events broadcast to TUI).

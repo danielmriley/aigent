@@ -15,7 +15,7 @@ mod server;
 // ── Local types ───────────────────────────────────────────────────────────────
 
 pub use client::DaemonClient;
-pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, SleepStatusPayload, ServerEvent};
+pub use commands::{ClientCommand, DaemonStatus, ProactiveStatsPayload, SeedEntry, SleepStatusPayload, ServerEvent};
 pub use error::ServerError;
 pub use scheduler::{HeartbeatFn, ScheduledTask, SchedulerState, TaskSchedule, spawn_scheduler};
 pub use server::run_unified_daemon;

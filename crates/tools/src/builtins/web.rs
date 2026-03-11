@@ -315,10 +315,16 @@ async fn search_duckduckgo(
     let client = build_client()?;
 
     // POST to the DuckDuckGo HTML search endpoint.
+    // Extra browser-grade headers reduce the chance of triggering DDG's
+    // bot-detection (anomaly.js / cc=botnet challenge page).
     let resp = client
         .post("https://html.duckduckgo.com/html/")
         .form(&[("q", query)])
-        .header("Accept", "text/html")
+        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
         .send()
         .await?;
 
@@ -328,6 +334,18 @@ async fn search_duckduckgo(
     }
 
     let body = resp.text().await?;
+
+    // DDG occasionally returns a JavaScript bot-challenge page instead of
+    // results.  Detect it by checking for the known challenge URL fragment.
+    // Return a real error so the tool executor records a transient failure
+    // and the agent knows to try a different approach rather than silently
+    // seeing "No results".
+    if body.contains("duckduckgo.com/anomaly.js") || body.contains("cc=botnet") {
+        anyhow::bail!(
+            "DuckDuckGo rate-limited this request (bot-challenge page). \
+             Try a different query or use a configured search provider (Brave/Tavily/SearXNG)."
+        );
+    }
 
     // Parse the HTML and extract search results synchronously.
     // The scraper `Html` type is !Send, so it must not live across an await.
