@@ -13,6 +13,7 @@ perf.data.old
 .aigent/
 workspace/
 config/default.toml
+scripts/config/default.toml
 
 # Logs and temporary files
 *.log
