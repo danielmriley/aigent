@@ -816,6 +816,67 @@ impl MemoryManager {
         self.sync_vault_projection()
     }
 
+    /// Reload the in-memory store by re-replaying the event log from scratch.
+    ///
+    /// Used after an external process (e.g. `aigent memory wipe`) writes tombstones
+    /// to the event log so the running daemon's in-memory state stays consistent
+    /// with the persisted log.  Configuration fields (`embed_fn`, `vault_path`,
+    /// `learning`, `sleep_cfg`, `kv_tier_limit`) are preserved; only the mutable
+    /// store state is rebuilt.
+    ///
+    /// Complexity: O(n) over the event log — same as the initial `with_event_log`.
+    pub async fn reload(&mut self) -> Result<()> {
+        let Some(event_log) = &self.event_log else {
+            return Ok(()); // no event log attached — no-op
+        };
+        let all_events = event_log.load_all_events().await?;
+
+        // Reset all mutable state; preserve configuration.
+        self.store = MemoryStore::default();
+        self.identity = IdentityKernel::default();
+        self.confidence_overrides.clear();
+        self.cached_identity_block = None;
+        self.cached_beliefs_block = None;
+        self.index_clear();
+
+        let mut record_count = 0usize;
+        let mut confidence_event_count = 0usize;
+
+        for event in all_events {
+            match event {
+                MemoryLogEvent::RecordEntry(rec) => {
+                    record_count += 1;
+                    if let Err(err) = self.apply_replayed_entry(rec.entry) {
+                        warn!(%err, "skipping quarantined entry during reload");
+                    }
+                }
+                MemoryLogEvent::ConfidenceUpdate(cu) => {
+                    let current = self
+                        .confidence_overrides
+                        .get(&cu.target_id)
+                        .copied()
+                        .or_else(|| self.store.get(cu.target_id).map(|e| e.confidence))
+                        .unwrap_or(0.0);
+                    let new_conf = (current + cu.delta).clamp(0.0, 1.0);
+                    self.confidence_overrides.insert(cu.target_id, new_conf);
+                    confidence_event_count += 1;
+                }
+                MemoryLogEvent::BeliefConsolidated(_) | MemoryLogEvent::BeliefRelationship(_) => {}
+            }
+        }
+
+        let stats = self.stats();
+        info!(
+            records = record_count,
+            confidence_events = confidence_event_count,
+            core = stats.core,
+            episodic = stats.episodic,
+            semantic = stats.semantic,
+            "memory reloaded from event log"
+        );
+        Ok(())
+    }
+
     /// Remove a set of entry IDs from the secondary index (if attached).
     fn index_remove_ids(&mut self, ids: &HashSet<Uuid>) {
         if let Some(idx) = &mut self.index {

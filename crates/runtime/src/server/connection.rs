@@ -847,6 +847,26 @@ pub(super) async fn handle_connection(
             )
             .await?;
         }
+        ClientCommand::ReloadMemory => {
+            let mut s = state.lock().await;
+            match s.memory.reload().await {
+                Ok(()) => {
+                    let _ = s.memory.flush_all();
+                    send_event(
+                        &mut write_half,
+                        ServerEvent::Ack("memory reloaded from event log".to_string()),
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    send_event(
+                        &mut write_half,
+                        ServerEvent::Ack(format!("memory reload failed: {err}")),
+                    )
+                    .await?;
+                }
+            }
+        }
     }
 
     Ok(())

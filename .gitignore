@@ -39,3 +39,4 @@ test_tui.rs
 test_ui.rs
 prompts/
 reports/
+results/

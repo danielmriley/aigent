@@ -266,6 +266,19 @@ impl DaemonClient {
         bail!("daemon did not return an Ack for DeduplicateMemory")
     }
 
+    /// Reload the daemon's in-memory store from the event log.
+    /// Called after `aigent memory wipe` so the daemon's live state stays
+    /// consistent with the persisted event log.
+    pub async fn reload_memory(&self) -> Result<()> {
+        let events = self.request_events(ClientCommand::ReloadMemory).await?;
+        for event in events {
+            if let ServerEvent::Ack(_) = event {
+                return Ok(());
+            }
+        }
+        bail!("daemon did not return an Ack for ReloadMemory")
+    }
+
     /// Seed synthetic memory entries into the daemon for testing.
     /// Returns the confirmation message from the daemon.
     pub async fn seed_memories(
