@@ -165,16 +165,34 @@ MOST RECENT PERSONALITY REINFORCEMENT:\n{reinforce_block}\n\
 pub fn batch_memories(entries: &[MemoryEntry], batch_size: usize) -> Vec<Vec<MemoryEntry>> {
     let batch_size = batch_size.max(1);
 
-    // Anchor entries: always replicated into every batch
-    let anchor: Vec<&MemoryEntry> = entries
-        .iter()
-        .filter(|e| {
-            (e.tier == MemoryTier::Core && e.source != "sleep:retired")
-                || e.tier == MemoryTier::UserProfile
-        })
-        .collect();
+    // Anchor entries: cap to top-N to prevent drowning fresh episodic signals.
+    // Core is sorted by confidence DESC (highest-confidence facts first);
+    // UserProfile by recency DESC (most-recent profile facts first).
+    // The IdentityKernel in every specialist prompt already covers broad identity
+    // context, so we only need a representative slice here.
+    // O(n log n) sort once; anchor set is O(1) bounded regardless of memory growth.
+    const MAX_CORE_ANCHORS: usize = 20;
+    const MAX_PROFILE_ANCHORS: usize = 20;
 
-    let anchor_clones: Vec<MemoryEntry> = anchor.iter().map(|e| (*e).clone()).collect();
+    let mut core_anchors: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|e| e.tier == MemoryTier::Core && e.source != "sleep:retired")
+        .collect();
+    core_anchors.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
+    core_anchors.truncate(MAX_CORE_ANCHORS);
+
+    let mut profile_anchors: Vec<&MemoryEntry> = entries
+        .iter()
+        .filter(|e| e.tier == MemoryTier::UserProfile)
+        .collect();
+    profile_anchors.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    profile_anchors.truncate(MAX_PROFILE_ANCHORS);
+
+    let anchor_clones: Vec<MemoryEntry> = core_anchors
+        .iter()
+        .chain(profile_anchors.iter())
+        .map(|e| (*e).clone())
+        .collect();
 
     // Variable pool: partitioned so each entry appears in exactly one batch
     let mut reflective: Vec<&MemoryEntry> = entries

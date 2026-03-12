@@ -18,6 +18,15 @@ use crate::sleep::{AgenticSleepInsights, SleepSummary, distill};
 
 use super::{ConsolidationFn, MemoryManager, retire_core_by_prefix};
 
+// ── Supports-edge wiring limit ────────────────────────────────────────────────
+
+/// Maximum number of recent Episodic entries to wire as `Supports` edges into
+/// each newly-created insight belief.  Caps both the index churn and the
+/// visual F-count shown in `aigent memory beliefs`.
+///
+/// O(MAX_SUPPORT_SOURCES · log n) index writes per insight — bounded and small.
+const MAX_SUPPORT_SOURCES: usize = 10;
+
 // ── Phase 4 clustering helpers ────────────────────────────────────────────────
 
 /// Snapshot of an Episodic entry assembled during the Pass 2 pre-scan.
@@ -214,6 +223,37 @@ impl MemoryManager {
         )
     }
 
+    /// Wire `Supports` edges from each `source_id` to `target_id` in both the
+    /// live redb index and the append-only event log.
+    ///
+    /// Best-effort: individual errors are logged and skipped so one bad write
+    /// never aborts the whole sleep application.
+    ///
+    /// Complexity: O(|source_ids| · log n) index writes; O(|source_ids|) log appends.
+    async fn wire_sleep_supports(&mut self, source_ids: &[Uuid], target_id: Uuid) {
+        for &src_id in source_ids {
+            if let Some(idx) = self.index.as_mut() {
+                if let Err(e) = idx.add_edge(&src_id, EdgeKind::Supports, &target_id) {
+                    warn!(error = ?e, %src_id, %target_id, "wire_sleep_supports: add_edge failed");
+                }
+            }
+            if let Some(log) = &self.event_log {
+                let _ = log
+                    .append_log_event(&MemoryLogEvent::BeliefRelationship(
+                        BeliefRelationshipEvent {
+                            event_id: Uuid::new_v4(),
+                            occurred_at: Utc::now(),
+                            source_id: src_id,
+                            target_id,
+                            edge_kind: EdgeKind::Supports,
+                            relationship_confidence: 0.5,
+                        },
+                    ))
+                    .await;
+            }
+        }
+    }
+
     /// Apply structured `AgenticSleepInsights` produced by the LLM to memory,
     /// then run the standard heuristic distillation on top.
     ///
@@ -231,6 +271,22 @@ impl MemoryManager {
     ) -> Result<SleepSummary> {
         let mut extra_ids: Vec<String> = Vec::new();
 
+        // Snapshot the MAX_SUPPORT_SOURCES most-recent Episodic entry IDs before
+        // any mutations.  These are the evidential observations that this sleep
+        // cycle's insights were derived from.  Collected as plain Uuids so the
+        // store borrow is released before the first &mut self call below.
+        // O(n) collect + O(n log n) sort, bounded by MAX_SUPPORT_SOURCES cap.
+        let episodic_source_ids: Vec<Uuid> = {
+            let mut eps: Vec<&crate::schema::MemoryEntry> = self
+                .store
+                .all()
+                .iter()
+                .filter(|e| e.tier == MemoryTier::Episodic)
+                .collect();
+            eps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            eps.into_iter().take(MAX_SUPPORT_SOURCES).map(|e| e.id).collect()
+        };
+
         // learned_about_user → UserProfile (tagged)
         for fact in &insights.learned_about_user {
             let e = self.record_inner_tagged(
@@ -242,6 +298,7 @@ impl MemoryManager {
                 BeliefKind::default(),
             ).await?;
             extra_ids.push(e.id.to_string());
+            self.wire_sleep_supports(&episodic_source_ids, e.id).await;
         }
 
         // follow_ups → Reflective (tagged)
@@ -268,6 +325,7 @@ impl MemoryManager {
                 BeliefKind::SelfModel,
             ).await?;
             extra_ids.push(e.id.to_string());
+            self.wire_sleep_supports(&episodic_source_ids, e.id).await;
         }
 
         // relationship_milestones → Reflective (tagged with relationship + dynamic)
@@ -295,6 +353,7 @@ impl MemoryManager {
                 BeliefKind::Opinion,
             ).await?;
             extra_ids.push(e.id.to_string());
+            self.wire_sleep_supports(&episodic_source_ids, e.id).await;
         }
 
         // contradictions → Semantic (tagged)
@@ -308,6 +367,7 @@ impl MemoryManager {
                 BeliefKind::default(),
             ).await?;
             extra_ids.push(e.id.to_string());
+            self.wire_sleep_supports(&episodic_source_ids, e.id).await;
         }
 
         // tool_insights → Procedural (tagged)
@@ -321,6 +381,7 @@ impl MemoryManager {
                 BeliefKind::Procedural,
             ).await?;
             extra_ids.push(e.id.to_string());
+            self.wire_sleep_supports(&episodic_source_ids, e.id).await;
         }
 
         // synthesis → Semantic (tagged)
@@ -334,6 +395,7 @@ impl MemoryManager {
                 BeliefKind::default(),
             ).await?;
             extra_ids.push(e.id.to_string());
+            self.wire_sleep_supports(&episodic_source_ids, e.id).await;
         }
 
         // keyed user-profile updates (replace by key)
@@ -543,6 +605,7 @@ impl MemoryManager {
                 "free-form memory recorded"
             );
             extra_ids.push(e.id.to_string());
+            self.wire_sleep_supports(&episodic_source_ids, e.id).await;
         }
 
         // Standard heuristic distillation + vault sync (includes backup).

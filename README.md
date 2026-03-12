@@ -1,48 +1,28 @@
 # Aigent
 
-Aigent is a persistent, self-improving AI agent written in Rust. It runs as a background daemon and connects to any frontend — a local TUI, a Telegram bot, or an external client over a Unix socket. Memory is stored in a 6-tier append-only event log that grows smarter over time through nightly sleep consolidation driven by a pipeline of parallel LLM specialist agents.
+A persistent, self-improving AI agent written in Rust. Aigent runs as a long-lived background daemon with thin frontends (terminal TUI and Telegram bot) communicating over Unix socket IPC. All state lives in a 6-tier append-only event-sourced memory system that grows smarter over time through nightly sleep consolidation — a pipeline of parallel LLM specialist agents that distil, promote, and reconcile knowledge while you sleep.
 
-## Recent Major Updates (February 2026)
+## Highlights
 
-| Change | Details |
-|---|---|
-| **Schemars JSON Schemas** | All public tool types (`ToolSpec`, `ToolParam`, `ParamType`, `SecurityLevel`, `ToolMetadata`, `ToolOutput`, `ToolSource`, `ToolInfo`) derive `schemars::JsonSchema` for auto-generated JSON Schema documents. `tool_registry_schema()` and `export_schemars_schemas()` functions for IDE tooling and marketplace validation. |
-| **Marketplace extensions** | Feature-gated (`marketplace`) extension system under `extensions/marketplace/`. `manifest.toml` declarative format, `MarketplaceRegistry` for install/remove/list, `discover_extensions()` scanner, `manifest_to_tool_spec()` converter. CLI commands: `aigent marketplace list/install/build/remove`. |
-| **Cron expression scheduler** | Runtime scheduler now accepts standard 6-field cron expressions (`"0 */5 * * * *"`) via the `cron` crate alongside fixed-interval `Duration` scheduling. `ScheduledTask::from_cron()` constructor. `TaskSchedule` enum unifies both modes. Backward-compatible with existing interval-based tasks. |
-| **Coreutils structured output** | All 19 pure-Rust coreutils tools (`ls`, `grep`, `head`, `tree`, `wc`, etc.) now support `jsonl=true` (one JSON object per line) and `semantic=true` (XML-style tags) output modes. New `uutils` feature flag delegates to system `sort`/`head` binaries for locale-aware sorting. Feature chain: cli → exec → tools. |
-| **gait — safe native git** | New `perform_gait` tool powered by libgit2 (`git2` crate). All git writes restricted to `trusted_write_paths`; reads broadly allowed. Grounding rule 10 instructs the LLM to prefer gait over `run_shell git …`. Config: `[git]` section with `trusted_repos`, `trusted_write_paths`, `allow_system_read`. WIT `git-operation` record + `perform-gait` export added. |
-| **Sandbox seccomp expansion** | Added `uname` (160), `sethostname` (170), and `clone3` (435) to the seccomp BPF allow-list so git / build tools work inside the sandbox. |
-| **Tool-result propagation v2** | Rule 9 added to grounding block: LLM is contractually bound by the ===== TOOL RESULT ===== markers. Fallback follow-up prompt cleaned up. TUI now suppresses raw tool-JSON tokens before `ClearStream` fires. Telegram `ClearStream` handler clears streamed output before second pass. |
-| **Prominent date/time in prompt** | `local_time` added to ENVIRONMENT CONTEXT. `Today is <weekday, Month D, YYYY>` injected into the system preamble so the LLM cannot hallucinate the date. |
-| **Non-blocking TUI event loop** | Crossterm key/mouse reading moved to a dedicated OS thread — spinner, tick, and backend events get fair `tokio::select!` scheduling. Eliminates all spinner stutter during streaming or tool calls. |
-| **11-rule truth-seeking grounding** | Rule 10: prefer `perform_gait` over `run_shell git`. Rule 9 (tool-result markers). All prior rules retained. |
-| **7-point tool continuation instruction** | The synthetic continuation prompt after every tool call is now a numbered CRITICAL INSTRUCTION block — the LLM can no longer dodge tool results. |
-| **Ctrl+T theme cycling** | Press Ctrl+T to cycle through Catppuccin Mocha → Tokyo Night → Nord live. Keybindings bar updated. |
-| **`aigent status` CLI** | New top-level command shows daemon uptime, memory stats, tool list, and full sleep schedule at a glance. |
-| **Sleep cycle tracing** | Passive and nightly sleep tasks now emit `info!` at start/completion. Sleep schedule injected into LLM environment context. |
-| **Auto-follow on insights** | ReflectionInsight and BeliefAdded events now trigger auto-follow so the viewport scrolls to show them. |
-| **Time-based spinner** | Spinner animation uses wall-clock time instead of event-loop tick counter — immune to starvation from rapid streaming events or slow event loops. Animates reliably during LLM generation, tool execution, inline reflection, and sleep cycles. |
-| **Config-driven theming** | New `[ui]` config section: `theme` (catppuccin-mocha / tokyo-night / nord) and `show_sidebar` (default true). Theme is read on startup from `config/default.toml`. |
-| **Styled keybindings bar** | Context-aware footer: shows input-mode keys in normal mode, history-mode keys when browsing transcript. Accent-coloured key labels with dimmed separators. |
-| **Tool detail Enter-toggle** | Press Enter on a tool message in history mode to view the full tool output inline. |
-| **Stronger tool propagation** | 7-point CRITICAL INSTRUCTION explicitly tells the LLM to use the verbatim tool result and never claim it is unavailable. |
-| **WASM-first tool execution** | Wasmtime host runtime is default-on. WASM guest binaries win over native at registry lookup (first-match). Native Rust builtins fall back only until `aigent tools build` compiles guests. |
-| **Platform sandboxing default-on** | `PR_SET_NO_NEW_PRIVS` + seccomp BPF (Linux x86-64) and `sandbox_init` (macOS) compiled in by default. Disable at runtime via `[tools] sandbox_enabled = false`; no recompile needed. |
-| **Three-level approval modes** | `safer` / `balanced` (default) / `autonomous` — configurable in onboarding wizard and in `[tools] approval_mode`. |
-| **Git auto-commit & rollback** | `git_auto_commit = true` commits every write/shell call; `git_rollback` tool reverts with one call. Wizard will `git init` the workspace automatically. |
-| **Brave Search** | `web_search` tool uses Brave API when `brave_api_key` is set; DuckDuckGo Instant Answer always available as fallback. |
-| **`aigent tools build/status` CLI** | Build WASM guests and inspect per-tool runtime state without starting the daemon. |
+- **6-tier memory** — Core, UserProfile, Reflective, Semantic, Procedural, Episodic — stored in an append-only JSONL event log with crash-safe `fsync` writes and a `redb` secondary index.
+- **Nightly self-improvement** — multi-agent sleep cycle with four parallel specialists (Identity, Relationships, Knowledge, Reflections) + a synthesis agent. Also supports passive (no-LLM) and single-agent modes.
+- **35+ tools** — filesystem, coreutils, shell, web search (6 providers), git (libgit2), scheduler, and more — all workspace-sandboxed with configurable approval modes.
+- **WASM-first extensibility** — Wasmtime runtime with a WIT host interface. WASM guest binaries take precedence over native fallbacks.
+- **Platform sandboxing** — seccomp BPF (Linux) and `sandbox_init` (macOS) applied to all shell children by default.
+- **Hybrid LLM routing** — Ollama (local-first), OpenRouter (cloud), and Candle (local GGUF inference). A fast router model classifies messages as Chat vs Tools to skip the full reasoning loop on simple queries.
+- **Obsidian integration** — auto-projection into `.aigent/vault/` with YAML summaries, daily notes, and bidirectional editing. Edit the YAML, shape the agent.
+- **Beliefs & inline reflection** — after every turn the agent extracts beliefs and insights, injecting an evolving worldview into every future prompt.
+- **Rich TUI** — `ratatui`-based chat with streaming tokens, syntax-highlighted markdown, file picker, slash commands, configurable themes, and expandable tool output.
+- **Telegram bot** — long-polling with typing indicators, tool footnotes, and full command parity.
 
-## Status
+## Quick Start
 
-Phases 0–2 (Foundation, Memory, Unified Agent Loop) are complete. Phase 11 (non-blocking event loop, bulletproof tool propagation, TUI polish, sleep debuggability) is the latest shipped milestone. All features above are live and enabled by default.
+### Prerequisites
 
-## Building from source
+- [Rust](https://rustup.rs) stable toolchain (pinned in `rust-toolchain.toml`; `rustup` handles it automatically)
+- [Ollama](https://ollama.com) — optional; required only when using the local Ollama provider
 
-**Prerequisites**
-
-- [Rust](https://rustup.rs) stable toolchain (`rust-toolchain.toml` pins the version; `rustup` picks it up automatically)
-- [Ollama](https://ollama.com) — optional, required only when using the local Ollama provider
+### Build from source
 
 ```bash
 git clone https://github.com/danielmriley/aigent
@@ -52,500 +32,385 @@ cargo build --release --locked
 
 The binary is produced at `target/release/aigent-app`.
 
-**One-line install to `~/.local/bin`**
+### One-line install
 
 ```bash
 ./install.sh
 ```
 
-Uses `cargo build --release --locked` for reproducible builds, installs atomically, prints a SHA-256 checksum, and restarts a running daemon automatically.
+Builds with `--release --locked`, installs atomically to `~/.local/bin`, prints a SHA-256 checksum, and restarts a running daemon if one is detected. Supports `--candle`, `--cuda`, `--metal`, `--prefix DIR`, and `--uninstall`.
 
-**First run**
+### First run
 
 ```bash
-# Option A — interactive setup wizard (recommended)
+# Interactive setup wizard (recommended)
 aigent onboard
 
-# Option B — copy the example config and edit manually, then start
+# Or copy the example config and start manually
 cp config/default.toml.example config/default.toml
 aigent start
 ```
 
-**Environment variables** (written to `.env` by the wizard automatically)
+### Environment variables
+
+Set in `.env` (the wizard writes these automatically) or export directly:
 
 | Variable | Purpose |
 | --- | --- |
-| `OPENROUTER_API_KEY` | Required when provider is set to `openrouter` |
-| `OLLAMA_BASE_URL` | Override Ollama endpoint (default: `http://localhost:11434`) |
-| `TELEGRAM_BOT_TOKEN` | Required to enable the Telegram bot |
+| `OPENROUTER_API_KEY` | Required for the OpenRouter cloud provider |
+| `OLLAMA_BASE_URL` | Override Ollama endpoint (default `http://localhost:11434`) |
+| `TELEGRAM_BOT_TOKEN` | Required to enable the Telegram bot frontend |
 
-## Capabilities
+---
 
-### Memory system
+## Architecture
 
-Aigent uses a **6-tier memory architecture** backed by an append-only JSONL event log (`.aigent/memory/events.jsonl`) as the canonical source of truth.
+```
+aigent-config
+ └─ aigent-tools          Tool registry, ToolSpec, 35+ built-ins
+     └─ aigent-llm        LlmClient trait, Ollama/OpenRouter/Candle, router
+         └─ aigent-exec   ToolExecutor, sandbox, WASM loader, gait (git)
+             └─ aigent-memory  MemoryManager, 6-tier event log, MemoryIndex
+                 └─ aigent-thinker  ReAct loop, JsonStreamBuffer
+                     └─ aigent-prompt  Prompt assembly, memory injection
+                         └─ aigent-agent  AgentRuntime, run_agent_turn, sleep
+                             └─ aigent-runtime  Daemon, Unix socket IPC
+                                 ├─ aigent-app     CLI binary (single entry point)
+                                 ├─ aigent-ui      Ratatui TUI
+                                 └─ aigent-telegram Telegram bot
+```
+
+The daemon (`aigent-runtime`) owns all mutable state behind `Arc<Mutex<DaemonState>>`. Frontends are thin, reconnectable clients over a Unix socket at `/tmp/aigent.sock`. A `broadcast::Sender<BackendEvent>` fans out events (tokens, beliefs, tool results, proactive messages) to all subscribers.
+
+---
+
+## Memory System
+
+### 6-tier hierarchy
 
 | Tier | Purpose |
 | --- | --- |
-| `Core` | Identity, constitution, personality — consistency-firewalled; rewrite requires approval |
-| `UserProfile` | Persistent user facts: preferences, goals, life context |
-| `Reflective` | Agent thoughts, plans, self-critiques, proactive follow-ups |
-| `Semantic` | Distilled facts and condensed knowledge promoted from episodic memory |
-| `Procedural` | Learned skills, workflows, how-to knowledge |
-| `Episodic` | Raw conversation turns and temporary observations |
+| **Core** | Identity, constitution, personality — consistency-firewalled; rewrite requires approval |
+| **UserProfile** | Persistent user facts: preferences, goals, life context |
+| **Reflective** | Agent thoughts, plans, self-critiques, proactive follow-ups |
+| **Semantic** | Distilled facts and condensed knowledge promoted from episodic memory |
+| **Procedural** | Learned skills, workflows, how-to knowledge |
+| **Episodic** | Raw conversation turns and temporary observations |
 
-**Retrieval** uses a hybrid weighted score:
-`tier(0.35) + recency(0.20) + lexical(0.25) + embedding(0.15) + confidence(0.05)`
+### Hybrid retrieval
 
-When Ollama is available, entries are embedded at record time via `/api/embeddings` and cosine similarity upgrades lexical matching to semantic vector search. When no embedding backend is configured, the embedding weight is redistributed proportionally across the other components. Core and UserProfile entries are always injected into the prompt regardless of score.
+Every query is scored with weighted components:
 
-A **high-density relational matrix** is injected into every prompt — a compact cross-tier association table that surfaces connections between memory entries the agent might otherwise miss.
+```
+score = tier(0.35) + recency(0.20) + lexical(0.25) + embedding(0.15) + confidence(0.05)
+```
 
-An **Obsidian-compatible vault** is auto-projected under `.aigent/vault/` with per-tier indexes, daily memory notes, topic backlinks, and wiki-style links. New entries are written incrementally so the vault stays in sync after every turn without a full rebuild.
+When Ollama is available, entries are embedded at record time and cosine similarity upgrades lexical matching to semantic vector search. Without an embedding backend the weight is redistributed across the other components. Core and UserProfile entries are always injected into the prompt regardless of score.
 
-### Storage & Performance
+A **relational matrix** — a compact cross-tier association table — is injected into every prompt to surface connections between memory entries.
 
-**Crash-safe append**: Every write to `events.jsonl` is followed by `flush()` + `sync_all()` so the entry survives a process crash or power loss immediately after `record()`. The `overwrite` path (used by `wipe`, `compact`, and Core retirements) writes to a `.tmp` sibling, fsyncs, then renames atomically — a crash at any point leaves either the old or the new file fully intact.
+### Storage guarantees
 
-**Resilient JSONL loading**: Corrupt lines in `events.jsonl` are skipped with a `warn!` trace that includes the line number and error. The bad line is appended to a `events.jsonl.corrupt` sidecar file for forensic inspection. The remaining events load normally — a single bad line never takes down the daemon.
+- **Crash-safe append** — every write to `events.jsonl` is followed by `flush()` + `sync_all()`. Overwrites (wipe, compact, Core retirements) use atomic `tmp → fsync → rename`.
+- **Resilient loading** — corrupt JSONL lines are skipped and saved to a `.corrupt` sidecar. A single bad line never takes down the daemon.
+- **Redb secondary index** — optional `redb`-backed index with an LRU-256 cache for O(log n) tier lookups. Rebuilt transparently if absent or corrupt.
 
-**Redb secondary index** (`aigent_memory::MemoryIndex`): An optional `redb`-backed secondary index lives alongside the JSONL log at `~/.aigent/memory/index.redb`. It stores compact entry metadata (confidence, tier, timestamp, source, content-hash) keyed by UUID and a tier lookup table. An LRU cache (256 entries) sits in front for hot-path reads. If the index file is absent or corrupt it is rebuilt transparently from the event log — zero data loss. The index is opt-in and non-critical: when unavailable, all operations fall back to the in-memory store.
+### Obsidian vault projection
 
-### Vault Projection & Human Co-Authoring
+The daemon projects memory into `.aigent/vault/` as Obsidian-compatible files:
 
-Every sleep cycle writes four auto-generated summary artefacts to the vault root in addition to the Obsidian note/index files:
+| File | Content |
+| --- | --- |
+| `core_summary.yaml` | Top-15 Core entries by confidence |
+| `user_profile.yaml` | Top-15 UserProfile entries |
+| `reflective_opinions.yaml` | Top-15 Reflective entries |
+| `MEMORY.md` | Human-friendly prose rollup |
 
-| File | Content | Tier |
-|---|---|---|
-| `core_summary.yaml` | Top-15 Core entries by confidence | Identity & constitution |
-| `user_profile.yaml` | Top-15 UserProfile entries | User facts & preferences |
-| `reflective_opinions.yaml` | Top-15 Reflective entries | Agent thoughts & opinions |
-| `MEMORY.md` | Human-friendly prose consolidation linking all three | All three tiers |
+Each YAML file includes a `checksum: sha256:…` field and `last_updated` timestamp. Files are written incrementally — unchanged files are not touched.
 
-**YAML format**: Each file has a `checksum: sha256:…` field and a `last_updated` timestamp so you (and the daemon) can detect real changes at a glance. Files are written incrementally — unchanged files are not touched across sleep cycles.
-
-**Truncation policy**: Each file contains at most `KV_TIER_LIMIT` (default: 15) items, sorted by `confidence DESC → recency DESC → valence DESC`. This keeps each file well under 200 lines and prevents context-window bloat.
-
-**Auto-injection**: On every LLM turn, the daemon reads `core_summary.yaml` and `user_profile.yaml` and prepends them as a pinned `AGENT IDENTITY` block at the very top of the prompt context (score 2.0 — always first). This guarantees the agent never forgets who it is even if retrieval ranking would otherwise demote Core entries.
-
-**Bidirectional edits**: A background `notify`-based file watcher monitors the four summary files. When a human edits any of them directly in Obsidian (or any editor), the daemon detects the change and ingests it as a high-confidence `MemoryEntry` with `source = "human-edit"`. The appropriate tier is inferred from the filename (`core_summary.yaml` → Core, `user_profile.yaml` → UserProfile, `reflective_opinions.yaml` → Reflective). The next sleep cycle reconciles the edit with existing memory. This gives you direct, persistent control over the agent's identity — edit the YAML, shape the soul.
+A background `notify`-based watcher detects human edits and ingests them as `source = "human-edit"` entries in the appropriate tier. The next sleep cycle reconciles the edit. **Edit the YAML, shape the soul.**
 
 ### Beliefs & inline reflection
 
-Every completed conversation turn now triggers a short structured LLM call (`inline_reflect`) that extracts up to three new **beliefs** and two free-form **reflective insights** from the exchange. Beliefs are stored in Core memory with a `belief` tag and a confidence score; reflective insights are stored in the Reflective tier. Both are streamed to all subscribers as `BackendEvent::BeliefAdded` and `BackendEvent::ReflectionInsight` events in real time.
+After every conversation turn, a structured LLM call extracts up to three **beliefs** and two **reflective insights**. Beliefs are stored in Core memory; insights in the Reflective tier. Both are streamed to all frontends in real time.
 
-All current beliefs (up to `max_beliefs_in_prompt`, default 5, sorted by composite score: confidence × 0.6 + recency × 0.25 + valence × 0.15) are automatically injected into every LLM prompt as a `MY_BELIEFS:` block alongside the `IDENTITY:` header. This gives the agent a genuine, evolving worldview that colours every response without the user having to mention it.
+Active beliefs (ranked by confidence × 0.6 + recency × 0.25 + valence × 0.15) are injected into every prompt as a `MY_BELIEFS:` block, giving the agent a genuine, evolving worldview.
 
-### Proactive mode
+---
 
-An optional background task (**Task C** inside the daemon) fires every `proactive_interval_minutes` minutes and asks the LLM whether it has something genuinely worth sharing unprompted — a follow-up question, a reminder, or an insight. Enable it in `config/default.toml`:
+## Sleep & Self-Improvement
+
+Three consolidation modes, all append-only (results are new entries, never mutations):
+
+| Mode | Description |
+| --- | --- |
+| **Passive** | Heuristic promotion of high-confidence episodic entries. No LLM required. |
+| **Agentic** | Single-agent LLM reflection — learns about the user, reinforces personality, resolves contradictions. |
+| **Multi-agent** | 4 parallel specialist LLM agents (Identity, Relationships, Knowledge, Reflections) + a deliberation/synthesis agent. Rate-limited to once per 22 hours. Falls back to agentic mode if the LLM is unavailable. Progress is streamed to connected clients. |
+
+Sleep runs on a nightly schedule (default 22:00–06:00, configurable) or on demand via `aigent sleep run` or the `/sleep` slash command.
+
+### Sleep seeding
+
+Inject synthetic episodic memories to teach the agent specific themes before a sleep cycle:
+
+```bash
+aigent sleep seed "Rust async patterns" --count 7 --valence positive --run
+```
+
+---
+
+## Proactive Mode
+
+An optional background task fires every `proactive_interval_minutes` and asks the LLM whether it has something worth sharing unprompted — a follow-up, a reminder, or an insight.
 
 ```toml
 [memory]
 proactive_interval_minutes = 60   # 0 = disabled (default)
-proactive_dnd_start_hour   = 22   # local time — end of active hours
-proactive_dnd_end_hour     = 8    # local time — start of active hours
+proactive_dnd_start_hour   = 22
+proactive_dnd_end_hour     = 8
 ```
 
-During the Do-Not-Disturb window the task runs silently and produces no output. When the agent decides it has something to say, it broadcasts a `BackendEvent::ProactiveMessage` that the TUI renders as a chat bubble and Telegram delivers as a normal message. The message is also persisted as an Episodic entry with `source = "proactive"` so future sleep cycles can reason about it.
+Messages are broadcast as `ProactiveMessage` events, rendered in the TUI and delivered via Telegram. A cooldown gate prevents bursts.
 
-**Sleep distillation** runs on a nightly schedule (configurable; default 22:00–06:00) and supports three modes:
+---
 
-- *Passive* — heuristic-only promotion of high-confidence episodic entries; no LLM required.
-- *Agentic* — single-agent LLM reflection that learns about the user, reinforces personality, captures follow-ups, and resolves contradictions.
-- *Multi-agent* — nightly pipeline of 4 parallel specialist LLM agents (Identity, Relationships, Knowledge, Reflections) followed by a deliberation/synthesis agent. Runs at most once per 22 hours. Falls back to single-agent agentic mode if the LLM is unavailable. Streaming progress events are relayed to the client while the cycle runs.
+## LLM Providers
 
-A **cooldown gate** (`proactive_cooldown_minutes`, default 5) prevents message bursts even when the check interval is short. Task C is aborted gracefully on daemon shutdown so it never fires mid-exit.
-
-### LLM routing
-
-- **Ollama** (local-first) — any locally installed model; configurable per session.
-- **OpenRouter** — cloud provider supporting GPT-4o, Claude 3.x/3.5/3.7, Gemini 2.0, Llama 3.x, Mistral, Qwen, DeepSeek, and more.
-- Both providers use separate model strings so Ollama model names are never forwarded to OpenRouter and vice versa.
-- Streaming responses via server-sent events; both providers share a common `LlmClient` trait.
-- Type `/fallback` in any message to force the cloud provider for that single turn.
-- `ReloadConfig` over the daemon socket re-reads `.env` immediately — a newly set `OPENROUTER_API_KEY` takes effect without restarting the daemon.
-
-### Interfaces
-
-#### TUI (terminal)
-
-- Full `ratatui`-based chat interface with collapsible sidebar, scrollable transcript, and live token streaming.
-- Markdown rendering with `syntect` syntax highlighting for fenced code blocks; inline bold, italic, code, lists, blockquotes, and headings (H1–H3).
-- Fuzzy-search file picker (`@` prefix) and slash-command palette.
-- Clipboard copy, history mode, and keyboard-driven focus switching (sidebar / chat / input).
-- Sleep cycle progress shown with an animated indicator while the nightly consolidation runs.
-- Tool call activity (name, success/failure) surfaces in the status bar and inline transcript during agent turns. Tool messages are **expandable**: select one in history mode to reveal the full tool output.
-- `BeliefAdded` and `ReflectionInsight` events shown in the status bar immediately after each turn completes.
-- `ProactiveMessage` events rendered as chat bubbles in the main transcript (Markdown-rendered).
-- External turns from Telegram visible inline in the TUI transcript via `ExternalTurn` events.
-- **TUI chat persistence**: every turn is appended to `.aigent/history/YYYY-MM-DD.jsonl` so the last 200 turns are automatically restored when you reopen the TUI. Manage with `aigent history clear`, `aigent history export <path>`, `aigent history path`.
-- **Animated spinner** (braille cycle) is visible throughout the entire agent turn — LLM generation, tool execution, and reflection phases. Uses wall-clock time for frame calculation, immune to event-loop starvation. Viewport auto-scrolls to follow new content.
-- **Auto-follow**: viewport always follows streaming tokens, tool results, and proactive messages. Scrolling up disables auto-follow; pressing End re-enables it.
-- **Config-driven theming**: set `[ui] theme = "tokyo-night"` (or `catppuccin-mocha`, `nord`) in `config/default.toml`. Sidebar visibility also configurable via `[ui] show_sidebar`.
-- **Context-aware keybindings bar**: footer shows relevant shortcuts for the current mode (input vs history), with accent-coloured key labels and dimmed separators.
-
-#### Telegram bot
-
-- Long-polling bot with per-chat short-term context windows.
-- All messages are routed through daemon IPC — memory and model state are shared with the TUI.
-- 409-conflict backoff for multi-instance safety.
-- **Typing indicator**: `sendChatAction(typing)` fires immediately on every message, then refreshes every 4 s for the entire agent turn (LLM generation, tool calls, inline reflection). Cancelled cleanly via a `oneshot` channel when the reply is ready.
-- **Tool footnote**: when the agent uses one or more tools to answer, a brief `🔧 Tools used: name1, name2` note is appended to the reply.
-- Commands: `/help`, `/status`, `/context`, `/model show|list|set|provider|test`, `/think <level>`, `/memory stats|inspect-core|export-vault`, `/sleep`, `/correct`, `/pin`, `/forget`.
-
-#### CLI subcommands
-
-| Command | Description |
+| Provider | Description |
 | --- | --- |
-| `aigent` / `aigent start` | Open TUI (auto-starts daemon; force-onboards on first run) |
-| `aigent onboard` | Interactive first-time setup wizard |
-| `aigent configuration` / `aigent config` | Re-open wizard to update identity, model, Telegram, memory, or safety settings |
-| `aigent telegram` | Run Telegram bot standalone (no TUI) |
-| `aigent daemon start\|stop\|restart\|status` | Manage the background daemon process |
-| `aigent memory stats` | Print memory tier counts and index/vault health |
-| `aigent memory inspect-core [--limit N]` | Show top core memories |
-| `aigent memory promotions [--limit N]` | Show recent sleep promotions |
-| `aigent memory export-vault [--path DIR]` | Write Obsidian vault to disk |
-| `aigent memory wipe [--layer <all\|core\|episodic\|...>] --yes` | Wipe one or all memory tiers |
-| `aigent memory proactive check` | Force a proactive check right now (bypasses DND and interval) |
-| `aigent memory proactive stats` | Show proactive mode activity (total sent, last sent, DND window) |
-| `aigent tool list` | List all tools registered in the running daemon with descriptions |
-| `aigent tool call <name> [key=val ...]` | Execute a named tool directly with key=value arguments |
-| `aigent tools build` | Build WASM guest tools in `extensions/tools-src/` (adds `wasm32-wasip1` target + `cargo build --release`) |
-| `aigent tools status` | Show per-tool runtime mode (WASM binary found vs native fallback) and effective sandbox state |
-| `aigent doctor` | Print current config and memory diagnostics |
-| `aigent doctor --review-gate [--report FILE]` | Run phase review gate with auto-remediation |
-| `aigent doctor --model-catalog [--provider <all\|ollama\|openrouter>]` | List available models |
-| `aigent reset --hard --yes` | Stop daemon, wipe `.aigent` state, require re-onboarding |
+| **Ollama** | Local-first; any installed model. Default provider. |
+| **OpenRouter** | Cloud gateway to GPT-4o, Claude, Gemini, Llama, Mistral, Qwen, DeepSeek, and more. |
+| **Candle** | Local GGUF inference via the Candle framework (CPU, CUDA, or Metal). Opt-in feature flag. |
 
-### Tool execution
+Both Ollama and OpenRouter use separate model strings; names are never cross-forwarded. Streaming via server-sent events. Type `/fallback` in any message to force the cloud provider for that turn. `ReloadConfig` over the socket hot-reloads `.env` without a restart.
 
-Built-in tools registered in the daemon and accessible via `/tools` slash commands and `aigent tool` CLI:
+### Router (fast-path classification)
 
-| Tool | Description |
+A small, fast model (e.g. 0.8B parameters, ~150ms) classifies each incoming message as **Chat** or **Tools**:
+
+- **Chat** → direct response from the primary model, skipping the full reasoning loop.
+- **Tools** → triggers the external thinking loop (ReAct-style) with tool specs and structured JSON output.
+
+Configure in `[router]` with a separate `ollama_model` or `openrouter_model`.
+
+---
+
+## Tools
+
+### Built-in tools (35+)
+
+| Category | Tools |
 | --- | --- |
-| `read_file` | Read a file within the workspace (path-sandboxed, max-bytes limited) |
-| `write_file` | Write or overwrite a file within the workspace |
-| `run_shell` | Execute a shell command in the workspace directory (timeout-bounded) |
-| `calendar_add_event` | Append an event to `.aigent/calendar.json` (local calendar store) |
-| `web_search` | Web search via Brave API (key in config) or DuckDuckGo Instant Answer fallback; timeout-bounded |
-| `draft_email` | Save an email draft to `.aigent/drafts/` as a plain-text file |
-| `remind_me` | Add a reminder to `.aigent/reminders.json` for proactive surfacing |
-| `git_rollback` | Revert the last git commit in the workspace (`git revert HEAD`) |
+| **Filesystem** | `read_file`, `write_file`, `list_dir`, `mkdir`, `touch`, `rm`, `cp`, `mv`, `find`, `tree` |
+| **Coreutils** | `ls`, `grep`, `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `sed`, `echo`, `seq`, `workspace_status` |
+| **Shell** | `run_shell` (timeout-bounded, seccomp/sandbox_init) |
+| **Web & search** | `web_search` (Brave → Tavily → Serper → Exa → SearXNG → DuckDuckGo), `browse_page` |
+| **Git** | `perform_gait` (libgit2: status, log, diff, commit, checkout, branch, reset, clone, pull, push, fetch, blame, tag, stash), `git_rollback` |
+| **Scheduler** | `create_cron_job`, `remove_cron_job`, `list_cron_jobs` (6-field cron expressions) |
+| **Data** | `calendar_add_event`, `remind_me`, `draft_email`, `get_current_datetime` |
+| **Extensions** | `list_modules` |
 
-In addition, **19 coreutils tools** are registered: `ls`, `mkdir`, `touch`, `rm`, `cp`, `mv`, `find_files`, `grep`, `head`, `tail`, `wc`, `tree`, `workspace_status`, `sort_lines`, `uniq`, `cut`, `sed`, `echo`, `seq`. All support `jsonl=true` and `semantic=true` output modes for structured LLM consumption.
+All coreutils support `jsonl=true` and `semantic=true` output modes for structured LLM consumption.
 
-All tools run in **WASM mode** when a compiled `.wasm` binary is present (see `aigent tools status`); otherwise they run as native Rust code with an identical API. All tools are governed by `ExecutionPolicy` (`allow_shell`, `allow_wasm`, `approval_required`, `tool_allowlist`, `tool_denylist`, `approval_exempt_tools`). An interactive approval channel gates dangerous actions before execution. The four data tools (`calendar_add_event`, `web_search`, `draft_email`, `remind_me`) are approval-exempt by default.
+### WASM extensions
 
-**LLM-driven tool calling**: before each streaming response, the daemon asks the LLM whether the user’s message requires a tool. If yes, the daemon executes the tool, records the result to Procedural memory, emits `ToolCallStart` / `ToolCallEnd` events, and injects the result into the main LLM prompt so the reply is grounded in the actual output.
-### Daemon / IPC
-
-The daemon exposes a Unix socket (`/tmp/aigent.sock` by default) and handles:
-
-| Command | Description |
-| --- | --- |
-| `SubmitTurn` | Chat turn; streams `BackendEvent` tokens back to the caller |
-| `GetStatus` | Live memory stats, uptime, provider, model, tool list |
-| `GetMemoryPeek` | Most recent memory entries |
-| `ExecuteTool` / `ListTools` | Tool invocation with safety gating |
-| `RunSleepCycle` | Trigger single-agent agentic sleep on demand; streams progress |
-| `RunMultiAgentSleepCycle` | Trigger the full 4-specialist sleep pipeline; streams progress |
-| `TriggerProactive` | Force an immediate proactive check regardless of DND and interval |
-| `GetProactiveStats` | Return proactive mode statistics (`ProactiveStatsPayload`) |
-| `Subscribe` | Persistent broadcast connection for TUI and Telegram relay |
-| `ReloadConfig` | Hot-reload `config/default.toml` and `.env` without restart |
-| `Shutdown` / `Ping` | Graceful shutdown (flushes memory + final sleep pass) / health check |
-
-**Broadcast events** emitted to all `Subscribe` connections:
-
-| Event | Description |
-| --- | --- |
-| `Token` | Streamed LLM output chunk |
-| `ReflectionInsight` | Free-form insight extracted by inline reflection after each turn |
-| `BeliefAdded { claim, confidence }` | New belief persisted from inline reflection |
-| `ProactiveMessage { content }` | Unprompted message from the proactive background task |
-| `ExternalTurn { source, content }` | User message received from a non-TUI channel (e.g. Telegram) |
-| `MemoryUpdated` / `Done` / `Error` | Turn lifecycle signals |
-
-### WASM extension interface
-
-A WIT host interface is defined in `extensions/wit/host.wit` for guest WASM skills:
-- Workspace file I/O: `read-file`, `write-file`, `list-dir`
-- Shell execution: `run-shell` (with timeout)
-- Persistent key-value store: `kv-get`, `kv-set`
-- HTTP: `http-get`, `http-post`
-- Git: `git-commit`, `git-rollback-last`, `git-log-last`
-- Secrets: `secret-get`
-
-Guest skills implement `spec()` and `run(params)` using the stdin/stdout JSON protocol.
-
-The **Wasmtime host runtime** (Cargo feature `wasm`, enabled by default) discovers compiled
-`.wasm` binaries at daemon start and registers them as live tools:
+The Wasmtime host runtime (`wasm` feature, default-on) discovers compiled `.wasm` binaries at startup. WASM tools are registered first (first-match wins); native Rust implementations fill gaps until guests are built.
 
 ```bash
-# Build the guest sub-workspace using the new CLI command
-aigent tools build
-# -> runs rustup target add wasm32-wasip1 then
-#    cargo build --release in extensions/tools-src/
-# -> creates extensions/tools-src/<crate>/target/wasm32-wasip1/release/*.wasm
-# The daemon picks them up automatically on next start
+aigent tools build    # compile guests (wasm32-wasip1)
+aigent tools status   # show WASM vs native per tool + sandbox state
+aigent tools reload   # hot-reload without restarting the daemon
 ```
 
-WASM tools are registered **first** in the tool registry (first-match wins).  
-Native Rust implementations are registered only for names **not** already covered by a
-WASM binary.  Until `.wasm` files are built, all 8 tools run natively with a startup
-log message: _"native Rust fallback active for N tool(s) — run `aigent tools build`"_.
-
-Inspect the current mode without starting the daemon:
+New tools via scaffold:
 
 ```bash
-aigent tools status   # shows WASM vs native per tool + sandbox effective state
+cd extensions/tools-src
+./new-tool.sh my_tool "One-sentence description"
+./build.sh my_tool
 ```
 
-## Capabilities matrix
+The WIT host interface (`extensions/wit/host.wit`) provides workspace file I/O, shell execution, key-value store, HTTP, git operations, and secret access.
 
-| Capability area | Status | Notes |
-| --- | --- | --- |
-| Onboarding wizard (TUI + prompt fallback) | ✅ Complete | Configures identity, model/provider, thinking level, workspace, sleep window, safety profile, **approval mode**, **Brave API key**. |
-| Persistent memory (6 tiers) | ✅ Complete | Core, UserProfile, Reflective, Semantic, Procedural, Episodic — append-only event log. |
-| Crash-safe JSONL (flush + fsync) | ✅ Complete | `append()` fsyncs every write; `overwrite()` uses tmp+rename+fsync; corrupt lines skipped on load. |
-| Hybrid retrieval (lexical + embedding) | ✅ Complete | Ollama embeddings + cosine similarity; graceful fallback to lexical-only. |
-| High-density relational matrix | ✅ Complete | Cross-tier association table injected into every prompt. |
-| Obsidian vault projection | ✅ Complete | Incremental writes; per-tier indexes, daily notes, topic backlinks. |
-| YAML KV summary files (3-tier) | ✅ Complete | `core_summary.yaml`, `user_profile.yaml`, `reflective_opinions.yaml`; checksum-based incremental. |
-| MEMORY.md narrative | ✅ Complete | Human-friendly prose consolidation cross-referencing KV files. |
-| KV auto-injection into every prompt | ✅ Complete | Core + UserProfile pinned at score 2.0 — agent always knows who it is. |
-| Bidirectional vault watcher | ✅ Complete | `notify`-based watcher ingests human edits as `source="human-edit"` memories. |
-| Redb secondary index + LRU cache | ✅ Complete | Opt-in fast tier/confidence lookup; transparent fallback to full scan. |
-| Sleep distillation — passive | ✅ Complete | Heuristic promotion of high-confidence episodic entries; no LLM required. |
-| Sleep distillation — agentic | ✅ Complete | Single-agent LLM reflection; learns about user, resolves contradictions. |
-| Sleep distillation — multi-agent | ✅ Complete | 4 parallel specialists + deliberation/synthesis; 22h rate-limit; progress streaming. |
-| Interactive TUI chat | ✅ Complete | Streaming, syntect markdown rendering, file picker, command palette. |
-| Telegram bot runtime | ✅ Complete | Long-polling, per-chat context, shared daemon state. |
-| Telegram typing indicator | ✅ Complete | `sendChatAction` refreshed every 4 s while the daemon processes a turn. |
-| Daemon IPC server | ✅ Complete | Unix socket; streaming turns, broadcast events, memory peek, tool execution. |
-| Daemon-first architecture | ✅ Complete | Daemon owns all state; TUI and Telegram are thin reconnectable clients. |
-| Belief API | ✅ Complete | `record_belief` / `retract_belief` / `all_beliefs`; stored as tagged Core entries. |
-| Inline reflection | ✅ Complete | Structured LLM call after every turn extracts beliefs + insights; streamed as events. |
-| Belief injection into prompts | ✅ Complete | Up to 10 active beliefs injected as `MY_BELIEFS:` block on every turn. |
-| Proactive mode (Task C) | ✅ Complete | Background task checks for proactive messages; respects DND window and configurable interval. Cooldown gate and graceful shutdown on daemon exit. |
-| Tool execution system | ✅ Complete | `read_file`, `write_file`, `run_shell`, `calendar_add_event`, `web_search`, `draft_email`, `remind_me`, `git_rollback`; workspace-sandboxed, per-tool allow/deny. |
-| LLM-driven tool calling | ✅ Complete | Pre-turn tool intent check via structured LLM prompt; executes tool, records to Procedural memory, injects result before streaming response. |
-| Tool approval modes | ✅ Complete | Three modes: `safer` (always ask), `balanced` (read-only free, default), `autonomous` (no prompts). Configurable via `[tools] approval_mode`. |
-| Git auto-commit | ✅ Complete | Automatic `git add -A && git commit` after every `write_file`/`run_shell`; `git_rollback` tool reverts last commit. |
-| Brave Search integration | ✅ Complete | `web_search` uses Brave API when `brave_api_key` is set; falls back to DuckDuckGo. |
-| WASM extension interface | ✅ Complete | WIT host API + Wasmtime host runtime (`wasm` feature, **default-on**). WASM guests registered first (first-match wins); native tools fill gaps until guests are built. `aigent tools build` compiles guests; `aigent tools status` shows per-tool mode. |
-| Platform sandboxing | ✅ Complete | `sandbox` feature **default-on**: `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list (x86-64 Linux); `sandbox_init` profile (macOS). Applied in child process before shell `exec`. Runtime-configurable via `[tools] sandbox_enabled = false`. |
-| **gait (native git)** | ✅ Complete | `perform_gait` tool: in-process git via libgit2. Supports status, log, diff, commit, checkout, branch, reset, clone, pull, push, fetch, ls-remote, show, blame, tag, stash. All writes restricted to `trusted_write_paths` (auto-includes workspace + self-repo). Config: `[git]` section. Grounding rule 10 instructs LLM to prefer gait. |
-| Memory CLI commands | ✅ Complete | `stats` (incl. tool exec counts), `inspect-core`, `promotions`, `export-vault`, `wipe`, `proactive check/stats`. |
-| Tool CLI commands | ✅ Complete | `aigent tool list`, `aigent tool call <name> [key=value ...]`, `aigent tools build` (compile WASM guests), `aigent tools status` (WASM vs native + sandbox state). |
-| Telegram command parity | ✅ Complete | Core commands available; all memory, proactive, and tool events routed correctly. |
-| Phase review gate | 🟨 In progress | `doctor --review-gate` implemented; some checks in progress. |
-| Systemd/launchd unit | ⏳ Planned | Daemon auto-start on system boot. |
-| Full channel parity smoke coverage | ⏳ Planned | Behaviour and memory consistency verified across TUI and Telegram. |
+### Tool execution pipeline
 
-## Usage
+1. **Router** classifies message → Tools path
+2. **External thinking loop** (ReAct, up to `max_tool_rounds` iterations) parses structured JSON from the LLM stream
+3. **ExecutionPolicy** enforces allowlist/denylist, approval mode, security level, and rate limits
+4. **Sandbox** applies platform-level restrictions before `exec`
+5. Tool result is recorded to memory and injected back into the prompt
 
-### Starting the daemon
+---
+
+## Interfaces
+
+### TUI
 
 ```bash
-aigent daemon start          # background daemon
-aigent daemon status         # check it is running
-aigent start                 # foreground TUI (also starts daemon if needed)
+aigent start    # auto-starts daemon if needed
 ```
 
-### Chat (TUI)
-
-```bash
-aigent start
-```
-
-Key bindings inside the TUI:
+- `ratatui`-based chat with collapsible sidebar, scrollable transcript, and live token streaming
+- Markdown rendering with `syntect` syntax highlighting for code blocks
+- Fuzzy-search file picker (`@` prefix) and slash-command palette
+- Expandable tool output — press Enter on a tool message in history mode
+- Animated braille spinner throughout LLM generation, tool execution, and reflection
+- Chat persistence — turns saved to `.aigent/history/YYYY-MM-DD.jsonl`, last 200 restored on open
+- Configurable themes: Catppuccin Mocha, Tokyo Night, Nord (cycle with Ctrl+T)
+- Context-aware keybindings bar
 
 | Key | Action |
 | --- | --- |
 | `Tab` / `Shift-Tab` | Cycle focus: input → chat → sidebar |
-| `Enter` | Send message |
-| `↑` / `↓` | Scroll transcript or navigate sidebar |
-| `@<filename>` | Open fuzzy file picker |
-| `/help` | Show slash-command palette |
-| `/fallback` | Force cloud (OpenRouter) provider for this turn |
-| `/sleep` | Trigger agentic sleep cycle now |
-| `/model provider openrouter` | Switch provider |
-| `/model set <name>` | Switch model |
+| `Enter` | Send message (or expand tool output in history mode) |
+| `↑` / `↓` | Scroll transcript or sidebar |
+| `@<filename>` | Fuzzy file picker |
+| `/help` | Slash command palette |
+| `/fallback` | Force cloud provider for this turn |
+| `/sleep` | Trigger sleep cycle |
+| `Ctrl-T` | Cycle theme |
 | `Ctrl-C` | Quit (daemon keeps running) |
 
-### Telegram bot
+### Telegram
 
 ```bash
-aigent telegram              # run bot in foreground
-# or via daemon:
-aigent daemon start          # bot starts automatically when telegram_enabled = true
+aigent telegram         # standalone
+aigent daemon start     # auto-starts when telegram_enabled = true
 ```
 
-### Memory commands
+- Long-polling with per-chat context windows
+- Typing indicator refreshed every 4s during turns
+- Tool footnote appended to replies when tools are used
+- Commands: `/help`, `/status`, `/context`, `/model show|list|set|provider|test`, `/think`, `/memory stats|inspect-core|export-vault`, `/sleep`, `/correct`, `/pin`, `/forget`
 
-```bash
-aigent memory stats
-aigent memory inspect-core --limit 30
-aigent memory promotions --limit 20
-aigent memory export-vault --path ~/Documents/aigent-vault
+### CLI
 
-# Proactive mode
-aigent memory proactive stats    # show activity (total sent, last sent, DND window)
-aigent memory proactive check    # force a check right now (bypasses DND and interval)
-```
+| Command | Description |
+| --- | --- |
+| `aigent start` | Open TUI (auto-starts daemon) |
+| `aigent onboard` | Interactive setup wizard |
+| `aigent config` | Re-open config wizard |
+| `aigent telegram` | Run Telegram bot standalone |
+| `aigent daemon start\|stop\|restart\|status` | Manage the daemon |
+| `aigent memory stats` | Tier counts, index health, vault status |
+| `aigent memory inspect-core [--limit N]` | Show top Core memories |
+| `aigent memory promotions [--limit N]` | Recent sleep promotions |
+| `aigent memory beliefs [--kind K] [--limit N]` | Browse beliefs |
+| `aigent memory export-vault [--path DIR]` | Write Obsidian vault |
+| `aigent memory wipe [--layer TIER] --yes` | Wipe one or all tiers |
+| `aigent memory proactive check\|stats` | Proactive mode controls |
+| `aigent tool list` | Registered tools with descriptions |
+| `aigent tool call <name> [key=val ...]` | Execute a tool directly |
+| `aigent tools build\|status\|reload` | WASM guest management |
+| `aigent sleep run\|status\|seed` | Sleep cycle controls |
+| `aigent history clear\|export\|path` | TUI chat history |
+| `aigent doctor [--review-gate] [--model-catalog]` | Config diagnostics |
+| `aigent reset --hard --yes` | Full state wipe |
 
-### Configuration
+---
 
-```bash
-aigent configuration         # interactive wizard
-aigent doctor                # show current config + diagnostics
-aigent doctor --model-catalog --provider openrouter
-```
+## Daemon IPC
 
-### Daemon lifecycle
+The daemon exposes a Unix socket and handles these commands:
 
-```bash
-aigent daemon start
-aigent daemon stop
-aigent daemon restart
-aigent daemon status
-```
+| Command | Description |
+| --- | --- |
+| `SubmitTurn` | Chat turn; streams `BackendEvent` tokens |
+| `GetStatus` | Memory stats, uptime, provider, model, tool list |
+| `ExecuteTool` / `ListTools` | Tool invocation with safety gating |
+| `RunSleepCycle` / `RunMultiAgentSleepCycle` | On-demand sleep with progress streaming |
+| `TriggerProactive` / `GetProactiveStats` | Proactive mode controls |
+| `Subscribe` | Persistent broadcast connection for frontends |
+| `ReloadConfig` | Hot-reload config and `.env` without restart |
+| `Shutdown` / `Ping` | Graceful shutdown (flushes memory) / health check |
 
-Runtime files:
-- PID: `.aigent/runtime/daemon.pid`
-- Log: `.aigent/runtime/daemon.log`
-- Socket: `/tmp/aigent.sock` (configurable via `daemon.socket_path` in `config/default.toml`)
+Broadcast events: `Token`, `ReflectionInsight`, `BeliefAdded`, `ProactiveMessage`, `ExternalTurn`, `ToolCall`, `ToolResult`, `MemoryUpdated`, `Done`, `Error`.
 
-## Safety & Trust Model
+---
 
-Aigent is designed to run on your main machine with access to real files and
-network.  Three interlocking layers keep it safe:
+## Safety & Trust
 
-### 1 — Workspace sandbox
+Five interlocking layers protect your system:
 
-Every file read and write is verified to be within `agent.workspace_path`
-before the syscall executes.  Path traversal (e.g. `../../etc/passwd`) is
-rejected with an error.  Shell commands run with the workspace as the current
-directory.
+### 1. Workspace sandbox
 
-### 2 — Approval modes
+Every file read/write is verified to be within `agent.workspace_path`. Path traversal (e.g. `../../etc/passwd`) is rejected. Shell commands run with the workspace as cwd.
 
-Configured via `[tools] approval_mode` in `config/default.toml`:
+### 2. Approval modes
 
 | Mode | Read-only tools | Write / shell | Default? |
-|------|-----------------|---------------|----------|
-| `safer` | ❓ Requires approval | ❓ Requires approval | No |
-| `balanced` | ✅ Auto-approved | ❓ Requires approval | **Yes** |
-| `autonomous` | ✅ Auto-approved | ✅ Auto-approved | No |
+| --- | --- | --- | --- |
+| `safer` | Requires approval | Requires approval | No |
+| `balanced` | Auto-approved | Requires approval | **Yes** |
+| `autonomous` | Auto-approved | Auto-approved | No |
 
-**Read-only tools** (never affect the filesystem): `read_file`, `web_search`,
-`calendar_add_event`, `remind_me`, `git_rollback`.
+Per-tool overrides via `tool_allowlist`, `tool_denylist`, and `approval_exempt_tools` in `[safety]`.
 
-**Write / shell tools** (can modify the workspace): `write_file`, `run_shell`,
-`draft_email`.
+### 3. Git rollback
 
-You can override behaviour per-tool with `tool_allowlist` / `tool_denylist` in
-`[safety]` and `approval_exempt_tools` for tools that should always be
-auto-approved regardless of mode.
+When `git_auto_commit = true`, every write/shell success is immediately committed. Revert with `aigent tool call git_rollback` or `git revert HEAD`.
 
-### 3 — Git rollback
+### 4. Platform sandboxing (default-on)
 
-When `[tools] git_auto_commit = true`, every `write_file` and `run_shell` call
-that succeeds is immediately committed to the workspace git repository with
-the message `Aigent tool: <name> — <detail>`.  If the agent makes a mistake
-you can:
+| Platform | Mechanism |
+| --- | --- |
+| Linux x86-64 | `PR_SET_NO_NEW_PRIVS` + seccomp BPF allow-list (~80 syscalls) |
+| macOS | `sandbox_init(3)` profile |
+| Other | No-op; workspace isolation and approval modes still active |
 
-```bash
-# Via CLI:
-aigent tool call git_rollback
+Disable at runtime: `[tools] sandbox_enabled = false`. Inspect with `aigent tools status`.
 
-# Or directly:
-git -C <workspace> revert HEAD
-```
+### 5. gait — safe native git
 
-During onboarding the wizard will `git init` the workspace if it is not already
-a git repository.
-
-### API keys & secrets
-
-External service keys (e.g. the Brave Search API key) live in
-`[tools] brave_api_key` in your config file, **or** in the `BRAVE_API_KEY`
-environmental variable (env takes precedence).  The agent will also look for
-keys in `<workspace>/.secrets/<name>` when the `secret-get` WASM host function
-is called.
-
-Never commit the `.secrets/` directory to version control — add it to
-`.gitignore` if your workspace is a git repository.
-
-### 4 — Platform sandboxing (default-on)
-
-The `sandbox` Cargo feature is compiled in by default.  When a `run_shell`
-child process is spawned, a `pre_exec` hook applies the platform sandbox
-before the shell `exec` call:
-
-| Platform | Mechanism | Scope |
-|----------|-----------|-------|
-| Linux x86-64 | `PR_SET_NO_NEW_PRIVS` (`prctl`) + seccomp BPF allow-list (~80 syscalls) | Shell child — after `fork`, before `exec` |
-| macOS | `sandbox_init(3)` Scheme profile (filesystem + network) | Shell child — after `fork`, before `exec` |
-| Other | No-op; workspace isolation and approval modes still active | — |
-
-The seccomp filter returns `ENOSYS` for denied syscalls (graceful
-failure rather than `SIGSYS`), so shell commands degrade cleanly when denied.
-
-**Runtime opt-out** — disable without recompiling:
+`perform_gait` uses libgit2 in-process. Write operations (commit, push, checkout, etc.) require the path to be inside `trusted_write_paths`. Read operations are broadly allowed when `allow_system_read = true`.
 
 ```toml
-# config/default.toml
-[tools]
-sandbox_enabled = false    # default: true
-```
-
-Inspect effective state:
-
-```bash
-aigent tools status
-# compiled-in   : yes
-# config enabled : yes
-# effective      : ACTIVE
-```
-
-The workspace isolation, approval-mode gating, and `tool_allowlist`/`tool_denylist`
-layers remain active on all platforms regardless of `sandbox_enabled`.
-
-### 5 — gait: safe native git interface
-
-`perform_gait` is the recommended git tool.  It uses libgit2 (via the `git2`
-crate) for in-process operations and falls back to the `git` CLI only for
-network-heavy actions (clone, push, pull, fetch, ls-remote, blame).
-
-**Security model:**
-
-| Classification | Operations | Rule |
-|----------------|-----------|------|
-| **WRITE** | commit, checkout, merge, reset, pull, push, clone, branch, tag, stash | Path MUST be inside `trusted_write_paths` |
-| **READ** | status, log, diff, show, blame, ls-remote, fetch | When `allow_system_read = true`, any path; otherwise same as WRITE |
-
-`clone` is **always a WRITE operation** — it requires an explicit `target_dir`
-that resolves inside `trusted_write_paths`.
-
-**Configuration:**
-
-```toml
-# config/default.toml
 [git]
 trusted_repos       = ["https://github.com/danielmriley/aigent"]
 trusted_write_paths = []           # workspace + self-repo auto-added
-allow_system_read   = true         # reads OK anywhere; set false for lockdown
+allow_system_read   = true
 ```
 
-**Magic repo names:**
+### API keys & secrets
 
-- `"workspace"` — resolves to the agent's workspace root.
-- `"self"` — resolves to the Aigent source directory (auto-detected from
-  binary path or `AIGENT_SOURCE_DIR` env var).
+Keys live in config (`[tools] brave_api_key`, etc.), environment variables (take precedence), or `<workspace>/.secrets/<name>` (accessed via the `secret-get` WASM host function). Never commit `.secrets/` to version control.
+
+---
+
+## Configuration
+
+All settings live in `config/default.toml`. Run the interactive wizard with `aigent config` or edit the file directly. Hot-reload without restart via `ReloadConfig` over the socket.
+
+Key sections: `[agent]`, `[llm]`, `[memory]`, `[safety]`, `[tools]`, `[git]`, `[router]`, `[inference]`, `[ui]`, `[daemon]`, `[debug]`.
+
+See [`config/default.toml.example`](config/default.toml.example) for the full reference with comments.
+
+### Runtime files
+
+| Path | Purpose |
+| --- | --- |
+| `.aigent/memory/events.jsonl` | Canonical append-only event log |
+| `.aigent/memory/index.redb` | Redb secondary index (rebuilt if missing) |
+| `.aigent/history/YYYY-MM-DD.jsonl` | TUI chat history |
+| `.aigent/vault/` | Obsidian-compatible projection |
+| `.aigent/runtime/daemon.pid` / `.log` | Daemon lifecycle files |
+| `/tmp/aigent.sock` | Unix socket (configurable) |
+
+---
+
+## Feature Flags
+
+| Flag | Crate(s) | Effect |
+| --- | --- | --- |
+| `wasm` | `aigent-exec` | Wasmtime host runtime (default-on) |
+| `sandbox` | `aigent-exec` | seccomp / `sandbox_init` (default-on) |
+| `candle` | `aigent-llm`, `aigent-agent` | Local GGUF inference via Candle |
+| `qdrant` | `aigent-memory` | Qdrant vector DB integration |
+| `marketplace` | workspace | Extension marketplace (opt-in) |
+| `uutils` | `aigent-tools`, `aigent-exec` | Delegate to system coreutils binaries |
+
+---
 
 ## Development
 
@@ -555,12 +420,18 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-`clippy.toml` and `deny.toml` enforce additional lint and dependency audit rules.
-
-## Phase review gate
+`clippy -D warnings` is a hard CI gate. `clippy.toml` and `deny.toml` enforce additional lint and dependency audit rules.
 
 ```bash
+# Build WASM guest tools
+aigent tools build
+
+# Run phase review gate
 aigent doctor --review-gate --report docs/phase-review-gate.md
 ```
 
-Validates Phase 0–2 readiness checks, auto-remediates fixable items, and exits non-zero on hard failures.
+---
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.

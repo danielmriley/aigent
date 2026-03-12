@@ -409,10 +409,20 @@ pub(crate) fn run_memory_beliefs(
             format!("{:.2}", delta)
         };
         // Truncate long content for terminal readability.
-        let content_preview = if node.content.len() > 60 {
-            format!("{}…", &node.content[..59])
-        } else {
-            node.content.clone()
+        // Use char-boundary-safe truncation to avoid panics on multi-byte chars.
+        let content_preview = {
+            let mut end = 0;
+            for (char_count, (idx, _)) in node.content.char_indices().enumerate() {
+                if char_count == 59 {
+                    break;
+                }
+                end = idx;
+            }
+            if node.content.chars().count() > 59 {
+                format!("{}…", &node.content[..end])
+            } else {
+                node.content.clone()
+            }
         };
         println!(
             "{:<12} {:<12} {:<6.2}  {:<8}  F:{:<2} R:{:<2}  {}",

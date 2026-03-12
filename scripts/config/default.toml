@@ -1,0 +1,178 @@
+[agent]
+name = "Zypher"
+user_name = "Daniel"
+workspace_path = "/home/daniel/Projects/aigent/scripts/."
+thinking_level = "balanced"
+external_thinking = false
+step_timeout_seconds = 120
+max_steps_per_turn = 10
+tool_timeout_secs = 60
+
+[llm]
+provider = "ollama"
+ollama_model = "qwen3.5:35b"
+openrouter_model = "openai/gpt-4o-mini"
+ollama_local_first = true
+ollama_base_url = "http://localhost:11434"
+
+[memory]
+backend = "eventlog"
+auto_sleep_minutes = 120
+auto_sleep_turn_interval = 6
+auto_sleep_mode = "nightly"
+night_sleep_start_hour = 22
+night_sleep_end_hour = 6
+core_rewrite_requires_approval = true
+multi_agent_sleep_batch_size = 60
+kv_tier_limit = 15
+timezone = "UTC"
+forget_episodic_after_days = 0
+forget_min_confidence = 0.30000001192092896
+proactive_interval_minutes = 0
+proactive_dnd_start_hour = 22
+proactive_dnd_end_hour = 8
+max_beliefs_in_prompt = 5
+max_relational_in_prompt = 20
+max_prompt_chars = 48000
+proactive_cooldown_minutes = 5
+reflection_enabled = true
+store_reasoning_traces = false
+sleep_capacity_limit = 2000
+
+[memory.learning]
+empirical_tool_success = 0.44999998807907104
+empirical_tool_failure_transient = 0.20000000298023224
+empirical_tool_failure_arch = 0.30000001192092896
+empirical_human = 0.550000011920929
+procedural_tool_success = 0.4000000059604645
+procedural_tool_failure_transient = 0.15000000596046448
+procedural_tool_failure_arch = 0.25
+procedural_human = 0.550000011920929
+self_model_tool_success = 0.5
+self_model_tool_failure_transient = 0.10000000149011612
+self_model_tool_failure_arch = 0.30000001192092896
+self_model_human = 0.5
+opinion_human = 0.44999998807907104
+opinion_sleep_synthesis = 0.25
+confirm_tool_empirical = 0.07999999821186066
+confirm_tool_procedural = 0.10000000149011612
+confirm_tool_self_model = 0.11999999731779099
+confirm_same_source = 0.07999999821186066
+confirm_cross_source = 0.15000000596046448
+confirm_user_explicit = 0.20000000298023224
+confirm_sleep_synthesis = 0.05000000074505806
+contradict_tool_success_vs_failure = 0.3499999940395355
+contradict_user_explicit = 0.3499999940395355
+contradict_tool_fact = 0.15000000596046448
+contradict_tool_failure_transient = 0.05000000074505806
+contradict_tool_failure_config = 0.07999999821186066
+contradict_tool_failure_arch = 0.20000000298023224
+decay_empirical = 0.029999999329447746
+decay_procedural = 0.009999999776482582
+decay_self_model = 0.019999999552965164
+decay_opinion = 0.004999999888241291
+tier_know_threshold = 0.699999988079071
+tier_believe_threshold = 0.5
+tier_suspect_threshold = 0.3499999940395355
+tier_observed_threshold = 0.10000000149011612
+
+[memory.sleep]
+hot_window_hours = 24
+opinion_min_observations = 5
+nightly_window_start = "22:00"
+nightly_window_end = "06:00"
+capacity_limit = 2000
+archival_age_days = 30
+multi_agent_timeout_mins = 60
+
+[safety]
+approval_required = true
+allow_shell = true
+allow_wasm = true
+tool_allowlist = []
+tool_denylist = []
+approval_exempt_tools = [
+    "calendar_add_event",
+    "remind_me",
+    "draft_email",
+    "web_search",
+    "browse_page",
+]
+max_security_level = "high"
+
+[safety.tool_overrides]
+
+[tools]
+approval_mode = "autonomous"
+brave_api_key = "BSAeGcQg0cqFzmNL8ZRhjRH1KXxozeW"
+tavily_api_key = ""
+searxng_base_url = ""
+serper_api_key = ""
+exa_api_key = ""
+search_providers = [
+    "brave",
+    "tavily",
+    "serper",
+    "exa",
+    "searxng",
+    "duckduckgo",
+]
+git_auto_commit = false
+sandbox_enabled = true
+max_tool_rounds = 5
+max_shell_command_bytes = 8192
+max_shell_output_bytes = 32768
+max_file_read_bytes = 65536
+
+[tools.modules]
+enabled = true
+modules_dir = "extensions/modules"
+auto_reload = true
+max_modules = 64
+
+[telemetry]
+log_level = "info"
+
+[onboarding]
+completed = true
+
+[integrations]
+telegram_enabled = true
+
+[daemon]
+socket_path = "/tmp/aigent.sock"
+
+[ui]
+theme = "catppuccin-mocha"
+show_sidebar = true
+
+[git]
+trusted_repos = ["https://github.com/danielmriley/aigent"]
+trusted_write_paths = []
+allow_system_read = true
+
+[inference]
+candle_enabled = false
+candle_model_repo = "Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF"
+candle_model_file = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
+candle_model_path = ""
+candle_local_models_dir = "~/.cache/aigent/models"
+candle_max_seq_len = 4096
+candle_temperature = 0.7
+candle_top_p = 0.9
+candle_repeat_penalty = 1.100000023841858
+candle_device = "cpu"
+
+[subagents]
+enabled = false
+ollama_model = ""
+openrouter_model = ""
+researcher_prompt = "You are a meticulous researcher. Examine the conversation history and memory context deeply. Identify key facts, missing information, and relevant background knowledge that could help answer the user's request. Output your findings as structured analysis."
+planner_prompt = "You are a strategic planner. Given the conversation and context, devise a clear step-by-step plan for how to best respond to or accomplish the user's request. Consider which tools might be needed and in what order. Output your plan as structured analysis."
+critic_prompt = "You are a rigorous critic. Examine the conversation for potential pitfalls: hallucination risks, incorrect assumptions, edge cases, security concerns, and logical gaps. Challenge the obvious approach. Output your critique as structured analysis."
+max_rounds = 3
+
+[debug]
+log_level = "info"
+log_to_file = true
+timing = true

@@ -55,6 +55,10 @@ pub enum ClientCommand {
     /// episodic observations with preference language, then immediately call
     /// `RunMultiAgentSleepCycle` to observe opinion formation.
     SeedMemories { entries: Vec<SeedEntry> },
+    /// Reload the daemon's in-memory store from the event log on disk.
+    /// Called by `aigent memory wipe` after writing tombstones so the daemon's
+    /// live state stays consistent with the persisted event log.
+    ReloadMemory,
 }
 
 /// A single synthetic memory entry used by [`ClientCommand::SeedMemories`].

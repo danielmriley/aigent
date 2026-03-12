@@ -288,7 +288,13 @@ async fn main() -> Result<()> {
     init_tracing(&config.debug);
 
     let config_exists = Path::new(&AppConfig::config_path()).exists();
-    let memory_log_path = Path::new(".aigent").join("memory").join("events.jsonl");
+    // Resolve to an absolute path so that the daemon and the CLI always
+    // refer to the same file regardless of the working directory each was
+    // launched from.
+    let memory_log_path = {
+        let rel = Path::new(".aigent").join("memory").join("events.jsonl");
+        std::env::current_dir().map(|cwd| cwd.join(&rel)).unwrap_or(rel)
+    };
 
     if std::env::var("AIGENT_DAEMON_PROCESS").ok().as_deref() == Some("1") {
         daemon::run_daemon_process(config, &memory_log_path).await?;
@@ -359,7 +365,7 @@ async fn main() -> Result<()> {
                 ).await?;
             } else {
                 println!("aigent doctor");
-                println!("- memory log path: .aigent/memory/events.jsonl");
+                println!("- memory log path: {}", memory_log_path.display());
                 println!("- memory entries loaded: {}", memory.all().len());
                 println!("- provider: {}", config.llm.provider);
                 println!("- model: {}", config.active_model());
@@ -368,8 +374,11 @@ async fn main() -> Result<()> {
         }
         Commands::Memory { command } => match command {
             MemoryCommands::Wipe { layer, yes } => {
-                let mut memory = MemoryManager::with_event_log(memory_log_path).await?;
+                let mut memory = MemoryManager::with_event_log(&memory_log_path).await?;
                 memory_cmds::run_memory_wipe(&mut memory, layer, yes).await?;
+                // Best-effort: notify the running daemon to resync its in-memory store.
+                let client = DaemonClient::new(&config.daemon.socket_path);
+                let _ = client.reload_memory().await;
             }
             MemoryCommands::Stats => {
                 let memory = MemoryManager::with_event_log(memory_log_path).await?;
