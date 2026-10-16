@@ -10,6 +10,7 @@ perf.data.old
 
 # Secrets and local runtime state
 .env
+scripts/**/.env
 .aigent/
 workspace/
 config/default.toml
